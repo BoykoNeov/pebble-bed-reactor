@@ -41,6 +41,7 @@ var _field_display: FieldDisplay
 var _color_bar: ColorBar
 var _flux_desc: FieldDescriptor
 var _k_eff := 0.0
+var _power := 0.0        # relative fission power (a.u.); becomes real MW at M4
 var _solve_iters := 0
 var _solved_once := false
 
@@ -164,6 +165,7 @@ func _solve_flux() -> void:
 	_grid.homogenize(_pebbles, positions)
 	var sol := Neutronics.solve(_grid)
 	_k_eff = sol.k_eff
+	_power = sol.fission_rate
 	_solve_iters = sol.iterations
 
 	# Update the heatmap (consumer of sim state; never writes back).
@@ -193,5 +195,6 @@ func _update_hud() -> void:
 		+ "active: %d / %d\n" % [_pebbles.size(), TARGET_POPULATION] \
 		+ "injected: %d   discharged: %d\n" % [_total_injected, _total_extracted] \
 		+ "k-eff: %.4f  (%s)\n" % [_k_eff, crit] \
+		+ "power: %.1f a.u.\n" % _power \
 		+ "solve iters: %d\n" % _solve_iters \
 		+ "fps: %d" % Engine.get_frames_per_second()

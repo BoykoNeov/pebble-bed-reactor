@@ -25,6 +25,10 @@ extends RefCounted
 class Solution:
 	var flux: PackedFloat32Array   # per-cell scalar flux (grid row-major)
 	var k_eff: float               # multiplication factor incl. leakage
+	var fission_rate: float        # total Sum(nuSigma_f * phi) at convergence.
+	                               # Flux is peak-normalized, so this is a RELATIVE
+	                               # power (arbitrary units). It is the fission heat
+	                               # source M4 will feed into the energy balance.
 	var iterations: int            # outer power iterations taken
 	var converged: bool
 
@@ -118,6 +122,13 @@ static func solve(grid: Grid, max_outer := 300, inner_sweeps := 6, tol := 1.0e-5
 			sol.iterations = outer + 1
 			break
 		sol.iterations = outer + 1
+
+	# Total fission rate on the converged, peak-normalized flux — the relative
+	# power readout (M1 deliverable) and the M4 heat-source hook.
+	var fr := 0.0
+	for c in range(n):
+		fr += nsf[c] * flux[c]
+	sol.fission_rate = fr
 
 	sol.flux = flux
 	sol.k_eff = k
