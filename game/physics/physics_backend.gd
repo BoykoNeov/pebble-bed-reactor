@@ -1,0 +1,58 @@
+# game/physics/physics_backend.gd
+#
+# The one load-bearing abstraction: everything mechanical goes through here so
+# the physics engine stays swappable (CLAUDE.md tech decision). Native Godot
+# physics fills this today; Rapier/Box2D could fill it later WITHOUT touching
+# the coupling loop, homogenization, or neutronics.
+#
+# Deliberately minimal — spawn a body, read positions, step. This is not a
+# speculative plugin framework; add a method only when a milestone needs it.
+#
+# WHY a step() that native leaves as a no-op: Godot steps its own physics inside
+# the scene tree, but an external engine (Rapier/Box2D) must be advanced
+# manually. Keeping step() in the interface means the coupling loop reads the
+# same regardless of backend.
+class_name PhysicsBackend
+extends RefCounted
+
+
+## Attach the backend to a node it may parent bodies under (native needs this;
+## an external engine can ignore it).
+func setup(_world_root: Node) -> void:
+	pass
+
+
+## Add an immovable wall segment (silo shell, funnel). Called once at build.
+func add_static_segment(_a: Vector2, _b: Vector2) -> void:
+	_todo()
+
+
+## Create a dynamic circular pebble body keyed by id.
+func spawn_pebble(_id: int, _pos: Vector2, _radius: float) -> void:
+	_todo()
+
+
+## Destroy the body for id (extraction at the bottom).
+func remove_pebble(_id: int) -> void:
+	_todo()
+
+
+## Current position of one body. Returns Vector2.ZERO if unknown.
+func get_position(_id: int) -> Vector2:
+	_todo()
+	return Vector2.ZERO
+
+
+## id -> Vector2 for every live body. This is the homogenization input at M1.
+func positions() -> Dictionary:
+	_todo()
+	return {}
+
+
+## Advance the mechanical world. No-op for engines that self-step (native).
+func step(_delta: float) -> void:
+	pass
+
+
+func _todo() -> void:
+	push_error("PhysicsBackend method not implemented by subclass")
