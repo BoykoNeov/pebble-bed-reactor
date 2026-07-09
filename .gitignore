@@ -1,0 +1,33 @@
+# Godot 4+ specific ignores
+.godot/
+
+# Godot import cache (legacy) and generated data
+.import/
+data_*/
+
+# Godot export artifacts
+/build/
+export.cfg
+*.pck
+*.zip
+*.exe
+*.dmg
+*.apk
+*.aab
+
+# Auto-generated translations
+*.translation
+
+# Mono / C# (only if a C# solver module is added later)
+.mono/
+mono_crash.*.json
+*.userprefs
+
+# Claude Code local overrides (machine-specific; keep shared settings.json tracked)
+.claude/settings.local.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
