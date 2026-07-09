@@ -1,10 +1,23 @@
 # main.gd
 #
-# M0 orchestrator: inject pebbles at the top, let them flow through the silo,
-# extract them at the bottom, and keep a per-pebble sim/Pebble bound to each
-# body by id. This is the skeleton of the two-world coupling loop (CLAUDE.md):
-# for now only the mechanical world runs; homogenization + neutronics plug in
-# here at M1, reading positions() and the Pebble registry.
+# Orchestrates the two-world coupling loop (CLAUDE.md). M0 built the mechanical
+# world (inject → granular flow → metered discharge). M1 adds neutronics:
+#
+#   Box2D-ish positions + per-pebble state
+#         │  homogenize (grid.gd)
+#         ▼
+#   coarse-grid macroscopic cross-sections
+#         │  quasi-static diffusion solve (neutronics.gd)
+#         ▼
+#   flux field φ + k-eff  ──►  heatmap + readout, sampled back onto pebbles
+#
+# M1 is strictly ONE-DIRECTIONAL: the flux is computed, shown, and stored on
+# each pebble (for M3 burnup / per-pebble viz), but it feeds back into NOTHING —
+# no cross-section change, no motion. Feedback is M2.
+#
+# The flux is CLOCKLESS (CLAUDE.md principle 1-2): it equilibrates far faster
+# than anything mechanical, so we solve it fresh at steady state on a modest
+# cadence rather than time-marching it or solving every frame.
 extends Node2D
 
 const TARGET_POPULATION := 380  # keep the silo full enough to show bed flow
@@ -12,6 +25,7 @@ const SPAWN_PER_TICK := 3
 const SPAWN_INTERVAL := 0.12    # seconds between injection ticks
 const PEBBLE_RADIUS := 8.0
 const EXTRACT_INTERVAL := 0.30  # metered discharge cadence (lowest pebble out)
+const SOLVE_INTERVAL := 0.50    # neutronics re-solve cadence (quasi-static)
 
 var _physics: PhysicsBackend
 var _pebbles: Dictionary = {}   # id -> Pebble (the Lagrangian registry)
@@ -19,8 +33,18 @@ var _rng := RandomNumberGenerator.new()
 var _next_id := 0
 var _spawn_accum := 0.0
 var _extract_accum := 0.0
+var _solve_accum := 0.0
 
-# M0 readouts
+# Neutronics / visualization (M1)
+var _grid: Grid
+var _field_display: FieldDisplay
+var _color_bar: ColorBar
+var _flux_desc: FieldDescriptor
+var _k_eff := 0.0
+var _solve_iters := 0
+var _solved_once := false
+
+# Readouts
 var _total_injected := 0
 var _total_extracted := 0
 var _label: Label
@@ -39,6 +63,19 @@ func _ready() -> void:
 	for seg in Silo.wall_segments():
 		_physics.add_static_segment(seg[0], seg[1])
 
+	# The coarse neutronics mesh over the silo + reflector band.
+	_grid = Grid.for_silo()
+
+	# Field heatmap goes in first so it renders BEHIND the pebbles (background
+	# field, pebbles on top — the two-worlds-at-once view).
+	_field_display = FieldDisplay.new()
+	add_child(_field_display)
+
+	# Flux is normalized to peak = 1 by the solver, so a fixed [0, 1] linear
+	# range is naturally stable frame-to-frame (CLAUDE.md: no per-frame
+	# auto-ranging). It stays within one order of magnitude, so no log needed.
+	_flux_desc = FieldDescriptor.new("Neutron flux", "norm", FieldDescriptor.GRID, 0.0, 1.0, false)
+
 	_build_hud()
 
 
@@ -49,6 +86,10 @@ func _build_hud() -> void:
 	_label.position = Vector2(12, 10)
 	_label.add_theme_font_size_override("font_size", 16)
 	layer.add_child(_label)
+
+	_color_bar = ColorBar.new()
+	_color_bar.position = Vector2(560, 120)
+	layer.add_child(_color_bar)
 
 
 func _process(_delta: float) -> void:
@@ -68,6 +109,11 @@ func _physics_process(delta: float) -> void:
 	while _extract_accum >= EXTRACT_INTERVAL:
 		_extract_accum -= EXTRACT_INTERVAL
 		_extract_lowest()
+
+	_solve_accum += delta
+	while _solve_accum >= SOLVE_INTERVAL:
+		_solve_accum -= SOLVE_INTERVAL
+		_solve_flux()
 
 
 func _inject_batch() -> void:
@@ -109,8 +155,43 @@ func _extract_lowest() -> void:
 	_total_extracted += 1
 
 
+func _solve_flux() -> void:
+	# The coupling step: homogenize the current pebble field onto the grid, solve
+	# the steady-state diffusion eigenproblem, then push results outward only.
+	var positions := _physics.positions()
+	if positions.is_empty():
+		return
+	_grid.homogenize(_pebbles, positions)
+	var sol := Neutronics.solve(_grid)
+	_k_eff = sol.k_eff
+	_solve_iters = sol.iterations
+
+	# Update the heatmap (consumer of sim state; never writes back).
+	_field_display.set_grid_field(_grid, sol.flux, _flux_desc)
+	if not _solved_once:
+		_color_bar.set_descriptor(_flux_desc)
+		_solved_once = true
+
+	# Sample the flux back onto each pebble — read-only at M1, the input M3 will
+	# turn into a per-pebble burnup rate.
+	for id in positions:
+		var peb: Pebble = _pebbles.get(id)
+		if peb != null:
+			peb.local_flux = _grid.sample(sol.flux, positions[id])
+
+
+func _draw() -> void:
+	# Silo shell, drawn in the parent's pass so it sits above the background
+	# heatmap but below the pebbles.
+	for seg in Silo.wall_segments():
+		draw_line(seg[0], seg[1], Color(0.9, 0.9, 0.95, 0.9), 3.0)
+
+
 func _update_hud() -> void:
-	_label.text = "PEBBLE BED — M0 granular flow\n" \
+	var crit := "subcritical" if _k_eff < 1.0 else "supercritical"
+	_label.text = "PEBBLE BED — M1 neutronics\n" \
 		+ "active: %d / %d\n" % [_pebbles.size(), TARGET_POPULATION] \
 		+ "injected: %d   discharged: %d\n" % [_total_injected, _total_extracted] \
+		+ "k-eff: %.4f  (%s)\n" % [_k_eff, crit] \
+		+ "solve iters: %d\n" % _solve_iters \
 		+ "fps: %d" % Engine.get_frames_per_second()

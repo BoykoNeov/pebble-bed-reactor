@@ -33,6 +33,10 @@ var pass_count: int = 0      # multi-pass fuel cycling
 ## energy balance. Kept here so feedback has something to read from day one.
 var temperature: float = 293.15
 
+## Local scalar flux sampled back from the grid solve (M1). Read-only downstream
+## for now — M3 turns it into a burnup rate. Populated by main.gd's coupling step.
+var local_flux: float = 0.0
+
 
 func _init(p_id: int = -1, p_radius: float = 8.0) -> void:
 	id = p_id

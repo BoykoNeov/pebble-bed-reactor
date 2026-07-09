@@ -1,5 +1,10 @@
 ; Engine configuration file.
-; Pebble Bed — 2D toy pebble bed reactor simulator (see CLAUDE.md).
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
 
 config_version=5
 
@@ -16,7 +21,7 @@ window/size/viewport_height=1080
 
 [physics]
 
-; Raise solver iterations: granular stacking is jittery/spongy with the default;
-; more iterations buys quieter quasi-static settling (CLAUDE.md pitfall).
+; Raised from the default: granular stacking is jittery/spongy otherwise; more
+; iterations buy quieter quasi-static settling (CLAUDE.md pitfall). The editor
+; may strip this comment on save — the rationale also lives in CLAUDE.md.
 2d/solver/solver_iterations=32
-common/physics_ticks_per_second=60
