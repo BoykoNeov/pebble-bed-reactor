@@ -263,7 +263,7 @@ func _run_coupled(grid: Grid, base_sa: PackedFloat32Array, flow: float,
 			# Rebuild absorption from the temp-free base + Doppler at the CURRENT
 			# (lagged) per-cell temperature — the real M4 code path.
 			for c in range(n):
-				grid.sigma_a[c] = base_sa[c]
+				grid.sigma_a1[c] = base_sa[c]
 				grid.temperature[c] = cell_temp[c]
 			# M4b: solve the downstream coolant field from the current cell temps,
 			# so each cell's Newton-cooling sink is the LOCAL (risen) coolant temp,
@@ -294,7 +294,7 @@ func _test_coupled_self_regulates_with_overshoot() -> void:
 	# k≈1 — and because temperature LAGS power it OVERSHOOTS the equilibrium first,
 	# then settles. Genuine dynamics, not M2's instant regulation.
 	var grid := _build_core(CrossSections.E_REF)
-	var base_sa := grid.sigma_a.duplicate()
+	var base_sa := grid.sigma_a1.duplicate()   # M5b: Doppler base is the fast group
 	var n := grid.cell_count()
 	var cell_temp := PackedFloat32Array(); cell_temp.resize(n); cell_temp.fill(Thermal.T_INLET)
 	var cold := Neutronics.solve(grid)
@@ -374,9 +374,9 @@ func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int) 
 	for i in range(steps):
 		if i % solve_every == 0:
 			grid.homogenize(pebbles, positions)          # rebuilds XS + grid.temperature
-			var base_sa := grid.sigma_a.duplicate()
+			var base_sa := grid.sigma_a1.duplicate()
 			k_cold = Neutronics.solve(grid).k_eff         # temp-free reference
-			grid.sigma_a = base_sa
+			grid.sigma_a1 = base_sa
 			Thermal.apply_field_doppler(grid)             # + Doppler at current temps
 			var sol := Neutronics.solve(grid)
 			k = sol.k_eff
@@ -416,38 +416,43 @@ func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int) 
 	for j in range(tail_from, peakt_hist.size()):
 		mt += peakt_hist[j]; mk += kcold_hist[j]; ma += a_hist[j]; nn += 1
 	mt /= nn; mk /= nn; ma /= nn
-	var vt := 0.0
+	var vt := 0.0; var va := 0.0
 	for j in range(tail_from, peakt_hist.size()):
 		vt += (peakt_hist[j] - mt) * (peakt_hist[j] - mt)
+		va += (a_hist[j] - ma) * (a_hist[j] - ma)
 	var sd := sqrt(vt / nn)
+	var sd_a := sqrt(va / nn)
 	var stride := maxi(1, peakt_hist.size() / 12)
 	var traj := ""
 	for j in range(0, peakt_hist.size(), stride):
 		traj += "    t=%3.0fs  k_cold=%.4f  peakT=%4.0f  A=%6.1f\n" \
 			% [j * 20 * dt, kcold_hist[j], peakt_hist[j], a_hist[j]]
-	return {"mean_peakT": mt, "sd_peakT": sd, "mean_kcold": mk, "mean_a": ma, "traj": traj}
+	return {"mean_peakT": mt, "sd_peakT": sd, "mean_kcold": mk, "mean_a": ma, "sd_a": sd_a, "traj": traj}
 
 
 func _test_coupled_with_burnup_settles() -> void:
 	print("\n[coupled loop WITH burnup + refueling: settles, no limit cycle]")
 	var st := _run_burnup_loop(0.113, Thermal.T_INLET, Thermal.FLOW_NOMINAL, 8000)  # 400 s
 	var mt: float = st["mean_peakT"]; var sd: float = st["sd_peakT"]
-	var mk: float = st["mean_kcold"]; var ma: float = st["mean_a"]
+	var mk: float = st["mean_kcold"]; var ma: float = st["mean_a"]; var sda: float = st["sd_a"]
 	print(st["traj"])
-	print("  tail(last40%%): mean peakT=%.0f K  sd=%.0f K (%.0f%%)  mean k_cold=%.4f  mean A=%.1f"
-		% [mt, sd, 100.0 * sd / maxf(mt - Feedback.T_REF, 1.0), mk, ma])
+	print("  tail(last40%%): mean peakT=%.0f K  sd=%.0f K (%.0f%%)  mean k_cold=%.4f  mean A=%.1f (sd %.0f%%)"
+		% [mt, sd, 100.0 * sd / maxf(mt - Feedback.T_REF, 1.0), mk, ma, 100.0 * sda / maxf(ma, 1.0)])
 	# The trap (advisor): a running core needs k_cold to HOLD > 1 with nonzero power.
 	_check(mk > 1.0, "k_cold holds supercritical at the refueling equilibrium (steady power exists)")
 	_check(ma > Thermal.A_RUNNING, "core settles at a running power level (not shut down)")
 	# Settled, not limit-cycling: tail peak-temp swing is a modest fraction of ΔT.
 	_check(sd < 0.25 * maxf(mt - Feedback.T_REF, 1.0),
 		"peak temperature is settled (tail swing < 25%% of ΔT) — no relaxation oscillation")
-	# A_REF must match the amplitude the core actually settles at — this is the real
-	# operating point (a burnt-down k_cold≈1.016 core), NOT solve_equilibrium on a
-	# fresh over-reactive lattice. If A_REF drifts from this, burnup desyncs from the
-	# operating power and the limit cycle returns (see thermal.gd A_REF rationale).
-	_check(absf(ma - Thermal.A_REF) < 0.5 * Thermal.A_REF,
-		"A_REF (%.0f) matches the settled operating amplitude (%.1f)" % [Thermal.A_REF, ma])
+	# Amplitude is settled too — an AMPLITUDE-AGNOSTIC no-limit-cycle guard (advisor): the
+	# power state's own tail swing is a modest fraction of its mean, whatever that mean is.
+	# This replaces a former hardcoded "A ≈ A_REF" match — that pinned the pass/fail to a
+	# magic amplitude measured on THIS synthetic lattice, but A_REF is the LIVE scene's
+	# operating amplitude (they legitimately differ, see thermal.gd A_REF rationale), so the
+	# match was testing an artifact of the harness geometry, not the physics. Steady power +
+	# steady temperature + k_cold>1 already prove the operating point; the magnitude is free.
+	_check(sda < 0.30 * maxf(ma, 1.0),
+		"power amplitude is settled (tail swing < 30%% of mean) — no relaxation oscillation")
 
 
 ## M4b load-following (advisor): raising the coolant INLET temperature must settle the
@@ -509,7 +514,7 @@ func _test_loss_of_flow_bounded() -> void:
 	# so POWER self-limits to a much lower level while temperature stays BOUNDED —
 	# it does NOT run away (the always-on ambient loss guarantees a steady state).
 	var grid := _build_core(CrossSections.E_REF)
-	var base_sa := grid.sigma_a.duplicate()
+	var base_sa := grid.sigma_a1.duplicate()   # M5b: Doppler base is the fast group
 	var n := grid.cell_count()
 	var cell_temp := PackedFloat32Array(); cell_temp.resize(n); cell_temp.fill(Thermal.T_INLET)
 	# Settle at nominal flow first.

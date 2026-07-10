@@ -77,12 +77,12 @@ func _test_keff_falls_with_temperature() -> void:
 	# must LOWER k-eff. Bypasses the search — drives temperature directly.
 	print("\n[k-eff vs uniform fuel temperature]")
 	var grid := _build_core(CrossSections.E_REF)
-	var base_sa := grid.sigma_a.duplicate()
+	var base_sa := grid.sigma_a1.duplicate()   # M5b: Doppler lands on the fast group
 	var prev_k := INF
 	var monotonic := true
 	for t in [293.15, 500.0, 800.0, 1200.0]:
 		for c in range(grid.cell_count()):
-			grid.sigma_a[c] = base_sa[c] + Feedback.doppler_sigma_a(t)
+			grid.sigma_a1[c] = base_sa[c] + Feedback.doppler_sigma_a(t)
 		var sol := Neutronics.solve(grid)
 		print("  T=%.1f K  ->  k=%.4f" % [t, sol.k_eff])
 		if sol.k_eff >= prev_k:

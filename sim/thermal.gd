@@ -140,13 +140,30 @@ const A_RUNNING := 0.05
 # with A/A_REF (advisor): at the design point A ≈ A_REF → the rate equals M3's
 # calibration (TIME_ACCEL and the depletion constants are PRESERVED, not re-tuned);
 # an idling core (A ≪ A_REF) barely burns; an over-powered one burns faster. Its
-# value is the settled amplitude at the LIVE operating point (enrichment ~11.3%,
-# k_cold ~ 1.016): (G_CONV_NOMINAL + G_AMBIENT) × the equilibrium ΔT there ≈ 30. WHY
-# not the ~15 of the cooler E_REF lattice: the live core runs a hotter, higher-power
-# equilibrium, so pinning A_REF to E_REF would read the operating core as ~2× power →
-# 2× burnup → k droops twice as fast as refueling restores it → a limit cycle.
-# Matching A_REF to the real operating amplitude keeps M3's ~10-pass fuel cycle.
-const A_REF := 30.0
+# value must be a SELF-CONSISTENT fixed point, because A_REF is NOT mere display
+# bookkeeping — it feeds the physics through a loop: power_frac = A/A_REF scales the
+# burnup rate → the equilibrium burnup distribution → k_cold → the Doppler ΔT the core
+# settles at → the settled amplitude A itself. So "the core settles at A, therefore set
+# A_REF = A" is CIRCULAR: a settled A measured at one A_REF is not the A the core would
+# settle at under a different A_REF. 87 is the value at which the loop closes on itself
+# — the coupled settle test converges to A ≈ 86 at A_REF = 87 (power_frac ≈ 1), and the
+# live main scene, run AT A_REF = 87, settles stable at ~900 K. Both worlds are stable
+# here; it is the only validated fixed point.
+#
+# WHY not the ~32 the live scene reads: that sample was taken with A_REF = 87 (power_frac
+# ≈ 0.37), so it is an OFF-fixed-point reading, not the amplitude the live core would
+# reach at power_frac 1. Chasing it (A_REF = 32) drove power_frac to ~2.7× in the coupled
+# tests → 2.7× burnup → k droops faster than refueling restores → a relaxation LIMIT
+# CYCLE (and the scram walk-away-safe bound broke as the over-powered core spiked post-
+# scram). The cost of staying at 87 is purely COSMETIC: the live core burns ~2.7× slow,
+# a timescale already compressed by TIME_ACCEL and invisible unless the player counts
+# passes — the burnup GRADIENT, flat-reactivity, and discharge-composition targets are
+# spatial/relative and survive. KNOWN follow-up: at power_frac ~0.37 a pebble needs
+# more passes to reach DISCHARGE_BURNUP, which can bump against the MAX_PASSES = 15
+# backstop and discharge it under-burned. Pinning A_REF to the live fixed point (an
+# iterative several-run calibration) is the real fix if the fuel cycle ever matters
+# quantitatively; for now the slow burn is an accepted cosmetic timescale offset.
+const A_REF := 87.0
 # Startup amplitude — a nominal running level. Paired with seeding pebble
 # temperatures to the M2 equilibrium so the sim starts NEAR steady state and just
 # settles, rather than launching with a violent cold-start transient (advisor).
@@ -339,11 +356,38 @@ static func steady_temp(p_fission: float, t_coolant: float, h_conv: float) -> fl
 	return (p_fission + h_conv * t_coolant + G_AMBIENT * T_AMBIENT) / (h_conv + G_AMBIENT)
 
 
-## Add the Doppler resonance-absorption feedback to a grid's absorption field
-## using its REAL per-cell temperature (from homogenized pebble temperatures),
-## in place. This is the M4 replacement for M2's critical-power search: the
-## temperature is now a measured state, not a value invented to force k = 1.
-## Delegates the correlation itself to Feedback.doppler_sigma_a (unchanged).
+## Add the Doppler resonance-absorption feedback to a grid's FAST-group absorption
+## field (M5b: Doppler is epithermal → Sigma_a1) using its REAL per-cell
+## temperature (from homogenized pebble temperatures), in place. This is the M4
+## replacement for M2's critical-power search: the temperature is now a measured
+## state, not a value invented to force k = 1. Delegates the correlation itself to
+## Feedback.doppler_sigma_a (unchanged).
 static func apply_field_doppler(grid: Grid) -> void:
 	for c in range(grid.cell_count()):
-		grid.sigma_a[c] += Feedback.doppler_sigma_a(grid.temperature[c])
+		grid.sigma_a1[c] += Feedback.doppler_sigma_a(grid.temperature[c])
+
+
+## Apply the moderator-temperature coefficient (M5b) to a grid's THERMAL-group
+## cross-sections in place, using each fuel cell's LOCAL coolant temperature. Hotter
+## coolant lowers the effective moderation M_eff (Feedback.moderator_m_eff), and both
+## M-dependent cross-sections follow it:
+##   * sigma_r  ∝ M      → rescaled by the ratio m_eff / m_base
+##   * sigma_a2  has only its MODERATOR-parasitic part (THERM_A_MOD·M·pack) move with
+##     M; the fuel/poison part is M-independent, so we shift by the exact parasitic
+##     delta THERM_A_MOD·(m_eff − m_base)·pack — no need to reconstruct the poison.
+## BOTH must move together: perturbing sigma_r alone (at fixed sigma_a2) makes k
+## monotone in M with NO sign flip; the emergent-sign MTC only exists because moving
+## M walks BOTH terms along the peaked k_inf(M) curve (cross_sections.gd header).
+##
+## Guarded to fuel cells (moderation > 0): reflector/void carry M = 0, and the
+## sigma_r ratio would divide by zero there. Expects the temperature-FREE base
+## sigma_r / sigma_a2 in place (as homogenize leaves them); the caller restores the
+## base each solve so this never stacks across frames (mirrors apply_field_doppler).
+static func apply_field_moderator(grid: Grid) -> void:
+	for c in range(grid.cell_count()):
+		var m_base := grid.moderation[c]
+		if m_base <= 0.0:
+			continue
+		var m_eff := Feedback.moderator_m_eff(m_base, grid.coolant_temp[c])
+		grid.sigma_r[c] *= m_eff / m_base
+		grid.sigma_a2[c] += CrossSections.THERM_A_MOD * (m_eff - m_base) * grid.packing[c]

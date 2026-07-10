@@ -40,9 +40,25 @@ var _in_bottom: float
 # Per-cell homogenized fields, row-major (idx = j * nx + i), length nx*ny.
 var material: PackedInt32Array
 var packing: PackedFloat32Array
-var d: PackedFloat32Array           # diffusion coefficient
-var sigma_a: PackedFloat32Array     # macroscopic absorption
-var nu_sigma_f: PackedFloat32Array  # macroscopic fission production
+# TWO-GROUP macroscopic cross-sections (M5b). Group 1 = fast, group 2 = thermal;
+# sigma_r is the fast→thermal down-scatter (removal). moderation is the per-cell
+# ratio M homogenized from pebble fuel loading — the base (design, reference
+# moderator temperature) value; the feedback layer rescales sigma_r / sigma_a2
+# from it at solve time for the moderator-temperature coefficient. The *_base
+# fields hold the temperature-FREE values homogenize writes; feedback (Doppler on
+# sigma_a1, MTC on sigma_r/sigma_a2) layers temperature dependence on top.
+var d1: PackedFloat32Array          # fast diffusion coefficient
+var d2: PackedFloat32Array          # thermal diffusion coefficient
+var sigma_a1: PackedFloat32Array    # fast absorption (Doppler target)
+var sigma_a2: PackedFloat32Array    # thermal absorption (fuel + moderator-parasitic + poison)
+var sigma_r: PackedFloat32Array     # fast → thermal removal (down-scatter)
+var nu_sigma_f1: PackedFloat32Array # fast fission production
+var nu_sigma_f2: PackedFloat32Array # thermal fission production
+var moderation: PackedFloat32Array  # per-cell moderation ratio M (fuel cells; 0 elsewhere)
+# Derived total fission production νΣf1+νΣf2. Kept because downstream consumers
+# (thermal coolant field, viz) use "nu_sigma_f > 0" purely as a FUEL-CELL FLAG,
+# and it is a convenient displayable total. Not read by the two-group solver.
+var nu_sigma_f: PackedFloat32Array
 # Area-weighted mean pebble temperature per cell (K), from the per-pebble
 # Lagrangian state (M4). This is how the REAL, time-lagged fuel temperature
 # reaches the Eulerian Doppler solve — replacing M2's instant critical-power
@@ -80,9 +96,15 @@ func _alloc() -> void:
 	var n := nx * ny
 	material = PackedInt32Array(); material.resize(n)
 	packing = PackedFloat32Array(); packing.resize(n)
-	d = PackedFloat32Array(); d.resize(n)
-	sigma_a = PackedFloat32Array(); sigma_a.resize(n)
+	d1 = PackedFloat32Array(); d1.resize(n)
+	d2 = PackedFloat32Array(); d2.resize(n)
+	sigma_a1 = PackedFloat32Array(); sigma_a1.resize(n)
+	sigma_a2 = PackedFloat32Array(); sigma_a2.resize(n)
+	sigma_r = PackedFloat32Array(); sigma_r.resize(n)
+	nu_sigma_f1 = PackedFloat32Array(); nu_sigma_f1.resize(n)
+	nu_sigma_f2 = PackedFloat32Array(); nu_sigma_f2.resize(n)
 	nu_sigma_f = PackedFloat32Array(); nu_sigma_f.resize(n)
+	moderation = PackedFloat32Array(); moderation.resize(n)
 	temperature = PackedFloat32Array(); temperature.resize(n)
 	temperature.fill(T_INLET)
 	coolant_temp = PackedFloat32Array(); coolant_temp.resize(n)
@@ -124,6 +146,7 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 	var b_acc := PackedFloat32Array(); b_acc.resize(n) # area-weighted burnup
 	var p_acc := PackedFloat32Array(); p_acc.resize(n) # area-weighted poison
 	var t_acc := PackedFloat32Array(); t_acc.resize(n) # area-weighted temperature (M4)
+	var l_acc := PackedFloat32Array(); l_acc.resize(n) # area-weighted fuel loading (M5b)
 
 	for id in positions:
 		var c := cell_of(positions[id])
@@ -141,6 +164,7 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 		b_acc[c] += a * peb.burnup
 		p_acc[c] += a * peb.poison
 		t_acc[c] += a * peb.temperature   # M4: real lumped pebble temperature
+		l_acc[c] += a * peb.fuel_loading  # M5b: sets the cell moderation ratio
 
 	var cell_area := h * h
 	for j in ny:
@@ -154,20 +178,42 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 				var e: float = e_acc[c] * inv
 				var b: float = b_acc[c] * inv
 				var poison: float = p_acc[c] * inv
-				d[c] = CrossSections.diffusion_fuel(pack)
-				sigma_a[c] = CrossSections.sigma_a_fuel(pack, poison)
-				nu_sigma_f[c] = CrossSections.nu_sigma_f(pack, e, b)
+				var loading: float = l_acc[c] * inv
+				var m := CrossSections.moderation(loading)
+				moderation[c] = m
+				d1[c] = CrossSections.diffusion_fast(pack)
+				d2[c] = CrossSections.diffusion_thermal(pack)
+				sigma_a1[c] = CrossSections.sigma_a1_fuel(pack)
+				sigma_a2[c] = CrossSections.sigma_a2_fuel(pack, poison, m)
+				sigma_r[c] = CrossSections.sigma_r_fuel(pack, m)
+				var f1 := CrossSections.nu_sigma_f1(pack, e, b)
+				var f2 := CrossSections.nu_sigma_f2(pack, e, b)
+				nu_sigma_f1[c] = f1
+				nu_sigma_f2[c] = f2
+				nu_sigma_f[c] = f1 + f2   # derived total / fuel-cell flag
 				temperature[c] = t_acc[c] * inv   # mean of the pebbles actually here
 			elif _inside_vessel(i, j):
 				material[c] = CrossSections.VOID
-				d[c] = CrossSections.VOID_D
-				sigma_a[c] = CrossSections.VOID_SIGA
+				moderation[c] = 0.0
+				d1[c] = CrossSections.VOID_D1
+				d2[c] = CrossSections.VOID_D2
+				sigma_a1[c] = CrossSections.VOID_SIGA1
+				sigma_a2[c] = CrossSections.VOID_SIGA2
+				sigma_r[c] = CrossSections.VOID_SIGR
+				nu_sigma_f1[c] = 0.0
+				nu_sigma_f2[c] = 0.0
 				nu_sigma_f[c] = 0.0
 				temperature[c] = T_INLET
 			else:
 				material[c] = CrossSections.REFLECTOR
-				d[c] = CrossSections.REFL_D
-				sigma_a[c] = CrossSections.REFL_SIGA
+				moderation[c] = 0.0
+				d1[c] = CrossSections.REFL_D1
+				d2[c] = CrossSections.REFL_D2
+				sigma_a1[c] = CrossSections.REFL_SIGA1
+				sigma_a2[c] = CrossSections.REFL_SIGA2
+				sigma_r[c] = CrossSections.REFL_SIGR
+				nu_sigma_f1[c] = 0.0
+				nu_sigma_f2[c] = 0.0
 				nu_sigma_f[c] = 0.0
 				temperature[c] = T_INLET
 

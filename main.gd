@@ -422,12 +422,18 @@ func _solve_flux() -> void:
 		return
 	_grid.homogenize(_pebbles, positions)
 
-	# Snapshot the temperature-FREE base absorption homogenize just wrote (Neutronics
-	# only reads the grid, never mutates it, so this stays clean across the cold solve).
-	var base_sa := _grid.sigma_a.duplicate()
+	# Snapshot the temperature-FREE base FAST absorption homogenize just wrote
+	# (Neutronics only reads the grid, never mutates it, so this stays clean across
+	# the cold solve). M5b: Doppler perturbs sigma_a1; the moderator-temperature
+	# coefficient perturbs sigma_r / sigma_a2, so those are snapshot too.
+	var base_sa1 := _grid.sigma_a1.duplicate()
+	var base_sr := _grid.sigma_r.duplicate()
+	var base_sa2 := _grid.sigma_a2.duplicate()
 
 	# Cold (temperature-free) reference solve — the honest UNCONTROLLED reactivity,
-	# kept as the HUD contrast: the k the core WOULD run at with no Doppler. Cheap here.
+	# kept as the HUD contrast: the k the core WOULD run at with no feedback. Runs on
+	# the base cross-sections homogenize just wrote (design M, no Doppler), so k_cold
+	# excludes BOTH temperature feedbacks — Doppler and the moderator coefficient. Cheap.
 	var cold := Neutronics.solve(_grid)
 	_k_cold = cold.k_eff
 
@@ -441,17 +447,30 @@ func _solve_flux() -> void:
 		_seed_thermal_equilibrium(positions, cold.flux)
 
 	if _feedback_on:
-		# Warm solve: temperature-free base + Doppler at the CURRENT per-cell temperature.
-		_grid.sigma_a = base_sa.duplicate()
+		# Warm solve: temperature-free base + Doppler (fuel T → sigma_a1) + moderator-
+		# temperature feedback (coolant T → sigma_r / sigma_a2) at the CURRENT per-cell
+		# state. Restore all three bases first so neither feedback stacks across frames.
+		# The MTC reads grid.coolant_temp, which solve_coolant_field fills at the END of
+		# this function — so it uses LAST frame's coolant field. That one-solve lag is
+		# deliberate: it breaks the coolant→MTC→power→coolant circularity, and the field
+		# moves far slower than the solve cadence, so the lag is invisible. At cold start
+		# coolant_temp = inlet everywhere → M_eff = M_base → the MTC is simply a no-op.
+		_grid.sigma_a1 = base_sa1.duplicate()
+		_grid.sigma_r = base_sr.duplicate()
+		_grid.sigma_a2 = base_sa2.duplicate()
 		Thermal.apply_field_doppler(_grid)
+		Thermal.apply_field_moderator(_grid)
 		var sol := Neutronics.solve(_grid)
 		_k_eff = sol.k_eff
 		_last_flux = sol.flux
 		_solve_iters = sol.iterations
 	else:
-		# Feedback OFF: the uncontrolled state — no Doppler, so k is the raw cold k and
-		# nothing self-limits power (it runs away, capped for display in _thermal_step).
-		_grid.sigma_a = base_sa.duplicate()   # ensure the heatmap shows the base, not a stale warm field
+		# Feedback OFF: the uncontrolled state — no Doppler, no MTC, so k is the raw cold
+		# k and nothing self-limits power (it runs away, capped for display). Restore the
+		# bases so the heatmaps show the design cross-sections, not a stale warm field.
+		_grid.sigma_a1 = base_sa1.duplicate()
+		_grid.sigma_r = base_sr.duplicate()
+		_grid.sigma_a2 = base_sa2.duplicate()
 		_k_eff = cold.k_eff
 		_last_flux = cold.flux
 		_solve_iters = cold.iterations

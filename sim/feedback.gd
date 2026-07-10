@@ -29,10 +29,17 @@ extends RefCounted
 const T_REF := 293.15       # reference (cold / inlet) fuel temperature, K.
                             # Doppler feedback is defined to be zero here.
 
-# sqrt(T) Doppler strength. Tuned so the nominal core (M1 cold k ~ 1.01) burns
-# off its ~1% excess reactivity at a plausible fuel temperature (a few hundred K
-# above inlet), not at 10^4 K. See tests/test_feedback.gd, which drives this.
-const DOPPLER_C := 4.3e-5
+# sqrt(T) Doppler strength. Tuned so the nominal core (cold k ~ 1.01) burns off
+# its ~1% excess reactivity at a plausible fuel temperature (a few hundred K above
+# inlet), not at 10^4 K. See tests/test_feedback.gd, which drives this.
+#
+# M5b: raised from 4.3e-5. Doppler now perturbs the FAST group (Sigma_a1), which
+# has a weaker k-sensitivity than the old one-group total absorption, so the same
+# strength left the nominal equilibrium too hot (~750 K rise) and the search
+# saturating DT_MAX across a small enrichment range. The larger constant restores
+# the ~few-hundred-K operating point AND steepens the feedback (equilibria sit
+# where the sqrt(T) slope is larger), so k stays pinned across the enrichment sweep.
+const DOPPLER_C := 7.5e-5
 
 # Critical-power search: k decreases monotonically with peak fuel temperature, so
 # a bisection on the peak temperature rise is bulletproof.
@@ -41,14 +48,50 @@ const K_TOL := 1.0e-3       # regulate until |k - 1| < this
 const MAX_ITERS := 40
 
 
-## Extra macroscopic absorption from Doppler broadening at fuel temperature `temp`.
-## Zero at (and below) T_REF, monotonically increasing above it — the source of
-## the negative reactivity feedback. Non-fuel cells never see this because their
+## Extra FAST-group (Sigma_a1) absorption from Doppler broadening at fuel
+## temperature `temp`. Doppler resonance capture (U-238) is EPITHERMAL, so in the
+## two-group model (M5b) it lands on the fast group, not the thermal group. Zero
+## at (and below) T_REF, monotonically increasing above it — the source of the
+## negative reactivity feedback. Non-fuel cells never see this because their
 ## temperature stays at T_REF (no fission power → no heating; see solve_equilibrium).
 static func doppler_sigma_a(temp: float) -> float:
 	if temp <= T_REF:
 		return 0.0
 	return DOPPLER_C * (sqrt(temp) - sqrt(T_REF))
+
+
+# --- Moderator-temperature coefficient (M5b) --------------------------------
+#
+# The SECOND temperature feedback (CLAUDE.md M4/M5), driven by the COOLANT/moderator
+# temperature rather than the fuel temperature. Its defining feature — and the reason
+# it earns its own milestone — is that its SIGN IS EMERGENT, not hardcoded: coolant
+# heat perturbs the moderation ratio M, and because k_inf(M) is PEAKED (see
+# cross_sections.gd header), the reactivity response is NEGATIVE below the peak
+# (under-moderated → self-stabilizing) but POSITIVE above it (over-moderated →
+# runaway). That sign flip is the "a player can accidentally build an unstable core
+# and see why" teaching target (CLAUDE.md validation targets).
+#
+# The DRIVER has a single fixed sign: a hotter moderator thermally hardens the
+# neutron spectrum (graphite expands / density drops, slowing-down weakens), so the
+# EFFECTIVE moderation M_eff FALLS with temperature — always, regardless of regime.
+# Whether that falling M raises or lowers k is precisely what the peak decides. Same
+# sqrt(T) form as Doppler; zero at T_REF so a cold core sits at its design M.
+#
+# MTC_C magnitude is the calibration that matters (advisor): large enough that the
+# over-moderated core visibly destabilizes, small enough that the nominal
+# (under-moderated) core stays settled. Tuned live against those two behaviors; the
+# static sign flip (tests/test_neutronics.gd) holds at ANY positive MTC_C.
+const MTC_C := 2.0e-3
+
+## Effective moderation ratio at coolant/moderator temperature `t_cool`, given the
+## design (cold) ratio `m_base`. Hotter coolant → LESS effective moderation
+## (m_eff < m_base) — the fixed-sign driver. The k-response sign flip lives in
+## k_inf(M), not here. Floored at a small positive fraction so the sigma_r rescale
+## (which is proportional to m) can never go negative in a hot transient.
+static func moderator_m_eff(m_base: float, t_cool: float) -> float:
+	if t_cool <= T_REF or m_base <= 0.0:
+		return m_base
+	return maxf(m_base * (1.0 - MTC_C * (sqrt(t_cool) - sqrt(T_REF))), 0.05 * m_base)
 
 
 ## Result of one coupled (neutronics + Doppler) quasi-static solve.
@@ -80,20 +123,22 @@ class Equilibrium:
 ## If the core is not cold-supercritical, NO positive power is critical (feedback
 ## can only lower k), so it regulates to zero — a passive shutdown.
 ##
-## grid.sigma_a is treated as the temperature-FREE base (as homogenize leaves it).
-## The search never corrupts it: it snapshots the base, and writes back the
-## equilibrium (warm) absorption so the heatmap/readouts show the regulated state.
+## grid.sigma_a1 (the FAST group) is treated as the temperature-FREE base (as
+## homogenize leaves it). The search never corrupts it: it snapshots the base, and
+## writes back the equilibrium (warm) absorption so the heatmap/readouts show the
+## regulated state.
 static func solve_equilibrium(grid: Grid, power_scale := 1.0) -> Equilibrium:
 	var n := grid.cell_count()
-	var base_sa := grid.sigma_a.duplicate()   # temperature-free base absorption
-	var nsf := grid.nu_sigma_f
+	var base_sa := grid.sigma_a1.duplicate()   # temperature-free fast-group base absorption
 
 	var eq := Equilibrium.new()
 
 	# Cold reference solve (feedback off): establishes k_cold and the power shape.
+	# cold.flux is already the peak-normalized fission-rate density — i.e. exactly the
+	# power shape — so no separate _power_shape step is needed (M5b two-group).
 	var cold := Neutronics.solve(grid)
 	eq.k_cold = cold.k_eff
-	var shape := _power_shape(nsf, cold.flux, n)
+	var shape := cold.flux.duplicate()
 
 	if cold.k_eff <= 1.0:
 		# Subcritical even cold — feedback only lowers k, so there is no critical
@@ -137,23 +182,6 @@ static func solve_equilibrium(grid: Grid, power_scale := 1.0) -> Equilibrium:
 	return eq
 
 
-## Peak-normalized fission-power-density shape (nuSigma_f * flux), in [0, 1].
-## Zero wherever there is no fuel (nuSigma_f = 0), so temperature only rises in
-## the fuel region.
-static func _power_shape(nsf: PackedFloat32Array, flux: PackedFloat32Array, n: int) -> PackedFloat32Array:
-	var pd := PackedFloat32Array(); pd.resize(n)
-	var peak := 0.0
-	for c in range(n):
-		var v := nsf[c] * flux[c]
-		pd[c] = v
-		peak = maxf(peak, v)
-	if peak > 0.0:
-		var inv := 1.0 / peak
-		for c in range(n):
-			pd[c] *= inv
-	return pd
-
-
 ## T[c] = T_REF + peak_dt * shape[c].
 static func _temp_field(shape: PackedFloat32Array, peak_dt: float, n: int) -> PackedFloat32Array:
 	var t := PackedFloat32Array(); t.resize(n)
@@ -162,8 +190,9 @@ static func _temp_field(shape: PackedFloat32Array, peak_dt: float, n: int) -> Pa
 	return t
 
 
-## Write the warm absorption into grid.sigma_a: base + Doppler(local temperature).
+## Write the warm FAST-group absorption into grid.sigma_a1: base + Doppler(local
+## temperature). (M5b: Doppler is epithermal → fast group.)
 static func _apply_doppler(grid: Grid, base_sa: PackedFloat32Array, shape: PackedFloat32Array, peak_dt: float, n: int) -> void:
 	for c in range(n):
 		var temp := T_REF + peak_dt * shape[c]
-		grid.sigma_a[c] = base_sa[c] + doppler_sigma_a(temp)
+		grid.sigma_a1[c] = base_sa[c] + doppler_sigma_a(temp)

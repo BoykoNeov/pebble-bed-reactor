@@ -18,6 +18,15 @@ var id: int = -1
 ## surface-to-volume / self-shielding (not packing fraction) — see CLAUDE.md.
 var radius: float = 8.0
 
+## Fuel loading: heavy-metal mass per pebble relative to nominal (1.0). One of
+## CLAUDE.md's three player design knobs (size, fuel loading, enrichment), wired
+## at M5b. It sets the graphite : heavy-metal ratio, hence the MODERATION of the
+## cell the pebble sits in (CrossSections.moderation): LOWER loading = more
+## graphite per gram of fuel = MORE moderation. Homogenize area-weights it into a
+## per-cell moderation ratio that drives the two-group removal / thermal
+## absorption — and therefore the sign of the moderator-temperature coefficient.
+var fuel_loading: float = 1.0
+
 ## Minimal isotopic vector (atoms, arbitrary toy units). Expanded at M3.
 ## Kept as named fields rather than an array so the physics meaning stays legible.
 var u235: float = 0.0
