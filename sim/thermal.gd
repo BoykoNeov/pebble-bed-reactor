@@ -73,6 +73,42 @@ const G_AMBIENT := 0.005
 # self-consistency the test checks).
 const HEAT_PER_FLUX := 1.0
 
+# --- Decay heat (M5) --------------------------------------------------------
+#
+# After fission stops, decaying fission products keep releasing heat — the reason a
+# reactor must still be cooled post-scram and the basis of the passive-safety demo
+# (CLAUDE.md glossary "decay heat"). Modeled ENERGY-CONSERVINGLY so it does NOT
+# perturb the M4 operating point (advisor): the total fission power S is RE-
+# PARTITIONED, not augmented. A fraction (1 − DECAY_GAMMA) of S is deposited
+# promptly; the rest feeds a few decay-heat reservoirs E_i that fill from fission
+# and drain at their own rate λ_i:
+#     dE_i/dt = f_i·S − λ_i·E_i,   delivered decay power = Σ λ_i·E_i
+# At steady state λ_i·E_i = f_i·S, so decay delivers Σf_i·S = DECAY_GAMMA·S and the
+# TOTAL delivered heat (1−γ)S + γS = S — identical to M4, so A_REF and the operating
+# temperatures are untouched. ONLY the post-scram transient differs: the prompt part
+# vanishes with the fission power, and the reservoirs drain to give the characteristic
+# fast-drop-then-slow-tail decay-heat curve that keeps the core hot after shutdown.
+#
+# Three toy groups span fast→slow (τ ≈ seconds → ~2 min) so the tail is VISIBLE over a
+# demo rather than a Way-Wigner fit to real half-lives (CLAUDE.md: qualitative toy).
+# γ ≈ 6.5% echoes the ~7% of reactor power that is decay heat just after shutdown.
+# Pinned by tests/test_thermal.gd; γ and the λ's are the ONLY knobs (never A_REF).
+const DECAY_FRACS := [0.030, 0.025, 0.010]     # f_i (Σ = DECAY_GAMMA)
+const DECAY_LAMBDAS := [0.40, 0.05, 0.008]     # λ_i (1/s): τ ≈ 2.5 / 20 / 125 s
+const DECAY_GAMMA := 0.065                      # Σ f_i; prompt fraction = 1 − this
+
+# --- Scram (M5) -------------------------------------------------------------
+#
+# Emergency shutdown: a full control-rod insertion — a large negative reactivity
+# that drives the power kinetics far subcritical, so fission power collapses over a
+# ~1/(SCRAM_WORTH·KINETICS_GAIN) ≈ 1.7 s e-fold. Applied to the KINETICS ONLY (an
+# effective k = k_eff − SCRAM_WORTH): unlike the feedback-OFF demo, scram does NOT
+# freeze the thermal / decay-heat loop, because the whole point of the passive-safety
+# demo is that heat CONTINUES after fission stops. Worth is large enough to hold the
+# core subcritical even after Doppler fully releases as it cools (k_cold ~ 1.02 ⇒ need
+# ≫ 0.02), so the amplitude pins at its source floor. Foreshadows M5 control rods.
+const SCRAM_WORTH := 0.15
+
 # --- Power kinetics (toy point-kinetics) ------------------------------------
 
 # dA/dt = A·(k−1)·KINETICS_GAIN. GAIN sets the power e-folding time: at a typical
@@ -233,10 +269,66 @@ static func step_pebble_temp(temp: float, p_fission: float, t_coolant: float, h_
 	return src / gain
 
 
-## Per-pebble fission heat-generation rate from the current power amplitude and
-## the pebble's local (peak-normalized) flux. The M4 heat source.
+## Per-pebble TOTAL fission heat-generation rate S from the current power amplitude
+## and the pebble's local (peak-normalized) flux. The M4 heat source; at M5 it is
+## split into a prompt part (prompt_power) and the decay-heat reservoirs.
 static func pebble_power(amplitude: float, local_flux: float) -> float:
 	return HEAT_PER_FLUX * amplitude * local_flux
+
+
+## Number of decay-heat groups (reservoirs per pebble).
+static func decay_group_count() -> int:
+	return DECAY_FRACS.size()
+
+
+## The PROMPT (instantaneous) fraction of the total fission power S — the part NOT
+## routed through the decay reservoirs. Delivered pebble heat = prompt_power(S) +
+## step_decay_heat(...); at steady state that sums back to exactly S (see header).
+static func prompt_power(s: float) -> float:
+	return (1.0 - DECAY_GAMMA) * s
+
+
+## Semi-implicit (backward-Euler) multi-group decay-heat update for one pebble's
+## reservoirs `e` (lazily sized/zeroed on first use — fresh fuel has no fission-
+## product inventory), fed by the total fission power `s`. Returns the decay power
+## DELIVERED this step (Σ λ_i·E_i') — the heat that persists after fission stops.
+##
+##   E_i' = (E_i + dt·f_i·s) / (1 + dt·λ_i)
+##
+## Backward Euler ⇒ unconditionally stable and strictly non-negative at any step,
+## matching step_power / step_pebble_temp (advisor: don't reintroduce an explicit
+## integrator that can go negative during a fast scram transient).
+static func step_decay_heat(e: PackedFloat32Array, s: float, dt: float) -> float:
+	if e.size() != DECAY_FRACS.size():
+		e.resize(DECAY_FRACS.size())   # zero-initialized: no inventory yet
+	var delivered := 0.0
+	for i in range(DECAY_FRACS.size()):
+		var ei := (e[i] + dt * float(DECAY_FRACS[i]) * s) / (1.0 + dt * float(DECAY_LAMBDAS[i]))
+		e[i] = ei
+		delivered += float(DECAY_LAMBDAS[i]) * ei
+	return delivered
+
+
+## Seed the reservoirs to the steady state for a constant fission power `s`
+## (E_i = f_i·s / λ_i), so the core can OPEN at its operating decay-heat inventory
+## instead of building it up from zero — the same reason pebble temperatures are
+## seeded at startup (advisor: avoid a spurious decay-heat build-up transient).
+static func seed_decay_heat(e: PackedFloat32Array, s: float) -> void:
+	e.resize(DECAY_FRACS.size())
+	for i in range(DECAY_FRACS.size()):
+		e[i] = float(DECAY_FRACS[i]) * s / float(DECAY_LAMBDAS[i])
+
+
+## Decay power currently stored in a pebble's reservoirs (Σ λ_i·E_i), without
+## advancing them — for the HUD readout and the decay-heat heatmap field. Zero for
+## an uninitialized (fresh, never-stepped) reservoir.
+static func decay_power(e: PackedFloat32Array) -> float:
+	if e.size() != DECAY_FRACS.size():
+		return 0.0
+	var d := 0.0
+	for i in range(DECAY_FRACS.size()):
+		d += float(DECAY_LAMBDAS[i]) * e[i]
+	return d
 
 
 ## The steady-state temperature a pebble would reach at fixed power and cooling —

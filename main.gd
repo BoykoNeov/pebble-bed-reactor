@@ -122,6 +122,16 @@ var _mean_temp := Feedback.T_REF      # bed-average fuel temperature (readout)
 var _thermal_seeded := false          # one-time near-equilibrium seed done?
 var _running := false                 # core producing power (gates depletion)
 
+# Decay heat & scram (M5). Decay heat is the fraction of the fuel heat that comes
+# from decaying fission products — it PERSISTS after fission stops, so it must still
+# be cooled (CLAUDE.md decay-heat / passive-safety). SCRAM is an emergency shutdown
+# (large negative reactivity into the kinetics) that collapses fission power WITHOUT
+# freezing the thermal/decay loop — the walk-away-safe demo watches the decay-heat
+# tail bound the temperature after the reactor trips.
+var _scrammed := false                # emergency shutdown engaged (kinetics only)
+var _decay_power := 0.0               # bed-total delivered decay heat (readout, a.u.)
+var _decay_frac := 0.0                # decay heat as a fraction of total delivered heat
+
 # Coolant transport & loop closure (M4b). The coolant is no longer a uniform inlet:
 # it enters cold at the top and warms as it flows down the bed, so each pebble sees a
 # LOCAL sink temperature. The heat exchanger closes the loop — extracted power = the
@@ -134,6 +144,7 @@ var _last_coolant: PackedFloat32Array = PackedFloat32Array()
 
 # Burnup / outflow (M3)
 var _burnup_desc: FieldDescriptor      # first PEBBLE-world (Lagrangian) field
+var _decay_desc: FieldDescriptor       # M5 per-pebble decay-heat power (Lagrangian)
 var _total_recirculated := 0           # pebbles sent back for another pass
 # Running outflow composition of DISCHARGED pebbles (the "inspect the spent fuel"
 # goal). Sums → averages; plus the most recent discharge for an at-a-glance read.
@@ -195,6 +206,12 @@ func _ready() -> void:
 	# its own burnup, so you can literally watch a burned pebble descend the bed
 	# (CLAUDE.md two render modes). Fixed range [0, discharge] keeps the scale stable.
 	_burnup_desc = FieldDescriptor.new("Burnup", "MWd/kgHM", FieldDescriptor.PEBBLE, 0.0, Depletion.DISCHARGE_BURNUP, false)
+	# Decay heat (M5) — a per-pebble (Lagrangian) field: each pebble colored by the heat
+	# its decaying fission products are currently releasing. Barely varies during normal
+	# operation, but after a SCRAM it is the ONLY heat source, so this view shows the
+	# decay-heat tail lingering (and draining) once fission has stopped. Fixed range up to
+	# ~γ·S at the peak-flux operating pebble keeps the scale stable.
+	_decay_desc = FieldDescriptor.new("Decay heat", "a.u.", FieldDescriptor.PEBBLE, 0.0, 2.0, false)
 
 	# Field registry: each entry pairs a descriptor with a getter for its latest
 	# values. GRID fields expose `get` → a per-cell array; PEBBLE fields expose
@@ -206,6 +223,7 @@ func _ready() -> void:
 		{"desc": _coolant_desc, "get": func() -> PackedFloat32Array: return _last_coolant},
 		{"desc": _pebble_temp_desc, "get_peb": func(peb: Pebble) -> float: return peb.temperature},
 		{"desc": _burnup_desc, "get_peb": func(peb: Pebble) -> float: return peb.burnup},
+		{"desc": _decay_desc, "get_peb": func(peb: Pebble) -> float: return Thermal.decay_power(peb.decay_e)},
 	]
 
 	_build_hud()
@@ -483,13 +501,19 @@ func _thermal_step(delta: float) -> void:
 	# the contrast (M2's "no self-limiting"). Toggling back ON resumes from the held state.
 	if delta <= 0.0 or not _feedback_on:
 		return
-	# Power amplitude: exact exponential update at the frozen-between-solves k.
-	_amplitude = Thermal.step_power(_amplitude, _k_eff, delta)
+	# Power amplitude: exact exponential update at the frozen-between-solves k. SCRAM
+	# (M5) subtracts a large negative reactivity here ONLY — the effective kinetics k
+	# goes far subcritical so fission power collapses, while the thermal/decay loop
+	# below keeps integrating (that is the whole point: heat continues after trip).
+	var k_kin := _k_eff - (Thermal.SCRAM_WORTH if _scrammed else 0.0)
+	_amplitude = Thermal.step_power(_amplitude, k_kin, delta)
 	var h := Thermal.h_of_flow(_coolant_flow)
 	var peak := Feedback.T_REF
 	var sum_t := 0.0
 	var extracted := 0.0
 	var out_t := _inlet_temp
+	var sum_decay := 0.0        # bed-total delivered decay heat this step
+	var sum_delivered := 0.0    # bed-total delivered fuel heat (prompt + decay)
 	var count := 0
 	for id in _pebbles:
 		var peb: Pebble = _pebbles[id]
@@ -497,7 +521,13 @@ func _thermal_step(delta: float) -> void:
 		# downstream transport field), not a uniform inlet — a deep pebble sheds heat
 		# into hotter helium than a shallow one.
 		var t_cool := peb.local_coolant
-		var p := Thermal.pebble_power(_amplitude, peb.local_flux)
+		# M5 energy-conserving split of the fission power S: a prompt part deposited now,
+		# plus the decay-heat reservoirs (fed by S, drained at their own rate). At steady
+		# state prompt + decay = S exactly, so this does NOT move the M4 operating point;
+		# only after a scram (S→0) do the reservoirs keep delivering the decay-heat tail.
+		var s := Thermal.pebble_power(_amplitude, peb.local_flux)
+		var decay := Thermal.step_decay_heat(peb.decay_e, s, delta)
+		var p := Thermal.prompt_power(s) + decay
 		peb.temperature = Thermal.step_pebble_temp(peb.temperature, p, t_cool, h, delta)
 		# Heat carried off by the coolant — the enthalpy the heat exchanger harvests on
 		# the secondary side (M4b loop closure). Summed over the bed this IS the headline
@@ -505,6 +535,8 @@ func _thermal_step(delta: float) -> void:
 		# equals the fission power. The always-on ambient loss is a passive structural
 		# leak, NOT harvested, so it is excluded from the headline.
 		extracted += h * (peb.temperature - t_cool)
+		sum_decay += decay
+		sum_delivered += p
 		peak = maxf(peak, peb.temperature)
 		sum_t += peb.temperature
 		out_t = maxf(out_t, t_cool)
@@ -513,6 +545,8 @@ func _thermal_step(delta: float) -> void:
 	_mean_temp = sum_t / count if count > 0 else Feedback.T_REF
 	_coolant_out = out_t
 	_power = extracted * THERMAL_MW_SCALE
+	_decay_power = sum_decay * THERMAL_MW_SCALE
+	_decay_frac = sum_decay / sum_delivered if sum_delivered > 0.0 else 0.0
 	_running = _amplitude > Thermal.A_RUNNING
 
 
@@ -531,10 +565,15 @@ func _seed_thermal_equilibrium(positions: Dictionary, cold_flux: PackedFloat32Ar
 		var peb: Pebble = _pebbles.get(id)
 		if peb != null:
 			var lf := _grid.sample(cold_flux, positions[id])
-			var p := Thermal.pebble_power(Thermal.A_REF, lf)
+			var s := Thermal.pebble_power(Thermal.A_REF, lf)
 			# Seed against the inlet coolant (the coolant field's downstream rise is a
-			# modest correction the bed settles out over its first few seconds).
-			peb.temperature = Thermal.steady_temp(p, _inlet_temp, h)
+			# modest correction the bed settles out over its first few seconds). steady_temp
+			# takes the TOTAL fuel heat S: at steady state prompt + decay = S, so the M5
+			# split does not change the seed temperature — but the decay reservoirs must be
+			# seeded to that same steady inventory (γ·S) so the core opens at operating decay
+			# heat instead of building it up (a spurious startup transient otherwise).
+			peb.temperature = Thermal.steady_temp(s, _inlet_temp, h)
+			Thermal.seed_decay_heat(peb.decay_e, s)
 	_amplitude = Thermal.A_REF
 	_thermal_seeded = true
 
@@ -592,6 +631,16 @@ func _toggle_feedback() -> void:
 	_solve_flux()   # re-solve immediately so the contrast is instant
 
 
+## Trip / reset the scram (M5). Scram inserts a large negative reactivity into the
+## power kinetics (Thermal.SCRAM_WORTH) so fission power collapses over ~2 s, but —
+## unlike the feedback-OFF freeze — the thermal and decay-heat loop keeps running, so
+## the player watches the decay-heat tail keep the core hot and bounded after the trip
+## (the walk-away-safe demo — pair it with a flow cut). Toggling off lets the core
+## restart from its held state if it is still cold-supercritical.
+func _toggle_scram() -> void:
+	_scrammed = not _scrammed
+
+
 func _cycle_field() -> void:
 	_current_field = (_current_field + 1) % _fields.size()
 	_refresh_field_display()
@@ -624,6 +673,8 @@ func _input(event: InputEvent) -> void:
 		_set_inlet(_inlet_temp + Thermal.INLET_STEP)
 	elif event.is_action_pressed("inlet_down"):
 		_set_inlet(_inlet_temp - Thermal.INLET_STEP)
+	elif event.is_action_pressed("scram"):
+		_toggle_scram()
 	elif event is InputEventKey:
 		match event.keycode:
 			KEY_F:
@@ -645,6 +696,10 @@ func _input(event: InputEvent) -> void:
 				_set_inlet(_inlet_temp + Thermal.INLET_STEP)
 			KEY_K:
 				_set_inlet(_inlet_temp - Thermal.INLET_STEP)
+			# SCRAM (M5) — emergency shutdown. Space trips / resets it; pair with a flow
+			# cut (,) to watch the decay-heat tail bound the temperature (walk-away safe).
+			KEY_SPACE:
+				_toggle_scram()
 			KEY_V, KEY_TAB:
 				_cycle_field()
 
@@ -693,12 +748,19 @@ func _update_hud() -> void:
 	var status := ""
 	if not _feedback_on:
 		status = "UNCONTROLLED — no self-limiting"
+	elif _scrammed:
+		status = "SCRAMMED — subcritical, decay-heat cooling"
 	elif _k_cold < 1.0 - CRIT_BAND:
 		status = "SUBCRITICAL — shutting down"
 	elif _peak_temp >= OVER_TEMP_K:
 		status = "OVER-TEMP — Doppler can't hold; needs control rods"
 	else:
 		status = "SELF-REGULATING (critical)"
+
+	# When scrammed, the multiplication the kinetics actually sees is k_eff − SCRAM_WORTH
+	# (far subcritical). Show THAT, not the Doppler-regulated ~1.0, so "SCRAMMED" doesn't
+	# sit next to a critical-looking k and read like a bug (advisor).
+	var k_show := _k_eff - (Thermal.SCRAM_WORTH if _scrammed else 0.0)
 
 	# Outflow composition of discharged (spent) fuel — the "inspect the spent fuel
 	# flowing out the bottom" deliverable: running averages + the last discharge.
@@ -713,17 +775,18 @@ func _update_hud() -> void:
 	else:
 		outflow = "spent fuel out: 0   (fuel still below discharge burnup)\n"
 
-	_label.text = "PEBBLE BED — M4b coolant transport & heat exchanger\n" \
+	_label.text = "PEBBLE BED — M5 decay heat & scram\n" \
 		+ "active: %d / %d   recirculated: %d\n" % [_pebbles.size(), TARGET_POPULATION, _total_recirculated] \
 		+ "injected: %d   discharged: %d\n" % [_total_injected, _total_extracted] \
 		+ "design enrichment: %.1f%%  ( [ / ] )    coolant flow: %.2f  ( , / . )\n" % [_enrichment * 100.0, _coolant_flow] \
 		+ "coolant inlet: %.0f K  ( K / L )\n" % _inlet_temp \
-		+ "feedback: %s   (F)    campaign: %.0f\n" % [("ON" if _feedback_on else "OFF"), _clocks.campaign_elapsed] \
-		+ "k-eff: %.4f   %s\n" % [_k_eff, status] \
+		+ "feedback: %s  (F)   scram: %s  (Space)   campaign: %.0f\n" % [("ON" if _feedback_on else "OFF"), ("TRIPPED" if _scrammed else "off"), _clocks.campaign_elapsed] \
+		+ "k-eff: %.4f   %s\n" % [k_show, status] \
 		+ "  cold / uncontrolled k: %.4f\n" % _k_cold \
 		+ "fuel temp:  peak %.0f K (ΔT %.0f)   mean %.0f K\n" % [_peak_temp, _peak_temp - Feedback.T_REF, _mean_temp] \
 		+ "coolant: inlet %.0f K → outlet %.0f K  (bed ΔT %.0f)\n" % [_inlet_temp, _coolant_out, _coolant_out - _inlet_temp] \
 		+ "extracted power: %.0f MWth (toy, secondary side)\n" % _power \
+		+ "decay heat: %.0f MWth  (%.0f%% of fuel heat)\n" % [_decay_power, _decay_frac * 100.0] \
 		+ outflow \
 		+ "field: %s   (V)\n" % field_name \
 		+ "solve iters: %d   fps: %d" % [_solve_iters, Engine.get_frames_per_second()]

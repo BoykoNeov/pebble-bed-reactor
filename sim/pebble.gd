@@ -43,6 +43,14 @@ var local_flux: float = 0.0
 ## This is the Newton-cooling sink temperature, replacing M4a's uniform inlet.
 var local_coolant: float = 293.15
 
+## Decay-heat reservoir energies (toy units), one per Thermal decay group (M5).
+## Fission products build these up in proportion to fission power and drain them by
+## radioactive decay, so a pebble keeps producing heat AFTER fission stops — the
+## basis of the decay-heat / post-scram passive-safety demo (CLAUDE.md glossary
+## "decay heat"). Sized and driven by the Thermal step; an empty array means "no
+## fission-product inventory yet" (fresh fuel), which the step initializes to zeros.
+var decay_e: PackedFloat32Array = PackedFloat32Array()
+
 
 func _init(p_id: int = -1, p_radius: float = 8.0) -> void:
 	id = p_id

@@ -32,6 +32,8 @@ func _initialize() -> void:
 	_test_coupled_with_burnup_settles()
 	_test_inlet_load_following()
 	_test_loss_of_flow_bounded()
+	_test_decay_heat()
+	_test_scram_passive_safety()
 	if _failures == 0:
 		print("\nALL CHECKS PASSED")
 	else:
@@ -391,7 +393,13 @@ func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int) 
 		var peak := Feedback.T_REF
 		for id in pebbles:
 			var peb: Pebble = pebbles[id]
-			var p := Thermal.pebble_power(a, peb.local_flux)
+			# M5 energy-conserving split: prompt (1−γ)S + delivered decay heat. At steady
+			# state this sums back to exactly S, so it must NOT move the settled operating
+			# point (the go/no-go this test guards). Threaded into the REAL coupled path so
+			# the gate keeps testing reality once decay heat is always-on live (advisor).
+			var s := Thermal.pebble_power(a, peb.local_flux)
+			var decay := Thermal.step_decay_heat(peb.decay_e, s, dt)
+			var p := Thermal.prompt_power(s) + decay
 			peb.temperature = Thermal.step_pebble_temp(peb.temperature, p, peb.local_coolant, h, dt)
 			Depletion.step(peb, peb.local_flux * power_frac, campaign_dt)
 			peak = maxf(peak, peb.temperature)
@@ -486,6 +494,10 @@ func _refuel_most_burned(pebbles: Dictionary, enrichment: float) -> void:
 		peb.u235 = enrichment; peb.u238 = 1.0 - enrichment; peb.pu239 = 0.0
 		peb.poison = 0.0; peb.burnup = 0.0; peb.pass_count = 0
 		peb.temperature = Thermal.T_INLET
+		# Fresh fuel has NO fission-product inventory → no decay heat (advisor blind spot):
+		# live _inject_batch makes a brand-new Pebble so it is clean, but this proxy mutates
+		# in place, so the reservoirs must be explicitly cleared on discharge-and-refresh.
+		peb.decay_e = PackedFloat32Array()
 	else:
 		peb.pass_count += 1
 
@@ -512,6 +524,159 @@ func _test_loss_of_flow_bounded() -> void:
 	_check(lof["peak_seen"] < 2200.0, "fuel temperature stays bounded through the loss-of-flow transient")
 	_check(lof["A"] < 0.6 * nom["A"], "power self-limits (settles well below nominal) after flow loss")
 	_check(absf(lof["k"] - 1.0) < 1.0e-2, "core re-settles near critical at the lower power")
+
+
+## M5 decay heat, tested on the pure Thermal functions: the energy-conserving split
+## (so it can't move A_REF) and the persist-after-fission-stops behavior (so the
+## passive-safety demo has heat to bound). γ and the λ's are pinned here.
+func _test_decay_heat() -> void:
+	print("\n[decay heat: energy-conserving split, persists after fission stops]")
+	_check(Thermal.decay_group_count() >= 1, "at least one decay-heat group")
+	var s := 30.0
+	var dt := 0.05
+	# (1) Steady state: fill the reservoirs from a constant S. Delivered decay must
+	# converge to γ·S, and prompt + decay back to S — the energy conservation that
+	# keeps the M4 operating point (A_REF, temps) untouched by adding decay heat.
+	var e := PackedFloat32Array()
+	var delivered := 0.0
+	for _i in range(20000):   # 1000 s — long enough for the slow (τ≈125 s) group
+		delivered = Thermal.step_decay_heat(e, s, dt)
+	print("  steady: delivered decay=%.3f (γ·S=%.3f)   prompt+decay=%.3f (S=%.3f)"
+		% [delivered, Thermal.DECAY_GAMMA * s, Thermal.prompt_power(s) + delivered, s])
+	_check(absf(delivered - Thermal.DECAY_GAMMA * s) < 0.02 * s,
+		"steady decay heat → γ·S (≈%.0f%% of fission power)" % (Thermal.DECAY_GAMMA * 100.0))
+	_check(absf((Thermal.prompt_power(s) + delivered) - s) < 0.02 * s,
+		"prompt + decay = total fission power S (energy-conserving → preserves A_REF)")
+
+	# (2) seed_decay_heat opens directly on that steady inventory (no build-up transient).
+	var es := PackedFloat32Array()
+	Thermal.seed_decay_heat(es, s)
+	_check(absf(Thermal.decay_power(es) - Thermal.DECAY_GAMMA * s) < 1.0e-4,
+		"seed_decay_heat opens at the steady decay inventory (γ·S)")
+
+	# (3) Persistence after scram: set S=0 and confirm decay heat drops FAST then keeps a
+	# slow tail (the recognizable curve), staying strictly positive and monotone-down —
+	# the heat that must still be removed after fission stops (the passive-safety basis).
+	var d0 := Thermal.decay_power(es)
+	var d_5s := d0
+	var d_60s := d0
+	var monotone := true
+	var positive := true
+	var prev := d0
+	for i in range(2000):   # 100 s at S=0
+		Thermal.step_decay_heat(es, 0.0, dt)
+		var d := Thermal.decay_power(es)
+		if d > prev + 1.0e-9:
+			monotone = false
+		if d <= 0.0:
+			positive = false
+		prev = d
+		if i == 99:     # ~5 s
+			d_5s = d
+		if i == 1199:   # ~60 s
+			d_60s = d
+	print("  post-scram decay power: t=0 %.3f → 5s %.3f → 60s %.3f → 100s %.3f" % [d0, d_5s, d_60s, prev])
+	_check(monotone and positive, "decay heat decays monotonically and stays positive (never negative)")
+	_check(d_5s < 0.6 * d0, "fast drop: decay heat < 60%% of shutdown value within ~5 s")
+	_check(d_60s > 0.02 * d0 and d_60s < d_5s, "slow tail: a residual persists after ~60 s (core stays warm)")
+
+
+## The M5 headline (advisor): the walk-away-safe story. Settle the coupled core, then
+## SCRAM (effective k = k − SCRAM_WORTH) AND cut coolant flow at once — the worst case.
+## Fission power must collapse, yet decay heat persists; the always-on ambient loss must
+## keep the fuel temperature BOUNDED (never runs away) and the core cools below its
+## operating point as the reservoirs drain. Uses the real coupled path incl. decay heat.
+func _test_scram_passive_safety() -> void:
+	print("\n[scram + decay heat: fission collapses, heat persists, temperature bounded]")
+	var built := _build_core_pebbles(0.113)
+	var grid: Grid = built[0]
+	var pebbles: Dictionary = built[1]
+	var positions: Dictionary = built[2]
+	var dt := 0.05
+	var solve_every := 4
+	var refuel_every := 6              # hold the core critical pre-scram (mirrors _run_burnup_loop)
+	var a := Thermal.A_NOMINAL
+	var flow := Thermal.FLOW_NOMINAL
+	var inlet := Thermal.T_INLET
+	var k := 1.0
+	var flux := PackedFloat32Array()
+	var scrammed := false
+	var a_before := 0.0
+	var peak_before := 0.0
+	var decay_at_scram := 0.0
+	var peak_seen_after := 0.0
+	var decay_5s := 0.0
+	var scram_step := 4400   # 220 s to settle
+	var post_steps := 3600   # 180 s of scram + loss-of-flow
+	for i in range(scram_step + post_steps):
+		if i == scram_step:
+			scrammed = true
+			flow = Thermal.FLOW_MIN            # worst case: scram AND loss of flow
+			a_before = a
+			peak_before = _bed_peak_temp(pebbles)
+			decay_at_scram = _bed_decay_power(pebbles)
+		var h := Thermal.h_of_flow(flow)
+		if i % solve_every == 0:
+			grid.homogenize(pebbles, positions)          # rebuilds XS + grid.temperature
+			Thermal.solve_coolant_field(grid, flow, inlet)
+			Thermal.apply_field_doppler(grid)
+			var sol := Neutronics.solve(grid)
+			k = sol.k_eff
+			flux = sol.flux
+			for id in positions:
+				pebbles[id].local_flux = grid.sample(flux, positions[id])
+				pebbles[id].local_coolant = grid.sample(grid.coolant_temp, positions[id])
+		# Scram is a KINETICS-only negative reactivity; the thermal/decay loop keeps running.
+		var k_kin := k - (Thermal.SCRAM_WORTH if scrammed else 0.0)
+		a = Thermal.step_power(a, k_kin, dt)
+		var power_frac := a / Thermal.A_REF
+		var campaign_dt := dt * Clocks.TIME_ACCEL
+		for id in pebbles:
+			var peb: Pebble = pebbles[id]
+			var s := Thermal.pebble_power(a, peb.local_flux)
+			var decay := Thermal.step_decay_heat(peb.decay_e, s, dt)
+			var p := Thermal.prompt_power(s) + decay
+			peb.temperature = Thermal.step_pebble_temp(peb.temperature, p, peb.local_coolant, h, dt)
+			Depletion.step(peb, peb.local_flux * power_frac, campaign_dt)
+		# Online refueling holds the core at its critical operating point during the pre-
+		# scram settle — WITHOUT it the bed depletes itself subcritical (passive burnup
+		# shutdown) and A collapses before the scram, so there is no running start to trip.
+		if i % refuel_every == 0:
+			_refuel_most_burned(pebbles, 0.113)
+		if scrammed:
+			peak_seen_after = maxf(peak_seen_after, _bed_peak_temp(pebbles))
+			if i == scram_step + 100:   # ~5 s after scram
+				decay_5s = _bed_decay_power(pebbles)
+	var peak_final := _bed_peak_temp(pebbles)
+	var decay_final := _bed_decay_power(pebbles)
+	print("  pre-scram:  A=%.1f  peakT=%.0f K  decayP=%.1f" % [a_before, peak_before, decay_at_scram])
+	print("  post scram+LOF: A=%.4f  peakT seen=%.0f K  final=%.0f K   decayP 5s=%.1f final=%.1f"
+		% [a, peak_seen_after, peak_final, decay_5s, decay_final])
+	_check(a_before > Thermal.A_RUNNING, "core was running before scram")
+	_check(a < Thermal.A_RUNNING and a < 0.05 * a_before,
+		"scram collapses fission power to a small fraction of pre-scram")
+	_check(peak_seen_after < 2200.0,
+		"fuel temperature stays BOUNDED through scram + loss-of-flow (walk-away safe)")
+	_check(decay_at_scram > 0.0 and decay_5s > 0.0,
+		"decay heat PERSISTS after fission stops (core still producing heat)")
+	_check(decay_final < decay_at_scram, "decay heat declines over time as the reservoirs drain")
+	_check(peak_final < peak_before, "core cools below its operating point after scram")
+
+
+## Peak pebble temperature across the bed (test helper).
+func _bed_peak_temp(pebbles: Dictionary) -> float:
+	var pk := Feedback.T_REF
+	for id in pebbles:
+		pk = maxf(pk, pebbles[id].temperature)
+	return pk
+
+
+## Total stored decay power across the bed (Σ over pebbles of Σ λ_i·E_i).
+func _bed_decay_power(pebbles: Dictionary) -> float:
+	var d := 0.0
+	for id in pebbles:
+		d += Thermal.decay_power(pebbles[id].decay_e)
+	return d
 
 
 func _check(ok: bool, label: String) -> void:
