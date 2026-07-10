@@ -25,7 +25,14 @@ const SPAWN_PER_TICK := 3
 const SPAWN_INTERVAL := 0.12    # seconds between injection ticks
 const PEBBLE_RADIUS := 8.0
 const EXTRACT_INTERVAL := 0.30  # metered discharge cadence (lowest pebble out)
-const SOLVE_INTERVAL := 0.50    # neutronics re-solve cadence (quasi-static)
+# Neutronics re-solve cadence (quasi-static flux). Tightened from M2's 0.5 s for
+# M4: the flux (hence k) is stale between solves, but the power amplitude and
+# pebble temperatures now integrate EVERY physics step against that k. The
+# coupling decision (advisor): keep the flux quasi-static on a cadence AND tune
+# the power response slow enough (Thermal.KINETICS_GAIN) that its e-folding time
+# is comfortably ≫ this interval — so stale k is harmless — while still resolving
+# often enough that a transient's k tracks the evolving temperature smoothly.
+const SOLVE_INTERVAL := 0.20
 
 # Player enrichment lever (M2). Kept LEU and well under 20% (CLAUDE.md: civilian
 # teaching toy). Small step because enrichment is a steep reactivity lever and
@@ -63,6 +70,10 @@ const OVER_TEMP_K := 1800.0
 # it (e.g. enrichment dialed down for the passive-shutdown demo, k ~ 0.6) reads as
 # genuinely subcritical / shutting down. Display-only — the depletion gate is untouched.
 const CRIT_BAND := 0.01
+# Toy display scale mapping the extracted-power energy balance to a plausible
+# headline figure (HTR-PM is ~250 MWth). Purely cosmetic — the physics is in
+# arbitrary units — tuned so the nominal operating point reads a few hundred MWth.
+const THERMAL_MW_SCALE := 0.06
 
 var _physics: PhysicsBackend
 var _pebbles: Dictionary = {}   # id -> Pebble (the Lagrangian registry)
@@ -81,9 +92,10 @@ var _grid: Grid
 var _field_display: FieldDisplay
 var _color_bar: ColorBar
 var _flux_desc: FieldDescriptor
-var _temp_desc: FieldDescriptor        # M2 fuel-temperature heatmap
+var _temp_desc: FieldDescriptor        # grid fuel-temperature heatmap (real at M4)
+var _pebble_temp_desc: FieldDescriptor # M4 per-pebble temperature (Lagrangian)
 var _k_eff := 0.0
-var _power := 0.0        # relative fission power (a.u.); becomes real MW at M4
+var _power := 0.0        # headline extracted thermal power (real energy balance, M4)
 var _solve_iters := 0
 
 # Field switching: keep the latest solved arrays so the player can flip the
@@ -98,8 +110,16 @@ var _feedback_on := true
 var _enrichment := ENRICH_DEFAULT
 var _k_cold := 0.0            # k with feedback OFF — the reactivity being suppressed
 var _peak_temp := Feedback.T_REF
-var _regulated := false
-var _feedback_insufficient := false
+
+# Thermal & cooling (M4). Temperature is no longer M2's instant search output —
+# it is a real, time-lagged STATE the pebbles carry, integrated on the physics
+# clock (Thermal). The power amplitude and coolant flow are the new dynamics/
+# controls; the loop closes as power → heat → pebble T (inertia) → Doppler → power.
+var _amplitude := Thermal.A_NOMINAL   # power-amplitude state (scales the flux shape)
+var _coolant_flow := Thermal.FLOW_NOMINAL  # primary operating lever (mass flow)
+var _mean_temp := Feedback.T_REF      # bed-average fuel temperature (readout)
+var _thermal_seeded := false          # one-time near-equilibrium seed done?
+var _running := false                 # core producing power (gates depletion)
 
 # Burnup / outflow (M3)
 var _burnup_desc: FieldDescriptor      # first PEBBLE-world (Lagrangian) field
@@ -147,9 +167,14 @@ func _ready() -> void:
 	# range is naturally stable frame-to-frame (CLAUDE.md: no per-frame
 	# auto-ranging). It stays within one order of magnitude, so no log needed.
 	_flux_desc = FieldDescriptor.new("Neutron flux", "norm", FieldDescriptor.GRID, 0.0, 1.0, false)
-	# Fuel temperature (M2). Fixed range from inlet to the over-temp line so the
-	# scale is stable across transients (CLAUDE.md); hotter cells clamp to the top.
+	# Fuel temperature (M2 heatmap; M4 makes it the REAL homogenized field). Fixed
+	# range from inlet to the over-temp line so the scale is stable across transients
+	# (CLAUDE.md); hotter cells clamp to the top.
 	_temp_desc = FieldDescriptor.new("Fuel temperature", "K", FieldDescriptor.GRID, Feedback.T_REF, OVER_TEMP_K, false)
+	# Per-pebble temperature (M4) — the Lagrangian view of the SAME real energy
+	# balance: watch one hot pebble travel down the bed. Same fixed range as the grid
+	# field so the two views are directly comparable.
+	_pebble_temp_desc = FieldDescriptor.new("Pebble temperature", "K", FieldDescriptor.PEBBLE, Feedback.T_REF, OVER_TEMP_K, false)
 	# Burnup (M3) — the FIRST per-pebble (Lagrangian) field: each pebble colored by
 	# its own burnup, so you can literally watch a burned pebble descend the bed
 	# (CLAUDE.md two render modes). Fixed range [0, discharge] keeps the scale stable.
@@ -162,6 +187,7 @@ func _ready() -> void:
 	_fields = [
 		{"desc": _flux_desc, "get": func() -> PackedFloat32Array: return _last_flux},
 		{"desc": _temp_desc, "get": func() -> PackedFloat32Array: return _last_temp},
+		{"desc": _pebble_temp_desc, "get_peb": func(peb: Pebble) -> float: return peb.temperature},
 		{"desc": _burnup_desc, "get_peb": func(peb: Pebble) -> float: return peb.burnup},
 	]
 
@@ -205,11 +231,17 @@ func _physics_process(delta: float) -> void:
 		_solve_accum -= SOLVE_INTERVAL
 		_solve_flux()
 
+	# Thermal & power dynamics (M4) — the ONE subsystem that time-integrates on the
+	# fast physics clock (CLAUDE.md clock model): the flux is quasi-static above and
+	# burnup is on the campaign clock below, but pebble temperature has real inertia,
+	# so it steps every frame against the latest k. This is what makes the loop lag,
+	# overshoot, and settle instead of regulating instantly.
+	_thermal_step(delta)
+
 	# Deplete on the CAMPAIGN clock (CLAUDE.md principle 1): campaign_dt is derived
-	# from the physics step here and reaches ONLY Depletion.step. Gated on a running
-	# core — a subcritical/shut-down core has a flux SHAPE but no fission, so it must
-	# not burn fuel (advisor). `_regulated` is true when regulated OR over-temp, false
-	# when subcritical or feedback-off. Uses each pebble's local_flux from the last solve.
+	# from the physics step here and reaches ONLY Depletion.step. Gated on a RUNNING
+	# core (power above threshold) — a shut-down core has a flux SHAPE but no fission,
+	# so it must not burn fuel (advisor). Uses each pebble's local_flux from last solve.
 	_deplete(_clocks.campaign_dt(delta))
 
 
@@ -325,68 +357,148 @@ func _record_outflow(peb: Pebble) -> void:
 ## Deplete every pebble by one campaign step, driven by its local flux from the
 ## last solve. Gated to a running core (see caller): no fission → no burnup.
 func _deplete(campaign_dt: float) -> void:
-	if not _regulated or campaign_dt <= 0.0:
+	# Frozen when feedback is OFF (see _thermal_step): no valid dynamic power level
+	# exists without Doppler, so burnup pauses with the rest of the loop.
+	if not _feedback_on or campaign_dt <= 0.0 or _amplitude <= 0.0:
 		return
+	# Real fluence scales with ABSOLUTE flux = amplitude × normalized shape, so burnup
+	# ∝ A/A_REF (advisor). At the design point A ≈ A_REF → the M3-calibrated rate
+	# (TIME_ACCEL preserved); an idling core (A ≪ A_REF) barely burns. This replaces
+	# M3's on/off gate — WITHOUT it, a core collapsing toward idle keeps burning at
+	# full rate and over-depletes k_cold below 1, forcing a spurious shutdown.
+	var power_frac := _amplitude / Thermal.A_REF
 	for id in _pebbles:
 		var peb: Pebble = _pebbles[id]
-		Depletion.step(peb, peb.local_flux, campaign_dt)
+		Depletion.step(peb, peb.local_flux * power_frac, campaign_dt)
 
 
 func _solve_flux() -> void:
-	# The coupling step: homogenize the current pebble field onto the grid, solve
-	# the steady-state diffusion problem, then push results outward only.
+	# The coupling step (M4 dynamic form): homogenize the current pebble field —
+	# now INCLUDING each pebble's real, lagged temperature — onto the grid, solve
+	# the quasi-static flux against that temperature, then push results outward only.
 	#
-	# M2 closes the loop the M1 version left open: with feedback ON we solve the
-	# COUPLED steady state (Feedback.solve_equilibrium finds the power/temperature
-	# at which Doppler makes the core critical); with it OFF we solve the raw
-	# eigenproblem, exposing the uncontrolled k so the contrast is visible.
+	# M4 replaces M2's critical-power SEARCH with a measured feedback. Temperature is
+	# a STATE the pebbles carry (integrated in _thermal_step), so Doppler just reads
+	# grid.temperature (Thermal.apply_field_doppler) and we solve the eigenproblem
+	# ONCE at the current temperature — no search. The retained M2 search survives
+	# only as the one-time equilibrium SEED below (and, later, fast-forward collapse).
 	var positions := _physics.positions()
 	if positions.is_empty():
 		return
 	_grid.homogenize(_pebbles, positions)
 
+	# Snapshot the temperature-FREE base absorption homogenize just wrote (Neutronics
+	# only reads the grid, never mutates it, so this stays clean across the cold solve).
+	var base_sa := _grid.sigma_a.duplicate()
+
+	# Cold (temperature-free) reference solve — the honest UNCONTROLLED reactivity,
+	# kept as the HUD contrast: the k the core WOULD run at with no Doppler. Cheap here.
+	var cold := Neutronics.solve(_grid)
+	_k_cold = cold.k_eff
+
+	# One-time thermal seed: start the bed near its Doppler equilibrium temperature so
+	# the sim opens close to steady state and merely settles, instead of a violent
+	# cold-start transient every launch (advisor). Gate on a FULL bed (not a partial
+	# one): a partly-filled bed reads k_cold just above 1, giving a tiny equilibrium
+	# ΔT — under-seeding, and the subsequent climb to the packed operating point IS
+	# the overshoot. Waiting for the full pack lands the seed on the real operating k.
+	if not _thermal_seeded and cold.k_eff > 1.0 and _pebbles.size() >= TARGET_POPULATION:
+		_seed_thermal_equilibrium(positions, cold.flux)
+
 	if _feedback_on:
-		var eq := Feedback.solve_equilibrium(_grid, 0.1)
-		_k_eff = eq.k_eff
-		_k_cold = eq.k_cold
-		_regulated = eq.regulated
-		_feedback_insufficient = eq.feedback_insufficient
-		_peak_temp = Feedback.T_REF + eq.peak_dt
-		# Relative fission rate (Σ νΣf·φ on the peak-normalized flux) — nonzero at
-		# criticality and the M4 heat-source hook. WHY not eq.power: that M2 proxy is
-		# the excess reactivity Doppler burns off, which correctly collapses to ~0 at a
-		# critical online-refueling equilibrium (k_cold→1) — a degenerate readout for a
-		# core that is actually at full power. True thermal power awaits M4's energy balance.
-		_power = _fission_rate(eq.flux)
-		_solve_iters = eq.iterations
-		_last_flux = eq.flux
-		_last_temp = eq.temperature
-	else:
-		# Feedback off: the honest uncontrolled state. No Doppler, so fuel sits at inlet
-		# temperature; the fission rate is still a meaningful relative-power readout.
+		# Warm solve: temperature-free base + Doppler at the CURRENT per-cell temperature.
+		_grid.sigma_a = base_sa.duplicate()
+		Thermal.apply_field_doppler(_grid)
 		var sol := Neutronics.solve(_grid)
 		_k_eff = sol.k_eff
-		_k_cold = sol.k_eff
-		_regulated = false
-		_feedback_insufficient = false
-		_peak_temp = Feedback.T_REF
-		_power = sol.fission_rate
-		_solve_iters = sol.iterations
 		_last_flux = sol.flux
-		_last_temp = _flat_temp_field()
+		_solve_iters = sol.iterations
+	else:
+		# Feedback OFF: the uncontrolled state — no Doppler, so k is the raw cold k and
+		# nothing self-limits power (it runs away, capped for display in _thermal_step).
+		_grid.sigma_a = base_sa.duplicate()   # ensure the heatmap shows the base, not a stale warm field
+		_k_eff = cold.k_eff
+		_last_flux = cold.flux
+		_solve_iters = cold.iterations
 
-	# Update the heatmap for whichever field is selected (consumer of sim state;
-	# never writes back).
+	# The homogenized grid temperature IS the fuel-temperature heatmap now — a real,
+	# measured field, not M2's invented equilibrium. (_peak_temp / _mean_temp are
+	# computed from the pebbles themselves in _thermal_step.)
+	_last_temp = _grid.temperature.duplicate()
+
+	# Update the heatmap for whichever field is selected (consumer; never writes back).
 	_refresh_field_display()
 
-	# Sample fields back onto each pebble: flux (M3 will make it a burnup rate) and
-	# the placeholder fuel temperature (viz now; M4 replaces it with a real energy
-	# balance). Mirrors the two-worlds map — grid field → per-pebble Lagrangian value.
+	# Sample the flux back onto each pebble (drives its fission heat in _thermal_step
+	# and its burnup in _deplete). Temperature is NOT sampled back: it is the pebble's
+	# own integrated state, and the two-worlds map now runs pebble T → grid via
+	# homogenize, not the reverse.
 	for id in positions:
 		var peb: Pebble = _pebbles.get(id)
 		if peb != null:
 			peb.local_flux = _grid.sample(_last_flux, positions[id])
-			peb.temperature = _grid.sample(_last_temp, positions[id])
+
+
+## Integrate the M4 power + thermal dynamics one physics step — the only fast-clock
+## time integration (CLAUDE.md clock model). Power amplitude follows toy point-
+## kinetics against the latest k (exact exponential, stable); each pebble's
+## temperature relaxes under its fission heat and the coolant/ambient losses
+## (semi-implicit, stable). Accumulates the headline extracted thermal power and
+## the peak/mean fuel temperature for the HUD, and sets the depletion gate.
+func _thermal_step(delta: float) -> void:
+	# Feedback OFF FREEZES the dynamic loop (advisor). WHY this is mandatory, not
+	# cosmetic: with no Doppler, _k_eff = raw cold k > 1, so the exponential kinetics
+	# would drive _amplitude to A_MAX every frame; burnup ∝ A/A_REF would then hit
+	# ~1e6/30 ≈ 3e4× and deplete the whole core to spent in a step or two — silent,
+	# irreversible state corruption from a couple seconds of the F-toggle demo. So OFF
+	# holds A, temperatures, and burnup fixed and simply displays the uncontrolled k as
+	# the contrast (M2's "no self-limiting"). Toggling back ON resumes from the held state.
+	if delta <= 0.0 or not _feedback_on:
+		return
+	# Power amplitude: exact exponential update at the frozen-between-solves k.
+	_amplitude = Thermal.step_power(_amplitude, _k_eff, delta)
+	var h := Thermal.h_of_flow(_coolant_flow)
+	var t_coolant := Thermal.T_INLET   # M4a: uniform inlet coolant; M4b adds the downstream rise
+	var peak := Feedback.T_REF
+	var sum_t := 0.0
+	var extracted := 0.0
+	var count := 0
+	for id in _pebbles:
+		var peb: Pebble = _pebbles[id]
+		var p := Thermal.pebble_power(_amplitude, peb.local_flux)
+		peb.temperature = Thermal.step_pebble_temp(peb.temperature, p, t_coolant, h, delta)
+		# Heat actually leaving this pebble to coolant + structure — the power the
+		# secondary side harvests (M4b heat exchanger); at steady state it equals the
+		# fission power. Summed, this is the headline "reactor power" the player watches.
+		extracted += h * (peb.temperature - t_coolant) + Thermal.G_AMBIENT * (peb.temperature - Thermal.T_AMBIENT)
+		peak = maxf(peak, peb.temperature)
+		sum_t += peb.temperature
+		count += 1
+	_peak_temp = peak
+	_mean_temp = sum_t / count if count > 0 else Feedback.T_REF
+	_power = extracted * THERMAL_MW_SCALE
+	_running = _amplitude > Thermal.A_RUNNING
+
+
+## One-time near-equilibrium seed (advisor): open the core AT its operating point so
+## it just settles rather than igniting from cold with a big overshoot. We seed the
+## amplitude to the design value A_REF and each pebble's temperature to the steady
+## value that SAME amplitude sustains at the current flow — power and temperature
+## mutually consistent, so k_eff starts ≈ 1 and barely moves. WHY A_REF and the
+## steady-temp balance instead of Feedback.solve_equilibrium: the frozen-shape search
+## under-estimates ΔT for the reactive fresh bed (and saturates at high enrichment),
+## so it under-seeds; A_REF is by definition the settled operating amplitude, giving
+## a self-consistent seed directly. (solve_equilibrium stays for M4b fast-forward.)
+func _seed_thermal_equilibrium(positions: Dictionary, cold_flux: PackedFloat32Array) -> void:
+	var h := Thermal.h_of_flow(_coolant_flow)
+	for id in positions:
+		var peb: Pebble = _pebbles.get(id)
+		if peb != null:
+			var lf := _grid.sample(cold_flux, positions[id])
+			var p := Thermal.pebble_power(Thermal.A_REF, lf)
+			peb.temperature = Thermal.steady_temp(p, Thermal.T_INLET, h)
+	_amplitude = Thermal.A_REF
+	_thermal_seeded = true
 
 
 ## Push the currently selected field into the heatmap + colorbar. GRID fields
@@ -429,26 +541,6 @@ func _reset_pebble_tints() -> void:
 		_physics.set_pebble_tint(id, PebbleBody.DEFAULT_TINT)
 
 
-## Total fission rate Σ νΣf·φ on the (peak-normalized) flux — a relative power that
-## stays nonzero at criticality, unlike M2's excess-reactivity proxy. νΣf is the
-## temperature-free base homogenize wrote, so this is valid whether or not Doppler
-## has perturbed the absorption. Becomes the M4 heat source.
-func _fission_rate(flux: PackedFloat32Array) -> float:
-	var fr := 0.0
-	var nsf := _grid.nu_sigma_f
-	for c in range(_grid.cell_count()):
-		fr += nsf[c] * flux[c]
-	return fr
-
-
-## An all-inlet-temperature field (feedback off / no fission heating yet).
-func _flat_temp_field() -> PackedFloat32Array:
-	var t := PackedFloat32Array()
-	t.resize(_grid.cell_count())
-	t.fill(Feedback.T_REF)
-	return t
-
-
 ## Stamp FRESH fuel at injection: the toy heavy-metal split grid._enrichment_of()
 ## reads back as the fissile fraction. From here Depletion.step evolves this vector
 ## over the pebble's life (U-235 burns, Pu-239 breeds, poison builds).
@@ -486,6 +578,10 @@ func _input(event: InputEvent) -> void:
 		_set_enrichment(_enrichment + ENRICH_STEP)
 	elif event.is_action_pressed("enrich_down"):
 		_set_enrichment(_enrichment - ENRICH_STEP)
+	elif event.is_action_pressed("flow_up"):
+		_set_flow(_coolant_flow + Thermal.FLOW_STEP)
+	elif event.is_action_pressed("flow_down"):
+		_set_flow(_coolant_flow - Thermal.FLOW_STEP)
 	elif event is InputEventKey:
 		match event.keycode:
 			KEY_F:
@@ -494,6 +590,12 @@ func _input(event: InputEvent) -> void:
 				_set_enrichment(_enrichment + ENRICH_STEP)
 			KEY_BRACKETLEFT, KEY_MINUS:
 				_set_enrichment(_enrichment - ENRICH_STEP)
+			# Coolant mass flow — the PRIMARY M4 operating lever. Down (,) drives the
+			# loss-of-flow / walk-away-safe demo; up (.) cools and re-reactivates.
+			KEY_PERIOD:
+				_set_flow(_coolant_flow + Thermal.FLOW_STEP)
+			KEY_COMMA:
+				_set_flow(_coolant_flow - Thermal.FLOW_STEP)
 			KEY_V, KEY_TAB:
 				_cycle_field()
 
@@ -505,6 +607,14 @@ func _input(event: InputEvent) -> void:
 ## online-refueling behavior, not an instant core-wide reset.
 func _set_enrichment(e: float) -> void:
 	_enrichment = clampf(e, ENRICH_MIN, ENRICH_MAX)
+
+
+## Change the coolant mass flow — the primary M4 operating lever (CLAUDE.md). Lower
+## flow → weaker convection → hotter pebbles → the loss-of-flow transient; higher
+## flow → cooler, more power at the same Doppler-pinned temperature. Takes effect on
+## the next physics step (it only changes the convective conductance in _thermal_step).
+func _set_flow(f: float) -> void:
+	_coolant_flow = clampf(f, Thermal.FLOW_MIN, Thermal.FLOW_MAX)
 
 
 func _draw() -> void:
@@ -525,7 +635,7 @@ func _update_hud() -> void:
 		status = "UNCONTROLLED — no self-limiting"
 	elif _k_cold < 1.0 - CRIT_BAND:
 		status = "SUBCRITICAL — shutting down"
-	elif _feedback_insufficient or _peak_temp >= OVER_TEMP_K:
+	elif _peak_temp >= OVER_TEMP_K:
 		status = "OVER-TEMP — Doppler can't hold; needs control rods"
 	else:
 		status = "SELF-REGULATING (critical)"
@@ -543,15 +653,15 @@ func _update_hud() -> void:
 	else:
 		outflow = "spent fuel out: 0   (fuel still below discharge burnup)\n"
 
-	_label.text = "PEBBLE BED — M3 burnup & outflow\n" \
+	_label.text = "PEBBLE BED — M4 thermal & cooling\n" \
 		+ "active: %d / %d   recirculated: %d\n" % [_pebbles.size(), TARGET_POPULATION, _total_recirculated] \
 		+ "injected: %d   discharged: %d\n" % [_total_injected, _total_extracted] \
-		+ "design enrichment: %.1f%%   ( [ / ] )   campaign: %.0f\n" % [_enrichment * 100.0, _clocks.campaign_elapsed] \
-		+ "feedback: %s   (F)\n" % ("ON" if _feedback_on else "OFF") \
+		+ "design enrichment: %.1f%%  ( [ / ] )    coolant flow: %.2f  ( , / . )\n" % [_enrichment * 100.0, _coolant_flow] \
+		+ "feedback: %s   (F)    campaign: %.0f\n" % [("ON" if _feedback_on else "OFF"), _clocks.campaign_elapsed] \
 		+ "k-eff: %.4f   %s\n" % [_k_eff, status] \
 		+ "  cold / uncontrolled k: %.4f\n" % _k_cold \
-		+ "peak fuel temp: %.0f K  (ΔT %.0f)   [Doppler placeholder → M4]\n" % [_peak_temp, _peak_temp - Feedback.T_REF] \
-		+ "fission rate: %.1f (rel.)   [thermal power → M4]\n" % _power \
+		+ "fuel temp:  peak %.0f K (ΔT %.0f)   mean %.0f K\n" % [_peak_temp, _peak_temp - Feedback.T_REF, _mean_temp] \
+		+ "thermal power: %.0f MWth (toy)\n" % _power \
 		+ outflow \
 		+ "field: %s   (V)\n" % field_name \
 		+ "solve iters: %d   fps: %d" % [_solve_iters, Engine.get_frames_per_second()]

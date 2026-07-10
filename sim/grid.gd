@@ -20,6 +20,10 @@ extends RefCounted
 const DEFAULT_CELL := 68.0
 const DEFAULT_BAND_CELLS := 2
 const PACK_MAX := 0.65        # cap so a cell can't read as denser than physical
+# Cold inlet / reflector reference temperature (K, = Feedback.T_REF = 20 C).
+# Duplicated as a plain literal so this low-level module stays free of a
+# dependency on the feedback layer; the two must agree (asserted in tests).
+const T_INLET := 293.15
 
 var nx: int
 var ny: int
@@ -39,6 +43,12 @@ var packing: PackedFloat32Array
 var d: PackedFloat32Array           # diffusion coefficient
 var sigma_a: PackedFloat32Array     # macroscopic absorption
 var nu_sigma_f: PackedFloat32Array  # macroscopic fission production
+# Area-weighted mean pebble temperature per cell (K), from the per-pebble
+# Lagrangian state (M4). This is how the REAL, time-lagged fuel temperature
+# reaches the Eulerian Doppler solve — replacing M2's instant critical-power
+# search (which invented a temperature) with the temperature the pebbles
+# actually have. Cells with no pebbles stay at the cold inlet reference.
+var temperature: PackedFloat32Array
 
 
 ## Build a grid sized to the silo plus a reflector band around it.
@@ -67,6 +77,8 @@ func _alloc() -> void:
 	d = PackedFloat32Array(); d.resize(n)
 	sigma_a = PackedFloat32Array(); sigma_a.resize(n)
 	nu_sigma_f = PackedFloat32Array(); nu_sigma_f.resize(n)
+	temperature = PackedFloat32Array(); temperature.resize(n)
+	temperature.fill(T_INLET)
 
 
 func cell_count() -> int:
@@ -103,6 +115,7 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 	var e_acc := PackedFloat32Array(); e_acc.resize(n) # area-weighted enrichment
 	var b_acc := PackedFloat32Array(); b_acc.resize(n) # area-weighted burnup
 	var p_acc := PackedFloat32Array(); p_acc.resize(n) # area-weighted poison
+	var t_acc := PackedFloat32Array(); t_acc.resize(n) # area-weighted temperature (M4)
 
 	for id in positions:
 		var c := cell_of(positions[id])
@@ -119,6 +132,7 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 		e_acc[c] += a * e
 		b_acc[c] += a * peb.burnup
 		p_acc[c] += a * peb.poison
+		t_acc[c] += a * peb.temperature   # M4: real lumped pebble temperature
 
 	var cell_area := h * h
 	for j in ny:
@@ -135,16 +149,19 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 				d[c] = CrossSections.diffusion_fuel(pack)
 				sigma_a[c] = CrossSections.sigma_a_fuel(pack, poison)
 				nu_sigma_f[c] = CrossSections.nu_sigma_f(pack, e, b)
+				temperature[c] = t_acc[c] * inv   # mean of the pebbles actually here
 			elif _inside_vessel(i, j):
 				material[c] = CrossSections.VOID
 				d[c] = CrossSections.VOID_D
 				sigma_a[c] = CrossSections.VOID_SIGA
 				nu_sigma_f[c] = 0.0
+				temperature[c] = T_INLET
 			else:
 				material[c] = CrossSections.REFLECTOR
 				d[c] = CrossSections.REFL_D
 				sigma_a[c] = CrossSections.REFL_SIGA
 				nu_sigma_f[c] = 0.0
+				temperature[c] = T_INLET
 
 
 ## SAMPLE-BACK: bilinear read of a per-cell field at a world position, so a
