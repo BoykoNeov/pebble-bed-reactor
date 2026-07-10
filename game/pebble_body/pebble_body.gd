@@ -11,8 +11,10 @@
 class_name PebbleBody
 extends RigidBody2D
 
+const DEFAULT_TINT := Color(0.75, 0.78, 0.82)  # graphite grey (no field selected)
+
 var radius: float = 8.0
-var tint: Color = Color(0.75, 0.78, 0.82)  # graphite grey; recolored at M1+
+var tint: Color = DEFAULT_TINT  # recolored per-pebble by the field viz (M3+)
 
 var _shape: CircleShape2D
 
@@ -28,6 +30,15 @@ func configure(p_radius: float) -> void:
 	# (CLAUDE.md pitfall: stacking is spongy/jittery — favour quiet settling).
 	linear_damp = 0.4
 	angular_damp = 0.6
+
+
+## Recolor for the per-pebble field heatmap. Only redraws on an actual change so
+## the render clock isn't repainting hundreds of unchanged bodies every frame.
+func set_tint(color: Color) -> void:
+	if color == tint:
+		return
+	tint = color
+	queue_redraw()
 
 
 func _draw() -> void:

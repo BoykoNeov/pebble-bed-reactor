@@ -49,6 +49,13 @@ func positions() -> Dictionary:
 	return {}
 
 
+## Recolor one body for the per-pebble (Lagrangian) field heatmap (M3+). Pure
+## visualization — a consumer of sim state, routed through the backend only
+## because it owns the render bodies. No-op if the backend has no drawable body.
+func set_pebble_tint(_id: int, _color: Color) -> void:
+	pass
+
+
 ## Advance the mechanical world. No-op for engines that self-step (native).
 func step(_delta: float) -> void:
 	pass

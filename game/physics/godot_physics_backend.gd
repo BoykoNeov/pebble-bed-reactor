@@ -54,3 +54,9 @@ func positions() -> Dictionary:
 	for id in _bodies:
 		out[id] = (_bodies[id] as PebbleBody).position
 	return out
+
+
+func set_pebble_tint(id: int, color: Color) -> void:
+	var body: PebbleBody = _bodies.get(id)
+	if body != null:
+		body.set_tint(color)
