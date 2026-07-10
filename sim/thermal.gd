@@ -368,9 +368,18 @@ static func apply_field_doppler(grid: Grid) -> void:
 
 
 ## Apply the moderator-temperature coefficient (M5b) to a grid's THERMAL-group
-## cross-sections in place, using each fuel cell's LOCAL coolant temperature. Hotter
-## coolant lowers the effective moderation M_eff (Feedback.moderator_m_eff), and both
-## M-dependent cross-sections follow it:
+## cross-sections in place, using each fuel cell's LOCAL PEBBLE (graphite) temperature.
+## WHY pebble, not coolant: in a gas-cooled pebble bed the helium moderates
+## negligibly — the graphite moderator IS inside the pebble, sitting at pebble
+## temperature. So the moderator coefficient rides the pebble/fuel temperature
+## (grid.temperature — the SAME field Doppler reads), not the coolant. This is both
+## the physically honest driver for this reactor type AND the strong one: the pebble
+## swing is ~hundreds of K where the coolant bed rise is ~tens, which is what makes an
+## over-moderated core visibly destabilize. (CLAUDE.md M4's "coolant temperature feeds
+## the moderator coefficient" is a simplification that is weak for a gas-cooled bed;
+## corrected here — see the M4 note in CLAUDE.md.)
+## Hotter graphite lowers the effective moderation M_eff (Feedback.moderator_m_eff),
+## and both M-dependent cross-sections follow it:
 ##   * sigma_r  ∝ M      → rescaled by the ratio m_eff / m_base
 ##   * sigma_a2  has only its MODERATOR-parasitic part (THERM_A_MOD·M·pack) move with
 ##     M; the fuel/poison part is M-independent, so we shift by the exact parasitic
@@ -388,6 +397,6 @@ static func apply_field_moderator(grid: Grid) -> void:
 		var m_base := grid.moderation[c]
 		if m_base <= 0.0:
 			continue
-		var m_eff := Feedback.moderator_m_eff(m_base, grid.coolant_temp[c])
+		var m_eff := Feedback.moderator_m_eff(m_base, grid.temperature[c])
 		grid.sigma_r[c] *= m_eff / m_base
 		grid.sigma_a2[c] += CrossSections.THERM_A_MOD * (m_eff - m_base) * grid.packing[c]

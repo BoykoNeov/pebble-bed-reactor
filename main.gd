@@ -39,6 +39,27 @@ const SOLVE_INTERVAL := 0.20
 # Doppler is a weak fine feedback — a few tenths of a percent already moves k ~1%.
 const ENRICH_MIN := 0.050
 const ENRICH_MAX := 0.120
+
+# Fuel-loading design lever (M5b): the graphite-to-heavy-metal ratio of a fresh
+# pebble, which sets its homogenized MODERATION ratio M = M_REF / loading
+# (CrossSections.moderation). This is the knob that walks the core across the
+# k_inf(M) peak: LESS loading (more graphite per gram of fuel) → MORE moderation →
+# higher M. Nominal 1.0 gives M = 1.0, on the stable UNDER-moderated side; dialing
+# loading DOWN toward LOADING_MIN pushes M over the peak into the OVER-moderated
+# regime where the moderator-temperature coefficient turns POSITIVE and the core
+# can run away — the "accidentally build an unstable core" demo (CLAUDE.md). Applied
+# to freshly injected fuel only (like enrichment), so a change propagates as the bed
+# refuels rather than resetting the core. Range straddles the peak (M≈1.2): MIN 0.5
+# → M=2.0 (strongly over-moderated), MAX 1.5 → M≈0.67 (deep under-moderated).
+const LOADING_DEFAULT := 1.0
+const LOADING_MIN := 0.5
+const LOADING_MAX := 1.5
+const LOADING_STEP := 0.05
+# Moderation ratio at the k_inf(M) peak (from the tests/test_neutronics.gd sweep,
+# M ≈ 1.2). Display-only: the HUD labels the core UNDER-moderated (stable MTC) below
+# it and OVER-moderated (unstable MTC) above it, so the player can see which side of
+# the instability their fuel-loading choice has put the core on.
+const MOD_PEAK_M := 1.2
 # The M3 operating point. WHY higher than M1/M2's 8.5% reference: the M3 core runs
 # a burnup SPREAD (fresh at 0 → spent at ~90), not fresh fuel, and that equilibrium
 # MIX is what must sit critical — so fresh fuel has to be genuinely supercritical.
@@ -93,6 +114,9 @@ var _grid: Grid
 var _field_display: FieldDisplay
 var _color_bar: ColorBar
 var _flux_desc: FieldDescriptor
+var _flux_fast_desc: FieldDescriptor   # M5b fast-group (φ1) heatmap
+var _flux_thermal_desc: FieldDescriptor # M5b thermal-group (φ2) heatmap
+var _moderation_desc: FieldDescriptor  # M5b per-cell design moderation ratio M
 var _temp_desc: FieldDescriptor        # grid fuel-temperature heatmap (real at M4)
 var _pebble_temp_desc: FieldDescriptor # M4 per-pebble temperature (Lagrangian)
 var _k_eff := 0.0
@@ -104,11 +128,15 @@ var _solve_iters := 0
 var _fields: Array = []   # [ {desc, get: Callable -> PackedFloat32Array}, ... ]
 var _current_field := 0
 var _last_flux: PackedFloat32Array = PackedFloat32Array()
+var _last_flux_fast: PackedFloat32Array = PackedFloat32Array()
+var _last_flux_thermal: PackedFloat32Array = PackedFloat32Array()
+var _last_moderation: PackedFloat32Array = PackedFloat32Array()
 var _last_temp: PackedFloat32Array = PackedFloat32Array()
 
 # Doppler feedback (M2): closes the loop so the reactor self-regulates.
 var _feedback_on := true
 var _enrichment := ENRICH_DEFAULT
+var _fuel_loading := LOADING_DEFAULT   # design moderation lever (M5b); stamped on fresh fuel
 var _k_cold := 0.0            # k with feedback OFF — the reactivity being suppressed
 var _peak_temp := Feedback.T_REF
 
@@ -189,6 +217,19 @@ func _ready() -> void:
 	# range is naturally stable frame-to-frame (CLAUDE.md: no per-frame
 	# auto-ranging). It stays within one order of magnitude, so no log needed.
 	_flux_desc = FieldDescriptor.new("Neutron flux", "norm", FieldDescriptor.GRID, 0.0, 1.0, false)
+	# Two-group flux components (M5b): the fast (φ1) and thermal (φ2) fields the solver
+	# produces. Each is peak-normalized to its own max, so [0,1] linear ranges are stable.
+	# Viewed together they SHOW the two-group story: the fast flux peaks in the fuel where
+	# fission is born, the thermal flux peaks out in the reflector where leaked neutrons
+	# thermalize and pile up (the reflector-peaking a one-group model can only fake).
+	_flux_fast_desc = FieldDescriptor.new("Fast flux (φ1)", "norm", FieldDescriptor.GRID, 0.0, 1.0, false)
+	_flux_thermal_desc = FieldDescriptor.new("Thermal flux (φ2)", "norm", FieldDescriptor.GRID, 0.0, 1.0, false)
+	# Design moderation ratio M per cell (M5b): the homogenized fuel-loading knob. Shows
+	# WHERE the core sits relative to the k_inf(M) peak (~1.2) — the field the player
+	# reshapes with the loading lever to build (or avoid) the over-moderated instability.
+	# Fixed range spanning the lever's reach (M_REF/LOADING_MAX … M_REF/LOADING_MIN).
+	_moderation_desc = FieldDescriptor.new("Moderation M", "ratio", FieldDescriptor.GRID,
+		CrossSections.M_REF / LOADING_MAX, CrossSections.M_REF / LOADING_MIN, false)
 	# Fuel temperature (M2 heatmap; M4 makes it the REAL homogenized field). Fixed
 	# range from inlet to the over-temp line so the scale is stable across transients
 	# (CLAUDE.md); hotter cells clamp to the top.
@@ -219,6 +260,9 @@ func _ready() -> void:
 	# more entry, not new render code.
 	_fields = [
 		{"desc": _flux_desc, "get": func() -> PackedFloat32Array: return _last_flux},
+		{"desc": _flux_fast_desc, "get": func() -> PackedFloat32Array: return _last_flux_fast},
+		{"desc": _flux_thermal_desc, "get": func() -> PackedFloat32Array: return _last_flux_thermal},
+		{"desc": _moderation_desc, "get": func() -> PackedFloat32Array: return _last_moderation},
 		{"desc": _temp_desc, "get": func() -> PackedFloat32Array: return _last_temp},
 		{"desc": _coolant_desc, "get": func() -> PackedFloat32Array: return _last_coolant},
 		{"desc": _pebble_temp_desc, "get_peb": func(peb: Pebble) -> float: return peb.temperature},
@@ -290,6 +334,7 @@ func _inject_batch() -> void:
 		_next_id += 1
 		var peb := Pebble.new(id, PEBBLE_RADIUS)
 		_stamp_enrichment(peb, _enrichment)
+		peb.fuel_loading = _fuel_loading   # M5b design moderation, stamped at manufacture
 		# The INITIAL bed is seeded to online-refueling equilibrium (a spread of
 		# burnups), not all-fresh. Later injections — refuel replacements for
 		# discharged pebbles — are genuinely fresh (burnup 0).
@@ -448,13 +493,14 @@ func _solve_flux() -> void:
 
 	if _feedback_on:
 		# Warm solve: temperature-free base + Doppler (fuel T → sigma_a1) + moderator-
-		# temperature feedback (coolant T → sigma_r / sigma_a2) at the CURRENT per-cell
+		# temperature feedback (graphite T → sigma_r / sigma_a2) at the CURRENT per-cell
 		# state. Restore all three bases first so neither feedback stacks across frames.
-		# The MTC reads grid.coolant_temp, which solve_coolant_field fills at the END of
-		# this function — so it uses LAST frame's coolant field. That one-solve lag is
-		# deliberate: it breaks the coolant→MTC→power→coolant circularity, and the field
-		# moves far slower than the solve cadence, so the lag is invisible. At cold start
-		# coolant_temp = inlet everywhere → M_eff = M_base → the MTC is simply a no-op.
+		# BOTH feedbacks read the SAME driver — grid.temperature, the pebble/graphite
+		# temperature — because in a gas-cooled bed the graphite moderator sits inside the
+		# pebble at pebble temperature (see Thermal.apply_field_moderator). That temperature
+		# is a genuine time-integrated state (thermal inertia), so the power→temp→feedback→
+		# power loop is closed honestly through the lag, with no one-solve hack. At cold
+		# start temperature = inlet everywhere → M_eff = M_base → the MTC is simply a no-op.
 		_grid.sigma_a1 = base_sa1.duplicate()
 		_grid.sigma_r = base_sr.duplicate()
 		_grid.sigma_a2 = base_sa2.duplicate()
@@ -463,6 +509,8 @@ func _solve_flux() -> void:
 		var sol := Neutronics.solve(_grid)
 		_k_eff = sol.k_eff
 		_last_flux = sol.flux
+		_last_flux_fast = sol.flux_fast
+		_last_flux_thermal = sol.flux_thermal
 		_solve_iters = sol.iterations
 	else:
 		# Feedback OFF: the uncontrolled state — no Doppler, no MTC, so k is the raw cold
@@ -473,6 +521,8 @@ func _solve_flux() -> void:
 		_grid.sigma_a2 = base_sa2.duplicate()
 		_k_eff = cold.k_eff
 		_last_flux = cold.flux
+		_last_flux_fast = cold.flux_fast
+		_last_flux_thermal = cold.flux_thermal
 		_solve_iters = cold.iterations
 
 	# M4b coolant transport: with the fuel temperature freshly homogenized onto the
@@ -489,6 +539,9 @@ func _solve_flux() -> void:
 	# computed from the pebbles themselves in _thermal_step.)
 	_last_temp = _grid.temperature.duplicate()
 	_last_coolant = _grid.coolant_temp.duplicate()
+	# Design moderation field (M5b) — the base per-cell M homogenize wrote (pre-MTC), so
+	# the heatmap shows the fuel-loading design the player set, not the transient warm M_eff.
+	_last_moderation = _grid.moderation.duplicate()
 
 	# Update the heatmap for whichever field is selected (consumer; never writes back).
 	_refresh_field_display()
@@ -692,6 +745,10 @@ func _input(event: InputEvent) -> void:
 		_set_inlet(_inlet_temp + Thermal.INLET_STEP)
 	elif event.is_action_pressed("inlet_down"):
 		_set_inlet(_inlet_temp - Thermal.INLET_STEP)
+	elif event.is_action_pressed("loading_up"):
+		_set_loading(_fuel_loading + LOADING_STEP)
+	elif event.is_action_pressed("loading_down"):
+		_set_loading(_fuel_loading - LOADING_STEP)
 	elif event.is_action_pressed("scram"):
 		_toggle_scram()
 	elif event is InputEventKey:
@@ -715,6 +772,13 @@ func _input(event: InputEvent) -> void:
 				_set_inlet(_inlet_temp + Thermal.INLET_STEP)
 			KEY_K:
 				_set_inlet(_inlet_temp - Thermal.INLET_STEP)
+			# Fuel LOADING — the M5b moderation design lever. Down (;) removes heavy metal
+			# (more graphite → MORE moderation → M up, toward the over-moderated instability);
+			# up (') adds it (less moderation → M down, deeper under-moderated / stable).
+			KEY_SEMICOLON:
+				_set_loading(_fuel_loading - LOADING_STEP)
+			KEY_APOSTROPHE:
+				_set_loading(_fuel_loading + LOADING_STEP)
 			# SCRAM (M5) — emergency shutdown. Space trips / resets it; pair with a flow
 			# cut (,) to watch the decay-heat tail bound the temperature (walk-away safe).
 			KEY_SPACE:
@@ -749,6 +813,16 @@ func _set_flow(f: float) -> void:
 ## the next coolant solve (it only re-seeds the top-of-bed march temperature).
 func _set_inlet(t: float) -> void:
 	_inlet_temp = clampf(t, Thermal.INLET_MIN, Thermal.INLET_MAX)
+
+
+## Change the DESIGN fuel loading — the M5b moderation lever. Like enrichment it is
+## applied to freshly injected pebbles ONLY (not restamped onto the burned bed), so a
+## new loading propagates as fresh fuel refuels the core: the moderation ratio, and
+## with it the sign of the moderator-temperature coefficient, shifts gradually rather
+## than flipping the whole core at once. The player watches the core walk from the
+## stable under-moderated regime toward the over-moderated instability as it refuels.
+func _set_loading(v: float) -> void:
+	_fuel_loading = clampf(v, LOADING_MIN, LOADING_MAX)
 
 
 func _draw() -> void:
@@ -794,10 +868,16 @@ func _update_hud() -> void:
 	else:
 		outflow = "spent fuel out: 0   (fuel still below discharge burnup)\n"
 
-	_label.text = "PEBBLE BED — M5 decay heat & scram\n" \
+	# Moderation regime from the DESIGN fuel loading: M = M_REF / loading, labeled by
+	# which side of the k_inf(M) peak it sits on — the sign of the moderator coefficient.
+	var m_design := CrossSections.moderation(_fuel_loading)
+	var mod_regime := "OVER-moderated (MTC +, unstable)" if m_design > MOD_PEAK_M else "under-moderated (MTC −, stable)"
+
+	_label.text = "PEBBLE BED — M5b two-group & moderation\n" \
 		+ "active: %d / %d   recirculated: %d\n" % [_pebbles.size(), TARGET_POPULATION, _total_recirculated] \
 		+ "injected: %d   discharged: %d\n" % [_total_injected, _total_extracted] \
 		+ "design enrichment: %.1f%%  ( [ / ] )    coolant flow: %.2f  ( , / . )\n" % [_enrichment * 100.0, _coolant_flow] \
+		+ "fuel loading: %.2f → M %.2f  %s  ( ; / ' )\n" % [_fuel_loading, m_design, mod_regime] \
 		+ "coolant inlet: %.0f K  ( K / L )\n" % _inlet_temp \
 		+ "feedback: %s  (F)   scram: %s  (Space)   campaign: %.0f\n" % [("ON" if _feedback_on else "OFF"), ("TRIPPED" if _scrammed else "off"), _clocks.campaign_elapsed] \
 		+ "k-eff: %.4f   %s\n" % [k_show, status] \

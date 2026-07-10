@@ -1,0 +1,6 @@
+# Third-party GDAI MCP plugin — do not commit (per plugin README / license).
+# It's a local dev tool that drives the Godot editor, not part of the game.
+gdai-mcp-plugin-godot/
+
+# Plugin distribution archives.
+*.zip

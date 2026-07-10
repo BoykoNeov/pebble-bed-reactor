@@ -213,8 +213,18 @@ power → heat → pebble temperature (with inertia) → Doppler reactivity → 
 ```
 
 The reactor now responds with genuine dynamics — thermal lag, overshoot,
-settling — instead of instant regulation. Coolant temperature similarly feeds the
-moderator temperature coefficient.
+settling — instead of instant regulation.
+
+> **M5b correction — the moderator coefficient is driven by pebble/graphite
+> temperature, not coolant temperature.** This section originally said "coolant
+> temperature similarly feeds the moderator temperature coefficient." That is
+> physically weak for a *gas-cooled* pebble bed: helium moderates negligibly, and
+> the graphite moderator actually sits **inside the pebble at pebble temperature**.
+> So the implemented moderator-temperature coefficient (MTC) rides `grid.temperature`
+> (the pebble/fuel field — the same driver Doppler reads), giving both the correct
+> physics and a driver strong enough (~hundreds of K of pebble swing vs ~tens of K
+> of coolant bed rise) to make an over-moderated core visibly destabilize. See
+> `sim/feedback.gd` (`moderator_m_eff`) and `sim/thermal.gd` (`apply_field_moderator`).
 
 ### Where it sits in the clock model
 

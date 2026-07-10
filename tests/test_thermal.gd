@@ -34,6 +34,7 @@ func _initialize() -> void:
 	_test_loss_of_flow_bounded()
 	_test_decay_heat()
 	_test_scram_passive_safety()
+	_test_moderation_instability()
 	if _failures == 0:
 		print("\nALL CHECKS PASSED")
 	else:
@@ -682,6 +683,160 @@ func _bed_decay_power(pebbles: Dictionary) -> float:
 	for id in pebbles:
 		d += Thermal.decay_power(pebbles[id].decay_e)
 	return d
+
+
+## Symmetric packed core at `enrichment` AND design moderation `loading` (M5b). Like
+## _build_core but stamps peb.fuel_loading, so homogenize sets each fuel cell's
+## moderation ratio M = CrossSections.moderation(loading). loading 1.0 → M 1.0
+## (under-moderated, below the k_inf peak); loading 0.5 → M 2.0 (over-moderated, above).
+func _build_core_loading(enrichment: float, loading: float) -> Grid:
+	var grid := Grid.for_silo()
+	var pebbles := {}
+	var positions := {}
+	var id := 0
+	var spacing := 18.0
+	var half_cols := 8
+	var y := Silo.OUTLET_Y - 370.0
+	while y <= Silo.OUTLET_Y - spacing:
+		for k in range(-half_cols, half_cols + 1):
+			var x := Silo.CENTER_X + k * spacing
+			if x <= Silo.LEFT + 8.0 or x >= Silo.RIGHT - 8.0:
+				continue
+			var peb := Pebble.new(id, 8.0)
+			peb.u235 = enrichment
+			peb.u238 = 1.0 - enrichment
+			peb.fuel_loading = loading
+			pebbles[id] = peb
+			positions[id] = Vector2(x, y)
+			id += 1
+		y += spacing
+	grid.homogenize(pebbles, positions)
+	return grid
+
+
+## Coupled thermal-dynamics loop WITH BOTH feedbacks live — Doppler (fast group) AND
+## the moderator-temperature coefficient (rescale Σr/Σa2 by the graphite temperature).
+## Mirrors _run_coupled but restores all THREE temperature-free bases each solve and
+## applies apply_field_moderator, exactly the live _solve_flux warm path. Isotopics are
+## FIXED (no burnup/depletion) — this deliberately keeps MTC OUT of the burnup path that
+## validated A_REF (advisor), isolating the moderator feedback's dynamic sign. Returns
+## the settled k / A / peak-temp plus the whole trajectory for inspection.
+func _run_coupled_mtc(grid: Grid, base_sa1: PackedFloat32Array, base_sr: PackedFloat32Array,
+		base_sa2: PackedFloat32Array, flow: float, amplitude: float,
+		cell_temp: PackedFloat32Array, steps: int, dt: float, solve_every: int) -> Dictionary:
+	var n := grid.cell_count()
+	var h := Thermal.h_of_flow(flow)
+	var k := 1.0
+	var flux := PackedFloat32Array(); flux.resize(n); flux.fill(0.0)
+	var peak_seen := 0.0
+	var k_hist := PackedFloat32Array()
+	var a_hist := PackedFloat32Array()
+	var t_hist := PackedFloat32Array()
+	for i in range(steps):
+		if i % solve_every == 0:
+			for c in range(n):
+				grid.sigma_a1[c] = base_sa1[c]
+				grid.sigma_r[c] = base_sr[c]
+				grid.sigma_a2[c] = base_sa2[c]
+				grid.temperature[c] = cell_temp[c]   # pebble/graphite T drives BOTH feedbacks
+			Thermal.solve_coolant_field(grid, flow, Thermal.T_INLET)
+			Thermal.apply_field_doppler(grid)
+			Thermal.apply_field_moderator(grid)
+			var sol := Neutronics.solve(grid)
+			k = sol.k_eff
+			flux = sol.flux
+		amplitude = Thermal.step_power(amplitude, k, dt)
+		var peak := Thermal.T_INLET
+		for c in range(n):
+			if grid.nu_sigma_f[c] <= 0.0:
+				continue
+			var p := Thermal.pebble_power(amplitude, flux[c])
+			cell_temp[c] = Thermal.step_pebble_temp(cell_temp[c], p, grid.coolant_temp[c], h, dt)
+			peak = maxf(peak, cell_temp[c])
+		peak_seen = maxf(peak_seen, peak)
+		if i % 20 == 0:
+			k_hist.append(k); a_hist.append(amplitude); t_hist.append(peak)
+	var peak_final := 0.0
+	for c in range(n):
+		peak_final = maxf(peak_final, cell_temp[c])
+	# Tail (last 30%) means — the settled metric.
+	var tail_from := int(t_hist.size() * 0.7)
+	var mt := 0.0; var mk := 0.0; var ma := 0.0; var nn := 0
+	for j in range(tail_from, t_hist.size()):
+		mt += t_hist[j]; mk += k_hist[j]; ma += a_hist[j]; nn += 1
+	if nn > 0:
+		mt /= nn; mk /= nn; ma /= nn
+	var stride := maxi(1, t_hist.size() / 12)
+	var traj := ""
+	for j in range(0, t_hist.size(), stride):
+		traj += "    t=%3.0fs  k=%.4f  peakT=%5.0f  A=%9.2f\n" % [j * 20 * dt, k_hist[j], t_hist[j], a_hist[j]]
+	return {"k": k, "A": amplitude, "peak_final": peak_final, "peak_seen": peak_seen,
+			"mean_k": mk, "mean_A": ma, "mean_peakT": mt, "traj": traj}
+
+
+## THE M5b HEADLINE (CLAUDE.md validation target): "under- vs over-moderation flips the
+## sign of the moderator coefficient — a player should be able to accidentally build an
+## unstable core and see why." Proven here in the COUPLED DYNAMICS (the static sign flip
+## lives in test_neutronics): two cores with MATCHED cold reactivity but opposite sides
+## of the k_inf(M) peak are integrated from a cold start with Doppler + MTC live.
+##  * under-moderated (M=1.0): MTC negative, reinforces Doppler → settles fast at a modest
+##    operating temperature (this ALSO guards the nominal core surviving the pebble-temp
+##    MTC — the gap the Doppler-only burnup suite can't see, advisor).
+##  * over-moderated  (M≈2.0): MTC positive, FIGHTS Doppler → the core must heat far more
+##    before Doppler alone finally pins k, so it runs to a much hotter, higher-power
+##    excursion (or to the cap). Hotter equilibrium at matched cold k = the instability.
+func _test_moderation_instability() -> void:
+	print("\n[moderation instability: under- vs over-moderated coupled dynamics]")
+	var flow := Thermal.FLOW_NOMINAL
+	var dt := 0.05
+	var steps := 8000        # 400 s
+	var solve_every := 4
+	# The clean demo: FLIP ONE KNOB (fuel loading) at the SAME enrichment. At E=0.085
+	# both cores are cold-critical to ~1% (probed: M=1.0→1.009, M=2.0→1.015), so any
+	# difference in what follows is PURELY the moderator-coefficient sign, not a reactivity
+	# handicap. (That the over-moderated core needs no extra fissile to match is a property
+	# of THIS k_inf(M) curve — the peak sits at M≈1.2, so M=2.0 and M=1.0 are near-equidistant
+	# in k. The physics that matters is the SLOPE dk/dM, opposite-signed on the two sides.)
+	var enrich := 0.085
+
+	# Under-moderated core (M=1.0): MTC negative, reinforces Doppler.
+	var g_u := _build_core_loading(enrich, 1.0)
+	var bu1 := g_u.sigma_a1.duplicate(); var bur := g_u.sigma_r.duplicate(); var bu2 := g_u.sigma_a2.duplicate()
+	var ku_cold := Neutronics.solve(g_u).k_eff
+	var ct_u := PackedFloat32Array(); ct_u.resize(g_u.cell_count()); ct_u.fill(Thermal.T_INLET)
+	var su := _run_coupled_mtc(g_u, bu1, bur, bu2, flow, Thermal.A_NOMINAL, ct_u, steps, dt, solve_every)
+
+	# Over-moderated core (M=2.0 via loading 0.5), SAME enrichment — matched cold reactivity,
+	# opposite feedback sign.
+	var g_o := _build_core_loading(enrich, 0.5)
+	var bo1 := g_o.sigma_a1.duplicate(); var bor := g_o.sigma_r.duplicate(); var bo2 := g_o.sigma_a2.duplicate()
+	var ko_cold := Neutronics.solve(g_o).k_eff
+	var ct_o := PackedFloat32Array(); ct_o.resize(g_o.cell_count()); ct_o.fill(Thermal.T_INLET)
+	var so := _run_coupled_mtc(g_o, bo1, bor, bo2, flow, Thermal.A_NOMINAL, ct_o, steps, dt, solve_every)
+
+	print("  UNDER (M=1.0): k_cold=%.4f" % ku_cold)
+	print(su["traj"])
+	print("  under settled: k=%.4f  peakT=%.0f K (seen %.0f)  A=%.2f  meanT=%.0f"
+		% [su["mean_k"], su["peak_final"], su["peak_seen"], su["mean_A"], su["mean_peakT"]])
+	print("  OVER  (M=2.0): k_cold=%.4f" % ko_cold)
+	print(so["traj"])
+	print("  over settled:  k=%.4f  peakT=%.0f K (seen %.0f)  A=%.2f  meanT=%.0f"
+		% [so["mean_k"], so["peak_final"], so["peak_seen"], so["mean_A"], so["mean_peakT"]])
+
+	# Both must start cold-supercritical, else the comparison is meaningless (a subcritical
+	# core just shuts down regardless of feedback sign).
+	_check(ku_cold > 1.0 and ko_cold > 1.0, "both cores start cold-supercritical (matched setup)")
+	# Under-moderated: negative net feedback → self-regulates to a bounded, modest operating point.
+	_check(su["mean_peakT"] < 1400.0 and su["mean_A"] > Thermal.A_RUNNING,
+		"under-moderated core self-regulates to a modest running operating point")
+	# The headline: over-moderated core runs FAR hotter at matched cold reactivity — positive
+	# MTC fights Doppler, so the core cannot settle until it is much hotter (the instability).
+	_check(so["mean_peakT"] > su["mean_peakT"] + 300.0,
+		"over-moderated core settles/excursions FAR hotter (%.0f vs %.0f K) — positive MTC"
+			% [so["mean_peakT"], su["mean_peakT"]])
+	_check(so["peak_seen"] > su["peak_seen"] + 300.0,
+		"over-moderated core overshoots harder (peak seen %.0f vs %.0f K)"
+			% [so["peak_seen"], su["peak_seen"]])
 
 
 func _check(ok: bool, label: String) -> void:

@@ -62,20 +62,28 @@ static func doppler_sigma_a(temp: float) -> float:
 
 # --- Moderator-temperature coefficient (M5b) --------------------------------
 #
-# The SECOND temperature feedback (CLAUDE.md M4/M5), driven by the COOLANT/moderator
-# temperature rather than the fuel temperature. Its defining feature — and the reason
-# it earns its own milestone — is that its SIGN IS EMERGENT, not hardcoded: coolant
-# heat perturbs the moderation ratio M, and because k_inf(M) is PEAKED (see
-# cross_sections.gd header), the reactivity response is NEGATIVE below the peak
-# (under-moderated → self-stabilizing) but POSITIVE above it (over-moderated →
-# runaway). That sign flip is the "a player can accidentally build an unstable core
-# and see why" teaching target (CLAUDE.md validation targets).
+# The SECOND temperature feedback (CLAUDE.md M4/M5), driven by the MODERATOR
+# (graphite) temperature rather than the fuel resonance-absorption temperature. In a
+# gas-cooled pebble bed the graphite moderator sits INSIDE the pebble at pebble
+# temperature, so this coefficient rides grid.temperature (the pebble/fuel field —
+# the SAME driver Doppler reads), NOT the coolant field. CLAUDE.md M4 originally
+# sketched "coolant temperature feeds the moderator coefficient"; that is a
+# simplification which is physically weak for a gas-cooled bed (helium barely
+# moderates) and numerically too weak to demonstrate the instability — corrected to
+# the pebble/graphite temperature here and in the M4 note in CLAUDE.md.
 #
-# The DRIVER has a single fixed sign: a hotter moderator thermally hardens the
-# neutron spectrum (graphite expands / density drops, slowing-down weakens), so the
-# EFFECTIVE moderation M_eff FALLS with temperature — always, regardless of regime.
-# Whether that falling M raises or lowers k is precisely what the peak decides. Same
-# sqrt(T) form as Doppler; zero at T_REF so a cold core sits at its design M.
+# Its defining feature — and the reason it earns its own milestone — is that its SIGN
+# IS EMERGENT, not hardcoded: graphite heat perturbs the moderation ratio M, and
+# because k_inf(M) is PEAKED (see cross_sections.gd header), the reactivity response
+# is NEGATIVE below the peak (under-moderated → self-stabilizing) but POSITIVE above
+# it (over-moderated → runaway). That sign flip is the "a player can accidentally
+# build an unstable core and see why" teaching target (CLAUDE.md validation targets).
+#
+# The DRIVER has a single fixed sign: hotter graphite thermally hardens the neutron
+# spectrum (graphite expands / density drops, slowing-down weakens), so the EFFECTIVE
+# moderation M_eff FALLS with temperature — always, regardless of regime. Whether that
+# falling M raises or lowers k is precisely what the peak decides. Same sqrt(T) form as
+# Doppler; zero at T_REF so a cold core sits at its design M.
 #
 # MTC_C magnitude is the calibration that matters (advisor): large enough that the
 # over-moderated core visibly destabilizes, small enough that the nominal
@@ -83,15 +91,15 @@ static func doppler_sigma_a(temp: float) -> float:
 # static sign flip (tests/test_neutronics.gd) holds at ANY positive MTC_C.
 const MTC_C := 2.0e-3
 
-## Effective moderation ratio at coolant/moderator temperature `t_cool`, given the
-## design (cold) ratio `m_base`. Hotter coolant → LESS effective moderation
+## Effective moderation ratio at moderator (graphite) temperature `t_mod`, given the
+## design (cold) ratio `m_base`. Hotter graphite → LESS effective moderation
 ## (m_eff < m_base) — the fixed-sign driver. The k-response sign flip lives in
 ## k_inf(M), not here. Floored at a small positive fraction so the sigma_r rescale
 ## (which is proportional to m) can never go negative in a hot transient.
-static func moderator_m_eff(m_base: float, t_cool: float) -> float:
-	if t_cool <= T_REF or m_base <= 0.0:
+static func moderator_m_eff(m_base: float, t_mod: float) -> float:
+	if t_mod <= T_REF or m_base <= 0.0:
 		return m_base
-	return maxf(m_base * (1.0 - MTC_C * (sqrt(t_cool) - sqrt(T_REF))), 0.05 * m_base)
+	return maxf(m_base * (1.0 - MTC_C * (sqrt(t_mod) - sqrt(T_REF))), 0.05 * m_base)
 
 
 ## Result of one coupled (neutronics + Doppler) quasi-static solve.

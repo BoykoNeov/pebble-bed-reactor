@@ -169,13 +169,13 @@ func _test_moderation_peak() -> void:
 
 
 ## The M5b HEADLINE (CLAUDE.md validation target): the moderator-temperature
-## coefficient FLIPS SIGN across the k_inf(M) peak. Driven by coolant temperature
-## (Feedback.moderator_m_eff → Thermal.apply_field_moderator rescaling Σr/Σa2), the
-## reactivity response to heating the coolant is NEGATIVE for an under-moderated core
-## (self-stabilizing) but POSITIVE for an over-moderated one (the accidental runaway).
-## Proven STATICALLY here — isolated from the coupled thermal dynamics (advisor) — by
-## warm-solving the SAME core at a cold vs a hot uniform coolant temperature with
-## Doppler OFF. Holds at ANY positive MTC_C: this pins the SIGN; the magnitude that
+## coefficient FLIPS SIGN across the k_inf(M) peak. Driven by PEBBLE (graphite)
+## temperature (Feedback.moderator_m_eff → Thermal.apply_field_moderator rescaling
+## Σr/Σa2), the reactivity response to heating the graphite is NEGATIVE for an
+## under-moderated core (self-stabilizing) but POSITIVE for an over-moderated one (the
+## accidental runaway). Proven STATICALLY here — isolated from the coupled thermal
+## dynamics (advisor) — by warm-solving the SAME core at a cold vs a hot uniform pebble
+## temperature with Doppler OFF. Holds at ANY positive MTC_C: this pins the SIGN; the magnitude that
 ## makes the live core visibly destabilize is tuned separately against the sim.
 func _test_mtc_sign_flip() -> void:
 	print("\n[moderator-temperature coefficient: emergent sign across the peak]")
@@ -186,25 +186,25 @@ func _test_mtc_sign_flip() -> void:
 	print("  under-moderated (M=1.00): k(cold)=%.5f  k(hot)=%.5f  dk=%+.5f"
 		% [ku_cold, ku_hot, ku_hot - ku_cold])
 	_check(ku_hot < ku_cold - 1.0e-4,
-		"under-moderated core: hotter coolant LOWERS k (negative MTC → stable)")
+		"under-moderated core: hotter graphite LOWERS k (negative MTC → stable)")
 	# Over-moderated design: fuel_loading 0.6 → M ≈ 1.67, above the peak.
 	var ko_cold := _mtc_k(0.6, Feedback.T_REF)
 	var ko_hot := _mtc_k(0.6, t_hot)
 	print("  over-moderated  (M=1.67): k(cold)=%.5f  k(hot)=%.5f  dk=%+.5f"
 		% [ko_cold, ko_hot, ko_hot - ko_cold])
 	_check(ko_hot > ko_cold + 1.0e-4,
-		"over-moderated core: hotter coolant RAISES k (positive MTC → unstable)")
+		"over-moderated core: hotter graphite RAISES k (positive MTC → unstable)")
 
 
-## Warm k_eff of a core at design moderation `fuel_loading` with a uniform coolant
-## temperature `t_cool` driving the MTC, Doppler OFF (fuel left cold) so ONLY the
-## moderator coefficient moves k. At t_cool = T_REF the MTC is a no-op, giving the
-## design-M reference k; a hotter t_cool lowers M_eff and shifts k by an amount whose
-## SIGN is set by which side of the k_inf(M) peak the design M sits on.
-func _mtc_k(fuel_loading: float, t_cool: float) -> float:
+## Warm k_eff of a core at design moderation `fuel_loading` with a uniform PEBBLE
+## (graphite) temperature `t_peb` driving the MTC, Doppler OFF (fuel absorption left
+## cold) so ONLY the moderator coefficient moves k. At t_peb = T_REF the MTC is a
+## no-op, giving the design-M reference k; a hotter t_peb lowers M_eff and shifts k by
+## an amount whose SIGN is set by which side of the k_inf(M) peak the design M sits on.
+func _mtc_k(fuel_loading: float, t_peb: float) -> float:
 	var r := _solve_core(CrossSections.E_REF, fuel_loading)
 	var grid: Grid = r.grid
-	grid.coolant_temp.fill(t_cool)
+	grid.temperature.fill(t_peb)
 	Thermal.apply_field_moderator(grid)
 	return Neutronics.solve(grid).k_eff
 
