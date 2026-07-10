@@ -49,6 +49,12 @@ var nu_sigma_f: PackedFloat32Array  # macroscopic fission production
 # search (which invented a temperature) with the temperature the pebbles
 # actually have. Cells with no pebbles stay at the cold inlet reference.
 var temperature: PackedFloat32Array
+# Per-cell coolant (helium) temperature (K), the M4b downstream transport field.
+# Filled by Thermal.solve_coolant_field via a top-down per-column energy balance:
+# coolant enters cold at the inlet and warms as it descends through the fuel,
+# co-current with the falling pebbles. Cells above/beside the bed pass the coolant
+# through unchanged. This is an Eulerian (grid) field, rendered like flux/temp.
+var coolant_temp: PackedFloat32Array
 
 
 ## Build a grid sized to the silo plus a reflector band around it.
@@ -79,6 +85,8 @@ func _alloc() -> void:
 	nu_sigma_f = PackedFloat32Array(); nu_sigma_f.resize(n)
 	temperature = PackedFloat32Array(); temperature.resize(n)
 	temperature.fill(T_INLET)
+	coolant_temp = PackedFloat32Array(); coolant_temp.resize(n)
+	coolant_temp.fill(T_INLET)
 
 
 func cell_count() -> int:

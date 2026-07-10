@@ -37,6 +37,12 @@ var temperature: float = 293.15
 ## for now — M3 turns it into a burnup rate. Populated by main.gd's coupling step.
 var local_flux: float = 0.0
 
+## Local coolant (helium) temperature the pebble is bathed in, sampled from the
+## grid coolant-transport field (M4b). Rises going DOWN the bed as the coolant
+## picks up heat — so a deep pebble is cooled by hotter helium than a shallow one.
+## This is the Newton-cooling sink temperature, replacing M4a's uniform inlet.
+var local_coolant: float = 293.15
+
 
 func _init(p_id: int = -1, p_radius: float = 8.0) -> void:
 	id = p_id

@@ -23,6 +23,7 @@ func _initialize() -> void:
 	print("=== M4 thermal & cooling calibration ===")
 	_test_reference_temps_agree()
 	_test_h_of_flow_monotone()
+	_test_coolant_transport()
 	_test_power_kinetics_sign()
 	_test_power_integrator_stable()
 	_test_thermal_integrator_stable_and_converges()
@@ -83,6 +84,98 @@ func _test_h_of_flow_monotone() -> void:
 			monotone = false
 		prev = h
 	_check(monotone, "h(flow) strictly increases with coolant flow")
+
+
+func _test_coolant_transport() -> void:
+	print("\n[coolant transport: downstream rise, bounded, flow-dependent]")
+	# Build a packed core and impose a uniform HOT pebble field, so the coolant
+	# march has a clean fixed source to warm against.
+	var grid := _build_core(CrossSections.E_REF)
+	var n := grid.cell_count()
+	var t_peb := 1000.0
+	for c in range(n):
+		if grid.nu_sigma_f[c] > 0.0:
+			grid.temperature[c] = t_peb
+
+	# Nominal-flow field.
+	var q_nom := Thermal.solve_coolant_field(grid, Thermal.FLOW_NOMINAL, Thermal.T_INLET)
+
+	# (1) Monotone rise top→bottom within a fuel column, and (2) never above the
+	# pebble temperature (implicit blend guarantees the 2nd-law bound).
+	var monotone := true
+	var bounded := true
+	var outlet_nom := Thermal.T_INLET
+	for i in range(grid.nx):
+		var prev := Thermal.T_INLET
+		var col_has_fuel := false
+		for j in range(grid.ny):
+			var c := grid.idx(i, j)
+			var tc := grid.coolant_temp[c]
+			if grid.nu_sigma_f[c] > 0.0:
+				col_has_fuel = true
+				if tc < prev - 1.0e-4:
+					monotone = false
+				if tc > t_peb + 1.0e-4:
+					bounded = false
+				prev = tc
+		if col_has_fuel:
+			outlet_nom = maxf(outlet_nom, prev)   # deepest coolant temp = column outlet
+	print("  nominal: outlet ΔT_bed=%.1f K (peb ΔT %.0f)  extracted=%.1f" % [outlet_nom - Thermal.T_INLET, t_peb - Thermal.T_INLET, q_nom])
+	_check(monotone, "coolant temperature rises monotonically DOWN each fuel column")
+	_check(bounded, "coolant never exceeds the local pebble temperature (2nd-law bound)")
+	_check(outlet_nom > Thermal.T_INLET + 1.0, "coolant actually warms through the bed")
+	# Nominal ΔT_bed must be a MODEST fraction of the pebble ΔT — this is the
+	# calibration constraint that keeps nominal-flow behavior close to M4a and
+	# preserves A_REF. If this fails, retune W_NOMINAL (never A_REF).
+	_check(outlet_nom - Thermal.T_INLET < 0.5 * (t_peb - Thermal.T_INLET),
+		"nominal bed ΔT is a modest fraction of pebble ΔT (M4a-preserving)")
+
+	# (3) Higher flow → smaller bed ΔT (more coolant carries the same heat cooler);
+	# lower flow → bigger rise (reinforces loss-of-flow).
+	for c in range(n):
+		if grid.nu_sigma_f[c] > 0.0:
+			grid.temperature[c] = t_peb
+	Thermal.solve_coolant_field(grid, Thermal.FLOW_MAX, Thermal.T_INLET)
+	var outlet_hi := _column_outlet(grid)
+	for c in range(n):
+		if grid.nu_sigma_f[c] > 0.0:
+			grid.temperature[c] = t_peb
+	Thermal.solve_coolant_field(grid, Thermal.FLOW_MIN, Thermal.T_INLET)
+	var outlet_lo := _column_outlet(grid)
+	print("  high flow outlet ΔT=%.1f  low flow outlet ΔT=%.1f" % [outlet_hi - Thermal.T_INLET, outlet_lo - Thermal.T_INLET])
+	_check(outlet_hi - Thermal.T_INLET < outlet_nom - Thermal.T_INLET,
+		"higher flow → smaller bed ΔT")
+	_check(outlet_lo - Thermal.T_INLET > outlet_nom - Thermal.T_INLET,
+		"lower flow → larger bed ΔT (reinforces loss-of-flow)")
+
+	# (4) Extracted power = heat the coolant carries away, strictly positive and
+	# equal to Σ per-cell enthalpy adds (the headline reactor power at steady state).
+	_check(q_nom > 0.0, "extracted power (coolant enthalpy rise) is positive")
+
+	# (5) Inlet lever: a hotter inlet raises the whole coolant field but extracts
+	# LESS (smaller pebble−coolant gap) — the load-following mechanism.
+	for c in range(n):
+		if grid.nu_sigma_f[c] > 0.0:
+			grid.temperature[c] = t_peb
+	var q_hot_inlet := Thermal.solve_coolant_field(grid, Thermal.FLOW_NOMINAL, 500.0)
+	print("  hot inlet (500 K): extracted=%.1f  (cold-inlet %.1f)" % [q_hot_inlet, q_nom])
+	_check(q_hot_inlet < q_nom, "hotter inlet extracts less power (load-following lever)")
+
+
+## Deepest coolant temperature over all fuel columns = the bed outlet temperature.
+func _column_outlet(grid: Grid) -> float:
+	var outlet := Thermal.T_INLET
+	for i in range(grid.nx):
+		var prev := Thermal.T_INLET
+		var has_fuel := false
+		for j in range(grid.ny):
+			var c := grid.idx(i, j)
+			if grid.nu_sigma_f[c] > 0.0:
+				has_fuel = true
+				prev = grid.coolant_temp[c]
+		if has_fuel:
+			outlet = maxf(outlet, prev)
+	return outlet
 
 
 func _test_power_kinetics_sign() -> void:
@@ -169,6 +262,10 @@ func _run_coupled(grid: Grid, base_sa: PackedFloat32Array, flow: float,
 			for c in range(n):
 				grid.sigma_a[c] = base_sa[c]
 				grid.temperature[c] = cell_temp[c]
+			# M4b: solve the downstream coolant field from the current cell temps,
+			# so each cell's Newton-cooling sink is the LOCAL (risen) coolant temp,
+			# exactly as _solve_flux does live. grid.temperature is set above.
+			Thermal.solve_coolant_field(grid, flow, Thermal.T_INLET)
 			Thermal.apply_field_doppler(grid)
 			var sol := Neutronics.solve(grid)
 			k = sol.k_eff
@@ -178,7 +275,7 @@ func _run_coupled(grid: Grid, base_sa: PackedFloat32Array, flow: float,
 			if grid.nu_sigma_f[c] <= 0.0:
 				continue   # non-fuel cells: no heat source, stay at inlet
 			var p := Thermal.pebble_power(amplitude, flux[c])
-			cell_temp[c] = Thermal.step_pebble_temp(cell_temp[c], p, Thermal.T_INLET, h, dt)
+			cell_temp[c] = Thermal.step_pebble_temp(cell_temp[c], p, grid.coolant_temp[c], h, dt)
 			peak_temp_seen = maxf(peak_temp_seen, cell_temp[c])
 	var peak_final := 0.0
 	for c in range(n):
@@ -278,8 +375,12 @@ func _test_coupled_with_burnup_settles() -> void:
 			var sol := Neutronics.solve(grid)
 			k = sol.k_eff
 			flux = sol.flux
+			# M4b: coolant field from the freshly homogenized cell temps, then
+			# sample it onto each pebble as its local cooling sink (like flux).
+			Thermal.solve_coolant_field(grid, Thermal.FLOW_NOMINAL, Thermal.T_INLET)
 			for id in positions:
 				pebbles[id].local_flux = grid.sample(flux, positions[id])
+				pebbles[id].local_coolant = grid.sample(grid.coolant_temp, positions[id])
 		a = Thermal.step_power(a, k, dt)
 		var power_frac := a / Thermal.A_REF
 		var campaign_dt := dt * Clocks.TIME_ACCEL
@@ -287,7 +388,7 @@ func _test_coupled_with_burnup_settles() -> void:
 		for id in pebbles:
 			var peb: Pebble = pebbles[id]
 			var p := Thermal.pebble_power(a, peb.local_flux)
-			peb.temperature = Thermal.step_pebble_temp(peb.temperature, p, Thermal.T_INLET, h, dt)
+			peb.temperature = Thermal.step_pebble_temp(peb.temperature, p, peb.local_coolant, h, dt)
 			Depletion.step(peb, peb.local_flux * power_frac, campaign_dt)
 			peak = maxf(peak, peb.temperature)
 		if i % refuel_every == 0:

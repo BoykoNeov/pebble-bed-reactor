@@ -70,10 +70,11 @@ const OVER_TEMP_K := 1800.0
 # it (e.g. enrichment dialed down for the passive-shutdown demo, k ~ 0.6) reads as
 # genuinely subcritical / shutting down. Display-only — the depletion gate is untouched.
 const CRIT_BAND := 0.01
-# Toy display scale mapping the extracted-power energy balance to a plausible
-# headline figure (HTR-PM is ~250 MWth). Purely cosmetic — the physics is in
-# arbitrary units — tuned so the nominal operating point reads a few hundred MWth.
-const THERMAL_MW_SCALE := 0.06
+# Toy display scale mapping the extracted coolant-enthalpy power (M4b: the heat the
+# secondary side harvests) to a plausible headline figure (HTR-PM is ~250 MWth).
+# Purely cosmetic — the physics is in arbitrary units — tuned so the nominal
+# operating point (flow 1.0, cold inlet) reads ~300 MWth.
+const THERMAL_MW_SCALE := 0.035
 
 var _physics: PhysicsBackend
 var _pebbles: Dictionary = {}   # id -> Pebble (the Lagrangian registry)
@@ -120,6 +121,16 @@ var _coolant_flow := Thermal.FLOW_NOMINAL  # primary operating lever (mass flow)
 var _mean_temp := Feedback.T_REF      # bed-average fuel temperature (readout)
 var _thermal_seeded := false          # one-time near-equilibrium seed done?
 var _running := false                 # core producing power (gates depletion)
+
+# Coolant transport & loop closure (M4b). The coolant is no longer a uniform inlet:
+# it enters cold at the top and warms as it flows down the bed, so each pebble sees a
+# LOCAL sink temperature. The heat exchanger closes the loop — extracted power = the
+# coolant enthalpy rise (the headline reactor / electrical proxy). Inlet temperature
+# is the load-following lever (hotter return → smaller convective gap → lower power).
+var _inlet_temp := Thermal.INLET_MIN   # coolant inlet temperature (K), player lever
+var _coolant_out := Thermal.INLET_MIN  # hottest coolant seen (bed outlet, readout)
+var _coolant_desc: FieldDescriptor     # grid coolant-temperature heatmap
+var _last_coolant: PackedFloat32Array = PackedFloat32Array()
 
 # Burnup / outflow (M3)
 var _burnup_desc: FieldDescriptor      # first PEBBLE-world (Lagrangian) field
@@ -171,6 +182,11 @@ func _ready() -> void:
 	# range from inlet to the over-temp line so the scale is stable across transients
 	# (CLAUDE.md); hotter cells clamp to the top.
 	_temp_desc = FieldDescriptor.new("Fuel temperature", "K", FieldDescriptor.GRID, Feedback.T_REF, OVER_TEMP_K, false)
+	# Coolant (helium) temperature (M4b) — a GRID field like flux/fuel-temp, showing
+	# the cold inlet at the top warming to a hot outlet at the bottom of the bed. A
+	# tighter fixed range than fuel temp (coolant stays well below the fuel) keeps the
+	# downstream gradient legible; hotter cells clamp to the top of the scale.
+	_coolant_desc = FieldDescriptor.new("Coolant temperature", "K", FieldDescriptor.GRID, Feedback.T_REF, 900.0, false)
 	# Per-pebble temperature (M4) — the Lagrangian view of the SAME real energy
 	# balance: watch one hot pebble travel down the bed. Same fixed range as the grid
 	# field so the two views are directly comparable.
@@ -187,6 +203,7 @@ func _ready() -> void:
 	_fields = [
 		{"desc": _flux_desc, "get": func() -> PackedFloat32Array: return _last_flux},
 		{"desc": _temp_desc, "get": func() -> PackedFloat32Array: return _last_temp},
+		{"desc": _coolant_desc, "get": func() -> PackedFloat32Array: return _last_coolant},
 		{"desc": _pebble_temp_desc, "get_peb": func(peb: Pebble) -> float: return peb.temperature},
 		{"desc": _burnup_desc, "get_peb": func(peb: Pebble) -> float: return peb.burnup},
 	]
@@ -421,22 +438,33 @@ func _solve_flux() -> void:
 		_last_flux = cold.flux
 		_solve_iters = cold.iterations
 
+	# M4b coolant transport: with the fuel temperature freshly homogenized onto the
+	# grid, march the downstream coolant energy balance (top-down, co-current with the
+	# falling pebbles) so each cell carries its LOCAL coolant temperature — cold at the
+	# inlet, warming through the bed. Quasi-steady on the solve cadence (coolant transit
+	# is seconds); the pebbles sample it as their cooling sink in _thermal_step. Computed
+	# from grid.temperature, which is the held state when feedback is OFF, so the field
+	# freezes with the rest of the loop rather than drifting.
+	Thermal.solve_coolant_field(_grid, _coolant_flow, _inlet_temp)
+
 	# The homogenized grid temperature IS the fuel-temperature heatmap now — a real,
 	# measured field, not M2's invented equilibrium. (_peak_temp / _mean_temp are
 	# computed from the pebbles themselves in _thermal_step.)
 	_last_temp = _grid.temperature.duplicate()
+	_last_coolant = _grid.coolant_temp.duplicate()
 
 	# Update the heatmap for whichever field is selected (consumer; never writes back).
 	_refresh_field_display()
 
-	# Sample the flux back onto each pebble (drives its fission heat in _thermal_step
-	# and its burnup in _deplete). Temperature is NOT sampled back: it is the pebble's
-	# own integrated state, and the two-worlds map now runs pebble T → grid via
-	# homogenize, not the reverse.
+	# Sample the flux AND the coolant temperature back onto each pebble: flux drives its
+	# fission heat (_thermal_step) and burnup (_deplete); coolant is its Newton-cooling
+	# sink (_thermal_step). Fuel temperature is NOT sampled back — it is the pebble's own
+	# integrated state, and the two-worlds map runs pebble T → grid via homogenize.
 	for id in positions:
 		var peb: Pebble = _pebbles.get(id)
 		if peb != null:
 			peb.local_flux = _grid.sample(_last_flux, positions[id])
+			peb.local_coolant = _grid.sample(_last_coolant, positions[id])
 
 
 ## Integrate the M4 power + thermal dynamics one physics step — the only fast-clock
@@ -458,24 +486,32 @@ func _thermal_step(delta: float) -> void:
 	# Power amplitude: exact exponential update at the frozen-between-solves k.
 	_amplitude = Thermal.step_power(_amplitude, _k_eff, delta)
 	var h := Thermal.h_of_flow(_coolant_flow)
-	var t_coolant := Thermal.T_INLET   # M4a: uniform inlet coolant; M4b adds the downstream rise
 	var peak := Feedback.T_REF
 	var sum_t := 0.0
 	var extracted := 0.0
+	var out_t := _inlet_temp
 	var count := 0
 	for id in _pebbles:
 		var peb: Pebble = _pebbles[id]
+		# M4b: each pebble is cooled by its LOCAL coolant temperature (from the
+		# downstream transport field), not a uniform inlet — a deep pebble sheds heat
+		# into hotter helium than a shallow one.
+		var t_cool := peb.local_coolant
 		var p := Thermal.pebble_power(_amplitude, peb.local_flux)
-		peb.temperature = Thermal.step_pebble_temp(peb.temperature, p, t_coolant, h, delta)
-		# Heat actually leaving this pebble to coolant + structure — the power the
-		# secondary side harvests (M4b heat exchanger); at steady state it equals the
-		# fission power. Summed, this is the headline "reactor power" the player watches.
-		extracted += h * (peb.temperature - t_coolant) + Thermal.G_AMBIENT * (peb.temperature - Thermal.T_AMBIENT)
+		peb.temperature = Thermal.step_pebble_temp(peb.temperature, p, t_cool, h, delta)
+		# Heat carried off by the coolant — the enthalpy the heat exchanger harvests on
+		# the secondary side (M4b loop closure). Summed over the bed this IS the headline
+		# extracted "reactor power" (the electrical-output proxy); at steady state it
+		# equals the fission power. The always-on ambient loss is a passive structural
+		# leak, NOT harvested, so it is excluded from the headline.
+		extracted += h * (peb.temperature - t_cool)
 		peak = maxf(peak, peb.temperature)
 		sum_t += peb.temperature
+		out_t = maxf(out_t, t_cool)
 		count += 1
 	_peak_temp = peak
 	_mean_temp = sum_t / count if count > 0 else Feedback.T_REF
+	_coolant_out = out_t
 	_power = extracted * THERMAL_MW_SCALE
 	_running = _amplitude > Thermal.A_RUNNING
 
@@ -496,7 +532,9 @@ func _seed_thermal_equilibrium(positions: Dictionary, cold_flux: PackedFloat32Ar
 		if peb != null:
 			var lf := _grid.sample(cold_flux, positions[id])
 			var p := Thermal.pebble_power(Thermal.A_REF, lf)
-			peb.temperature = Thermal.steady_temp(p, Thermal.T_INLET, h)
+			# Seed against the inlet coolant (the coolant field's downstream rise is a
+			# modest correction the bed settles out over its first few seconds).
+			peb.temperature = Thermal.steady_temp(p, _inlet_temp, h)
 	_amplitude = Thermal.A_REF
 	_thermal_seeded = true
 
@@ -582,6 +620,10 @@ func _input(event: InputEvent) -> void:
 		_set_flow(_coolant_flow + Thermal.FLOW_STEP)
 	elif event.is_action_pressed("flow_down"):
 		_set_flow(_coolant_flow - Thermal.FLOW_STEP)
+	elif event.is_action_pressed("inlet_up"):
+		_set_inlet(_inlet_temp + Thermal.INLET_STEP)
+	elif event.is_action_pressed("inlet_down"):
+		_set_inlet(_inlet_temp - Thermal.INLET_STEP)
 	elif event is InputEventKey:
 		match event.keycode:
 			KEY_F:
@@ -596,6 +638,13 @@ func _input(event: InputEvent) -> void:
 				_set_flow(_coolant_flow + Thermal.FLOW_STEP)
 			KEY_COMMA:
 				_set_flow(_coolant_flow - Thermal.FLOW_STEP)
+			# Coolant INLET temperature — the M4b load-following lever. Up (L) raises the
+			# returning coolant temp → smaller convective gap → core self-limits to lower
+			# power at the same Doppler-pinned fuel temperature; down (K) cools it back.
+			KEY_L:
+				_set_inlet(_inlet_temp + Thermal.INLET_STEP)
+			KEY_K:
+				_set_inlet(_inlet_temp - Thermal.INLET_STEP)
 			KEY_V, KEY_TAB:
 				_cycle_field()
 
@@ -615,6 +664,17 @@ func _set_enrichment(e: float) -> void:
 ## the next physics step (it only changes the convective conductance in _thermal_step).
 func _set_flow(f: float) -> void:
 	_coolant_flow = clampf(f, Thermal.FLOW_MIN, Thermal.FLOW_MAX)
+
+
+## Change the coolant INLET temperature — the M4b load-following lever (advisor).
+## Doppler pins the fuel temperature that burns the cold excess, so raising the inlet
+## does not change that target; it shrinks the convective gap (T_fuel − T_inlet), so
+## each pebble sheds less and the core settles at LOWER power. This delivers the
+## CLAUDE.md "coolant temp feeds reactivity, power re-settles" behavior through the
+## existing loop — no separate moderator coefficient (that stays M5). Takes effect on
+## the next coolant solve (it only re-seeds the top-of-bed march temperature).
+func _set_inlet(t: float) -> void:
+	_inlet_temp = clampf(t, Thermal.INLET_MIN, Thermal.INLET_MAX)
 
 
 func _draw() -> void:
@@ -653,15 +713,17 @@ func _update_hud() -> void:
 	else:
 		outflow = "spent fuel out: 0   (fuel still below discharge burnup)\n"
 
-	_label.text = "PEBBLE BED — M4 thermal & cooling\n" \
+	_label.text = "PEBBLE BED — M4b coolant transport & heat exchanger\n" \
 		+ "active: %d / %d   recirculated: %d\n" % [_pebbles.size(), TARGET_POPULATION, _total_recirculated] \
 		+ "injected: %d   discharged: %d\n" % [_total_injected, _total_extracted] \
 		+ "design enrichment: %.1f%%  ( [ / ] )    coolant flow: %.2f  ( , / . )\n" % [_enrichment * 100.0, _coolant_flow] \
+		+ "coolant inlet: %.0f K  ( K / L )\n" % _inlet_temp \
 		+ "feedback: %s   (F)    campaign: %.0f\n" % [("ON" if _feedback_on else "OFF"), _clocks.campaign_elapsed] \
 		+ "k-eff: %.4f   %s\n" % [_k_eff, status] \
 		+ "  cold / uncontrolled k: %.4f\n" % _k_cold \
 		+ "fuel temp:  peak %.0f K (ΔT %.0f)   mean %.0f K\n" % [_peak_temp, _peak_temp - Feedback.T_REF, _mean_temp] \
-		+ "thermal power: %.0f MWth (toy)\n" % _power \
+		+ "coolant: inlet %.0f K → outlet %.0f K  (bed ΔT %.0f)\n" % [_inlet_temp, _coolant_out, _coolant_out - _inlet_temp] \
+		+ "extracted power: %.0f MWth (toy, secondary side)\n" % _power \
 		+ outflow \
 		+ "field: %s   (V)\n" % field_name \
 		+ "solve iters: %d   fps: %d" % [_solve_iters, Engine.get_frames_per_second()]

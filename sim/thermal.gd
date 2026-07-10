@@ -124,6 +124,88 @@ const FLOW_MAX := 2.0
 const FLOW_NOMINAL := 1.0
 const FLOW_STEP := 0.1
 
+# --- Coolant transport (M4b) ------------------------------------------------
+#
+# The downstream coolant energy balance: helium enters cold at the top and warms
+# as it flows DOWN through the bed (co-current with the falling pebbles), picking
+# up each cell's convective heat. A per-column top-down march (solve_coolant_field)
+# turns the per-cell pebble→coolant heat into a spatial coolant-temperature field,
+# so a deep pebble is cooled by hotter helium than a shallow one — the missing
+# spatial structure M4a stubbed out with a uniform inlet.
+
+# Coolant heat-capacity rate ṁ·cp per column at nominal flow (toy energy/K/s). This
+# is the KEY M4b calibration knob (advisor): it sets how much the coolant warms per
+# unit heat picked up (ΔT_bed = Q_column / W). Chosen LARGE relative to a cell's
+# convective conductance so the NOMINAL-flow bed temperature rise is a modest
+# fraction of the pebble ΔT — that keeps nominal-flow behavior close to M4a and
+# PRESERVES the A_REF operating point (tune THIS, never A_REF, if the coupled test
+# drifts). W scales linearly with mass flow, so LOW flow shrinks W → a bigger
+# coolant rise → hotter deep pebbles: it reinforces the loss-of-flow transient
+# alongside the h(flow) drop. Pinned by tests/test_thermal.gd.
+const W_NOMINAL := 30.0
+
+# Pebbles per fully-packed grid cell — the geometric factor turning a cell's
+# per-pebble convective conductance h into the cell's TOTAL conductance
+# (G_cell = h · packing · CELL_PEBBLES). For the default 68 px cell and 8 px pebble
+# this is cell_area/(π r²) ≈ 23, so the coolant picks up exactly the heat the
+# pebbles in the cell shed (energy-consistent with the per-pebble Newton cooling in
+# the thermal step). A toy geometric constant, not a free parameter.
+const CELL_PEBBLES := 23.0
+
+# Player inlet-temperature lever (M4b) — the load-following knob (advisor). Raising
+# the returning coolant temperature shrinks the convective gap (T_pebble − T_cool),
+# so at the Doppler-pinned fuel temperature each pebble sheds LESS power and the core
+# settles at a LOWER power level: honest load-following through the existing loop, no
+# new reactivity coefficient (the moderator coefficient stays M5). Range from cold
+# inlet up to a hot return; default is the cold reference so M4a behavior is the
+# starting point.
+const INLET_MIN := 293.15
+const INLET_MAX := 700.0
+const INLET_STEP := 15.0
+
+
+## Coolant heat-capacity rate ṁ·cp at a given mass flow (toy). Linear in mass flow:
+## more coolant carries more enthalpy per kelvin, so a given heat load warms it less.
+static func w_of_flow(flow: float) -> float:
+	return W_NOMINAL * maxf(flow, 0.0) / FLOW_NOMINAL
+
+
+## Solve the quasi-steady coolant-transport field in place on `grid.coolant_temp`,
+## and return the total extracted thermal power (coolant enthalpy rise summed over
+## columns) — the heat the secondary side / heat exchanger harvests, i.e. the
+## headline reactor power at steady state.
+##
+## Co-current top-down march, each column independent (the funnel is handled for
+## free — a column simply stops picking up heat once it leaves the fuel). For each
+## fuel cell the coolant passes through, an IMPLICIT single-cell balance
+##     W·(T_out − T_in) = G_cell·(T_peb − T_out)
+##  ⇒ T_out = (W·T_in + G_cell·T_peb) / (W + G_cell)
+## makes T_out a convex blend of the incoming coolant and the local pebble
+## temperature: it can NEVER exceed T_peb, so at low flow (W → small) the coolant
+## asymptotes to the pebble temperature instead of overshooting it and (2nd-law
+## violation) heating pebbles downstream — the same stability reasoning that made
+## the pebble update semi-implicit. The cell's stored coolant temperature is the
+## outlet value the next cell down (and the pebbles here) see.
+static func solve_coolant_field(grid: Grid, flow: float, t_inlet: float) -> float:
+	var w := w_of_flow(flow)
+	var h := h_of_flow(flow)
+	var extracted := 0.0
+	for i in range(grid.nx):
+		var t_cool := t_inlet
+		for j in range(grid.ny):
+			var c := grid.idx(i, j)
+			# Only fuel cells hold heat-shedding pebbles; void/reflector cells pass
+			# the coolant through unchanged (nu_sigma_f flags a fuel cell as in the
+			# rest of the coupling).
+			if grid.nu_sigma_f[c] > 0.0:
+				var g_cell := h * grid.packing[c] * CELL_PEBBLES
+				var t_peb := grid.temperature[c]
+				var t_out := (w * t_cool + g_cell * t_peb) / (w + g_cell)
+				extracted += w * (t_out - t_cool)   # enthalpy this cell added to the coolant
+				t_cool = t_out
+			grid.coolant_temp[c] = t_cool
+	return extracted
+
 
 ## Newton-cooling conductance at a given coolant mass flow. Monotonically
 ## increasing (more flow → better convection → cooler pebbles), sub-linear.
