@@ -30,6 +30,7 @@ func _initialize() -> void:
 	_test_pebble_time_constant()
 	_test_coupled_self_regulates_with_overshoot()
 	_test_coupled_with_burnup_settles()
+	_test_inlet_load_following()
 	_test_loss_of_flow_bounded()
 	if _failures == 0:
 		print("\nALL CHECKS PASSED")
@@ -347,18 +348,21 @@ func _build_core_pebbles(enrichment: float) -> Array:
 ## and to sweep KINETICS_GAIN. The refueling proxy mirrors main.gd's discharge-vs-
 ## recirculate: periodically the most-burned pebble is discharged-and-refreshed
 ## (spent → fresh) or recirculated, holding population and injecting reactivity.
-func _test_coupled_with_burnup_settles() -> void:
-	print("\n[coupled loop WITH burnup + refueling: settles, no limit cycle]")
-	var built := _build_core_pebbles(0.113)   # live operating enrichment
+## Run the FULL coupled loop (kinetics + per-pebble thermal + coolant transport +
+## power-scaled burnup + refuel proxy) at a given coolant inlet temperature and flow,
+## and return tail-averaged (last 40%) steady-state metrics + the trajectory string.
+## Shared by the settle test and the load-following test so both exercise the exact
+## same real code path (only the inlet/flow/steps differ).
+func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int) -> Dictionary:
+	var built := _build_core_pebbles(enrichment)
 	var grid: Grid = built[0]
 	var pebbles: Dictionary = built[1]
 	var positions: Dictionary = built[2]
 	var dt := 0.05
 	var solve_every := 4
 	var refuel_every := 6         # ~0.3 s at dt=0.05, mirroring EXTRACT_INTERVAL
-	var steps := 8000             # 400 s of sim — several would-be cycles
 	var a := Thermal.A_NOMINAL
-	var h := Thermal.h_of_flow(Thermal.FLOW_NOMINAL)
+	var h := Thermal.h_of_flow(flow)
 	var k := 1.0
 	var k_cold := 1.0
 	var flux := PackedFloat32Array()
@@ -375,9 +379,9 @@ func _test_coupled_with_burnup_settles() -> void:
 			var sol := Neutronics.solve(grid)
 			k = sol.k_eff
 			flux = sol.flux
-			# M4b: coolant field from the freshly homogenized cell temps, then
-			# sample it onto each pebble as its local cooling sink (like flux).
-			Thermal.solve_coolant_field(grid, Thermal.FLOW_NOMINAL, Thermal.T_INLET)
+			# M4b: coolant field at THIS inlet/flow from the freshly homogenized cell
+			# temps, then sample it onto each pebble as its local cooling sink.
+			Thermal.solve_coolant_field(grid, flow, inlet)
 			for id in positions:
 				pebbles[id].local_flux = grid.sample(flux, positions[id])
 				pebbles[id].local_coolant = grid.sample(grid.coolant_temp, positions[id])
@@ -392,12 +396,13 @@ func _test_coupled_with_burnup_settles() -> void:
 			Depletion.step(peb, peb.local_flux * power_frac, campaign_dt)
 			peak = maxf(peak, peb.temperature)
 		if i % refuel_every == 0:
-			_refuel_most_burned(pebbles, 0.113)
+			_refuel_most_burned(pebbles, enrichment)
 		if i % 20 == 0:
 			peakt_hist.append(peak)
 			kcold_hist.append(k_cold)
 			a_hist.append(a)
-	# Settling metric over the LAST 40% of the trajectory.
+	# Tail (last 40%) means — the steady-state metric; instantaneous values in a
+	# breathing core are noise (the whole reason this test tail-averages).
 	var tail_from := int(peakt_hist.size() * 0.6)
 	var mt := 0.0; var mk := 0.0; var ma := 0.0; var nn := 0
 	for j in range(tail_from, peakt_hist.size()):
@@ -407,13 +412,20 @@ func _test_coupled_with_burnup_settles() -> void:
 	for j in range(tail_from, peakt_hist.size()):
 		vt += (peakt_hist[j] - mt) * (peakt_hist[j] - mt)
 	var sd := sqrt(vt / nn)
-	# Downsampled trajectory so settle-vs-limit-cycle is visible at a glance.
 	var stride := maxi(1, peakt_hist.size() / 12)
 	var traj := ""
 	for j in range(0, peakt_hist.size(), stride):
 		traj += "    t=%3.0fs  k_cold=%.4f  peakT=%4.0f  A=%6.1f\n" \
 			% [j * 20 * dt, kcold_hist[j], peakt_hist[j], a_hist[j]]
-	print(traj)
+	return {"mean_peakT": mt, "sd_peakT": sd, "mean_kcold": mk, "mean_a": ma, "traj": traj}
+
+
+func _test_coupled_with_burnup_settles() -> void:
+	print("\n[coupled loop WITH burnup + refueling: settles, no limit cycle]")
+	var st := _run_burnup_loop(0.113, Thermal.T_INLET, Thermal.FLOW_NOMINAL, 8000)  # 400 s
+	var mt: float = st["mean_peakT"]; var sd: float = st["sd_peakT"]
+	var mk: float = st["mean_kcold"]; var ma: float = st["mean_a"]
+	print(st["traj"])
 	print("  tail(last40%%): mean peakT=%.0f K  sd=%.0f K (%.0f%%)  mean k_cold=%.4f  mean A=%.1f"
 		% [mt, sd, 100.0 * sd / maxf(mt - Feedback.T_REF, 1.0), mk, ma])
 	# The trap (advisor): a running core needs k_cold to HOLD > 1 with nonzero power.
@@ -428,6 +440,33 @@ func _test_coupled_with_burnup_settles() -> void:
 	# operating power and the limit cycle returns (see thermal.gd A_REF rationale).
 	_check(absf(ma - Thermal.A_REF) < 0.5 * Thermal.A_REF,
 		"A_REF (%.0f) matches the settled operating amplitude (%.1f)" % [Thermal.A_REF, ma])
+
+
+## M4b load-following (advisor): raising the coolant INLET temperature must settle the
+## core at LOWER power while it STAYS RUNNING (k_cold > 1) — not shut it down. A single
+## live snapshot can't tell "re-settled lower" from "collapsing" in a breathing core
+## (both show k_eff<1 momentarily), so this compares TAIL-AVERAGED steady states at two
+## inlets. A modest inlet bump keeps the comparison inside the k_cold headroom so the
+## test isolates the load-following lever from the passive-shutdown regime.
+func _test_inlet_load_following() -> void:
+	print("\n[inlet lever = load-following: higher inlet → lower power, still running]")
+	var steps := 6000   # 300 s — enough for a stable tail at each inlet
+	var cold := _run_burnup_loop(0.113, Thermal.T_INLET, Thermal.FLOW_NOMINAL, steps)
+	var hot := _run_burnup_loop(0.113, Thermal.T_INLET + 60.0, Thermal.FLOW_NOMINAL, steps)
+	print("  cold inlet %.0f K: mean A=%.1f  mean k_cold=%.4f  mean peakT=%.0f K"
+		% [Thermal.T_INLET, cold["mean_a"], cold["mean_kcold"], cold["mean_peakT"]])
+	print("  hot  inlet %.0f K: mean A=%.1f  mean k_cold=%.4f  mean peakT=%.0f K"
+		% [Thermal.T_INLET + 60.0, hot["mean_a"], hot["mean_kcold"], hot["mean_peakT"]])
+	# The discriminator: the hot-inlet core must still be RUNNING at a supercritical-cold
+	# equilibrium — otherwise the inlet is acting as a shutdown lever, not load-following.
+	_check(cold["mean_kcold"] > 1.0 and cold["mean_a"] > Thermal.A_RUNNING,
+		"baseline (cold inlet) runs at a supercritical-cold equilibrium")
+	_check(hot["mean_kcold"] > 1.0 and hot["mean_a"] > Thermal.A_RUNNING,
+		"hotter inlet STILL runs (k_cold>1, A>running) — genuine load-following, not shutdown")
+	# The lever's signature: less power at the higher inlet (smaller convective gap).
+	_check(hot["mean_a"] < cold["mean_a"],
+		"hotter inlet settles at LOWER power (%.1f < %.1f) — the load-following response"
+			% [hot["mean_a"], cold["mean_a"]])
 
 
 ## Refuel proxy: discharge-and-refresh the most-burned pebble if it is spent,
