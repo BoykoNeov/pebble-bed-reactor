@@ -91,6 +91,15 @@ const POISON_A2 := 0.55       # thermal-absorption weight of the lumped fission-
                               # over-penalize k and pull the mixed-core operating point off the
                               # hard-won ~11% enrichment. Calibrated by tests/test_depletion.gd
                               # to keep the equilibrium-mix operating point where M3/M4 tuned it.
+const XENON_A2 := 4.1         # thermal-absorption weight of Xe-135 (M5c). LARGE relative to
+                              # POISON_A2 because Xe-135 has a monstrous thermal cross-section
+                              # (~2.6e6 barns) but is present in tiny atomic amounts — the toy
+                              # xe135 inventory is a small number, so the weight carries the
+                              # potency. Sized (tests/test_xenon.gd) so EQUILIBRIUM xenon is a
+                              # modest reactivity worth that fits inside the operating margin,
+                              # while the post-shutdown pit (~2-3x equilibrium) is clearly
+                              # visible. Only the PRODUCT XENON_A2 * xe135 is physical, so this
+                              # absorbs the arbitrary scale of the yields in depletion.gd.
 const BURN_PENALTY := 0.0     # M3 turns this on: νΣf falls as fuel depletes
 
 # --- Reflector (graphite band around the core) ---
@@ -144,9 +153,13 @@ static func sigma_r_fuel(packing: float, m: float) -> float:
 
 
 ## Thermal-group absorption. Fuel/structure part + moderator-parasitic part
-## (a_mod * M, the term that makes k_inf peak) + lumped fission-product poison (M3).
-static func sigma_a2_fuel(packing: float, poison: float, m: float) -> float:
-	return (THERM_A_FUEL + THERM_A_MOD * m) * packing + POISON_A2 * poison
+## (a_mod * M, the term that makes k_inf peak) + lumped fission-product poison (M3)
+## + transient Xe-135 poison (M5c). Xenon defaults to 0.0 so existing callers/tests
+## that predate M5c are unaffected. Poison and xenon are per-heavy-metal densities
+## (area-weighted in homogenize), NOT scaled by packing: they ride the fuel already
+## counted in the pebbles binned to the cell.
+static func sigma_a2_fuel(packing: float, poison: float, m: float, xenon := 0.0) -> float:
+	return (THERM_A_FUEL + THERM_A_MOD * m) * packing + POISON_A2 * poison + XENON_A2 * xenon
 
 
 ## Fast fission production. Small; rises with loading and enrichment; depletes

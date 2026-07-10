@@ -35,7 +35,10 @@ Early development. Built in milestone order:
 - **M2** — Doppler feedback (passive self-regulation)
 - **M3** — Burnup, depletion, and outflow composition
 - **M4** — Thermal and cooling loop
-- **M5+** — Two-group diffusion, xenon transient, control, safety demos
+- **M5a** — Decay heat and scram (walk-away-safe demo)
+- **M5b** — Two-group diffusion and the emergent-sign moderator coefficient
+- **M5c** — Xenon transient and poisoning (Xe-135 worth, post-scram iodine pit)
+- **M5+** — Control rods, further safety/instability demos
 
 ## Tech stack
 

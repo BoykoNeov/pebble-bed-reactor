@@ -34,6 +34,17 @@ var u238: float = 0.0
 var pu239: float = 0.0
 var poison: float = 0.0  # one lumped fission-product absorber
 
+## Transient poisons (M5c — xenon). Unlike `poison` (a permanent absorber that only
+## grows with burnup), these rise AND fall on an intermediate timescale, so they must
+## be tracked separately. I-135 is a fission product that decays into Xe-135; Xe-135
+## is a very strong thermal absorber removed by its own decay AND by neutron burnout
+## (flux-dependent). The interplay — production tied to fission, decay tied to TIME —
+## is what makes the reactor droop as xenon builds and, after a shutdown, spike into
+## the post-scram "iodine pit" as trapped I-135 keeps decaying into Xe with no flux to
+## burn it out. Evolved by Depletion.step; homogenized into sigma_a2 like `poison`.
+var i135: float = 0.0    # I-135 precursor (decays to Xe-135)
+var xe135: float = 0.0   # Xe-135 absorber (the reactivity-transient poison)
+
 ## Slow-clock accumulators, driven by the campaign clock at M3.
 var burnup: float = 0.0      # MWd/kgHM proxy
 var pass_count: int = 0      # multi-pass fuel cycling

@@ -191,9 +191,16 @@ func _test_equilibrium_mix_enrichment() -> void:
 ## validates the METHOD and that a workable LEU point exists; main.gd's ENRICH_DEFAULT
 ## runs slightly higher because the live settled bed is less reactive than the lattice
 ## (a live-geometry tuning, like TIME_ACCEL). OVER_TEMP_K mirrors main.gd's line.
+##
+## M5c: bumped 0.110 → 0.112. The depletion step now also evolves the Xe-135 chain, so
+## these mixed-core pebbles carry their equilibrium xenon (~0.7% Δk of parasitic
+## absorption), which pushed the old 0.110 point (k was 1.010, barely above the 1.008
+## gate) below the margin. 0.112 restores a comfortable supercritical mix WITH xenon in,
+## still regulating well under over-temp — the same recalibration every physics layer
+## has triggered here. tests/test_xenon.gd owns the xenon-worth calibration.
 const OVER_TEMP_K := 1800.0
 func lattice_operating_enrichment() -> float:
-	return 0.110
+	return 0.112
 
 
 ## A core whose pebbles carry a uniform SPREAD of burnups across [0, discharge] —

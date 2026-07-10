@@ -160,6 +160,14 @@ var _scrammed := false                # emergency shutdown engaged (kinetics onl
 var _decay_power := 0.0               # bed-total delivered decay heat (readout, a.u.)
 var _decay_frac := 0.0                # decay heat as a fraction of total delivered heat
 
+# Xenon transient & poisoning (M5c). Xe-135 is a strong thermal absorber the pebbles
+# accrue from fission (via I-135 decay) and shed by decay + neutron burnout — an
+# intermediate-timescale poison whose reactivity worth is shown live, and whose
+# post-scram "iodine pit" is the headline transient (pairs with scram + flow cut).
+var _xenon_desc: FieldDescriptor      # per-pebble Xe-135 heatmap (Lagrangian)
+var _xenon_worth := 0.0               # reactivity worth of current xenon (k_no_xe − k), Δk
+var _mean_xenon := 0.0                # bed-average Xe-135 inventory (a.u.)
+
 # Coolant transport & loop closure (M4b). The coolant is no longer a uniform inlet:
 # it enters cold at the top and warms as it flows down the bed, so each pebble sees a
 # LOCAL sink temperature. The heat exchanger closes the loop — extracted power = the
@@ -253,6 +261,13 @@ func _ready() -> void:
 	# decay-heat tail lingering (and draining) once fission has stopped. Fixed range up to
 	# ~γ·S at the peak-flux operating pebble keeps the scale stable.
 	_decay_desc = FieldDescriptor.new("Decay heat", "a.u.", FieldDescriptor.PEBBLE, 0.0, 2.0, false)
+	# Xe-135 (M5c) — a per-pebble (Lagrangian) field: each pebble colored by its transient
+	# xenon inventory. During normal operation the bed sits near a uniform equilibrium
+	# xenon; after a SCRAM (or flow cut) the pebbles' trapped I-135 keeps decaying into Xe
+	# with no flux to burn it out, so this view shows xenon SURGING up (the pit) then
+	# draining. Fixed range spans equilibrium up past the pit peak so it reads on a stable
+	# scale (single-pebble equilibrium ~2.9e-5, pit crest ~5e-5; range to 8e-5 leaves headroom).
+	_xenon_desc = FieldDescriptor.new("Xenon-135", "a.u.", FieldDescriptor.PEBBLE, 0.0, 8.0e-5, false)
 
 	# Field registry: each entry pairs a descriptor with a getter for its latest
 	# values. GRID fields expose `get` → a per-cell array; PEBBLE fields expose
@@ -268,6 +283,7 @@ func _ready() -> void:
 		{"desc": _pebble_temp_desc, "get_peb": func(peb: Pebble) -> float: return peb.temperature},
 		{"desc": _burnup_desc, "get_peb": func(peb: Pebble) -> float: return peb.burnup},
 		{"desc": _decay_desc, "get_peb": func(peb: Pebble) -> float: return Thermal.decay_power(peb.decay_e)},
+		{"desc": _xenon_desc, "get_peb": func(peb: Pebble) -> float: return peb.xe135},
 	]
 
 	_build_hud()
@@ -482,6 +498,20 @@ func _solve_flux() -> void:
 	var cold := Neutronics.solve(_grid)
 	_k_cold = cold.k_eff
 
+	# Xenon reactivity worth (M5c): re-solve with the Xe-135 absorption stripped out of
+	# the thermal group, so the HUD can show how much reactivity the transient poison is
+	# eating right now. The post-scram pit reads as THIS number swinging up. grid.xenon
+	# holds the per-cell homogenized Xe density; XENON_A2*xenon is exactly what homogenize
+	# folded into sigma_a2, so subtracting it and re-solving gives the xenon-free k. One
+	# extra cold-style solve per cadence (cheap on this grid); sigma_a2 is restored below
+	# by the branch (both restore base_sa2, which KEEPS xenon for the real solve).
+	var sa2_xe := _grid.sigma_a2.duplicate()
+	for c in range(_grid.cell_count()):
+		_grid.sigma_a2[c] = sa2_xe[c] - CrossSections.XENON_A2 * _grid.xenon[c]
+	var cold_noxe := Neutronics.solve(_grid)
+	_grid.sigma_a2 = sa2_xe   # restore xenon-in absorption before the feedback branch
+	_xenon_worth = cold_noxe.k_eff - cold.k_eff   # >0: xenon is suppressing reactivity
+
 	# One-time thermal seed: start the bed near its Doppler equilibrium temperature so
 	# the sim opens close to steady state and merely settles, instead of a violent
 	# cold-start transient every launch (advisor). Gate on a FULL bed (not a partial
@@ -550,11 +580,16 @@ func _solve_flux() -> void:
 	# fission heat (_thermal_step) and burnup (_deplete); coolant is its Newton-cooling
 	# sink (_thermal_step). Fuel temperature is NOT sampled back — it is the pebble's own
 	# integrated state, and the two-worlds map runs pebble T → grid via homogenize.
+	var xe_sum := 0.0
+	var xe_n := 0
 	for id in positions:
 		var peb: Pebble = _pebbles.get(id)
 		if peb != null:
 			peb.local_flux = _grid.sample(_last_flux, positions[id])
 			peb.local_coolant = _grid.sample(_last_coolant, positions[id])
+			xe_sum += peb.xe135
+			xe_n += 1
+	_mean_xenon = xe_sum / xe_n if xe_n > 0 else 0.0
 
 
 ## Integrate the M4 power + thermal dynamics one physics step — the only fast-clock
@@ -646,6 +681,14 @@ func _seed_thermal_equilibrium(positions: Dictionary, cold_flux: PackedFloat32Ar
 			# heat instead of building it up (a spurious startup transient otherwise).
 			peb.temperature = Thermal.steady_temp(s, _inlet_temp, h)
 			Thermal.seed_decay_heat(peb.decay_e, s)
+			# Seed Xe-135 to its equilibrium at the pebble's operating flux (A_REF ⇒
+			# power_frac ≈ 1, so the operating fluence is just its local peak-normalized
+			# flux `lf`). WHY overwrite the xenon _seed_burned already built: that build ran
+			# at flux 1.0, which OVER-seeds relative to the operating flux (~0.5 mid-bed), so
+			# the bed would open xenon-heavy and droop as it decayed toward operating. Seeding
+			# the real operating equilibrium here opens the core at its true xenon load — the
+			# same reason temperature and decay heat are seeded (advisor: no startup transient).
+			Depletion.seed_xenon(peb, lf)
 	_amplitude = Thermal.A_REF
 	_thermal_seeded = true
 
@@ -844,7 +887,18 @@ func _update_hud() -> void:
 	elif _scrammed:
 		status = "SCRAMMED — subcritical, decay-heat cooling"
 	elif _k_cold < 1.0 - CRIT_BAND:
-		status = "SUBCRITICAL — shutting down"
+		# Distinguish a genuine xenon "dead time" from an ordinary subcritical core. The
+		# dead-time condition is PRECISE: subcritical NOW, but the core WOULD be critical if
+		# the xenon cleared (k_cold + xenon_worth > 1) — so Xe-135 alone is holding it down
+		# and it cannot restart until the xenon decays. A low-enrichment shutdown (k_cold far
+		# below 1, xenon a minor contributor) correctly reads as an ordinary shutdown, NOT a
+		# pit. NOTE this is a REACHABLE state, not the default: at the nominal operating point
+		# k_cold sits ~1.01–1.02 and the ~0.2% pit swing stays well above the 0.99 gate, so
+		# the pit is a visible reactivity transient there, not a restart-blocker. It becomes a
+		# true dead time only if the core is run near-critical (e.g. enrichment dialed down)
+		# and then scrammed while carrying its xenon load.
+		var xenon_pit := _xenon_worth > 0.005 and _k_cold + _xenon_worth > 1.0
+		status = "SUBCRITICAL — XENON PIT (dead time; wait for Xe decay)" if xenon_pit else "SUBCRITICAL — shutting down"
 	elif _peak_temp >= OVER_TEMP_K:
 		status = "OVER-TEMP — Doppler can't hold; needs control rods"
 	else:
@@ -873,7 +927,12 @@ func _update_hud() -> void:
 	var m_design := CrossSections.moderation(_fuel_loading)
 	var mod_regime := "OVER-moderated (MTC +, unstable)" if m_design > MOD_PEAK_M else "under-moderated (MTC −, stable)"
 
-	_label.text = "PEBBLE BED — M5b two-group & moderation\n" \
+	# Xenon readout: worth = how much reactivity Xe-135 is eating now (Δk). After a scram
+	# or flow cut, fission stops but trapped I-135 keeps decaying into Xe, so this climbs
+	# — the iodine pit. Flag that state so the player can watch the pit build and drain.
+	var xe_note := "  — post-scram pit building" if (_scrammed and _xenon_worth > 0.006) else ""
+
+	_label.text = "PEBBLE BED — M5c xenon transient & poisoning\n" \
 		+ "active: %d / %d   recirculated: %d\n" % [_pebbles.size(), TARGET_POPULATION, _total_recirculated] \
 		+ "injected: %d   discharged: %d\n" % [_total_injected, _total_extracted] \
 		+ "design enrichment: %.1f%%  ( [ / ] )    coolant flow: %.2f  ( , / . )\n" % [_enrichment * 100.0, _coolant_flow] \
@@ -886,6 +945,7 @@ func _update_hud() -> void:
 		+ "coolant: inlet %.0f K → outlet %.0f K  (bed ΔT %.0f)\n" % [_inlet_temp, _coolant_out, _coolant_out - _inlet_temp] \
 		+ "extracted power: %.0f MWth (toy, secondary side)\n" % _power \
 		+ "decay heat: %.0f MWth  (%.0f%% of fuel heat)\n" % [_decay_power, _decay_frac * 100.0] \
+		+ "xenon: worth %.2f%% Δk   mean Xe %.1f (×1e-5)%s\n" % [_xenon_worth * 100.0, _mean_xenon * 1e5, xe_note] \
 		+ outflow \
 		+ "field: %s   (V)\n" % field_name \
 		+ "solve iters: %d   fps: %d" % [_solve_iters, Engine.get_frames_per_second()]
