@@ -457,20 +457,45 @@ func _stamp_enrichment(peb: Pebble, e: float) -> void:
 	peb.u238 = 1.0 - e
 
 
+func _toggle_feedback() -> void:
+	_feedback_on = not _feedback_on
+	_solve_flux()   # re-solve immediately so the contrast is instant
+
+
+func _cycle_field() -> void:
+	_current_field = (_current_field + 1) % _fields.size()
+	_refresh_field_display()
+
+
 func _input(event: InputEvent) -> void:
-	if not (event is InputEventKey and event.pressed and not event.echo):
+	# Ignore key releases and auto-repeat. Non-key events (InputEventAction, which
+	# is what the gdai MCP's simulate_input synthesizes) fall through to the action
+	# checks below so the sim is drivable headlessly / from tooling, not just the
+	# physical keyboard.
+	if event is InputEventKey and (not event.pressed or event.echo):
 		return
-	match event.keycode:
-		KEY_F:
-			_feedback_on = not _feedback_on
-			_solve_flux()   # re-solve immediately so the contrast is instant
-		KEY_BRACKETRIGHT, KEY_EQUAL:
-			_set_enrichment(_enrichment + ENRICH_STEP)
-		KEY_BRACKETLEFT, KEY_MINUS:
-			_set_enrichment(_enrichment - ENRICH_STEP)
-		KEY_V, KEY_TAB:
-			_current_field = (_current_field + 1) % _fields.size()
-			_refresh_field_display()
+	# InputMap actions take priority: a real key mapped to one of these arrives as
+	# an action-matching key event, so it is handled here — the raw-keycode branch
+	# is only a fallback for when the [input] actions aren't defined (e.g. a clone
+	# without them). The elif chain guarantees a single key press toggles once.
+	if event.is_action_pressed("toggle_feedback"):
+		_toggle_feedback()
+	elif event.is_action_pressed("cycle_field"):
+		_cycle_field()
+	elif event.is_action_pressed("enrich_up"):
+		_set_enrichment(_enrichment + ENRICH_STEP)
+	elif event.is_action_pressed("enrich_down"):
+		_set_enrichment(_enrichment - ENRICH_STEP)
+	elif event is InputEventKey:
+		match event.keycode:
+			KEY_F:
+				_toggle_feedback()
+			KEY_BRACKETRIGHT, KEY_EQUAL:
+				_set_enrichment(_enrichment + ENRICH_STEP)
+			KEY_BRACKETLEFT, KEY_MINUS:
+				_set_enrichment(_enrichment - ENRICH_STEP)
+			KEY_V, KEY_TAB:
+				_cycle_field()
 
 
 ## Change the DESIGN enrichment: applied to freshly injected pebbles only (see
