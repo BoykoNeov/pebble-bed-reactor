@@ -21,6 +21,29 @@
 extends Node2D
 
 const TARGET_POPULATION := 380  # keep the silo full enough to show bed flow
+# Extra pebbles beyond the bed, circulating in the fuel-handling machine (FuelLoop).
+#
+# WHY the buffer is load-bearing, not decoration: TARGET_POPULATION is a CALIBRATED
+# quantity — the bed's fuel inventory is what A_REF and the whole M4/M5 operating
+# point were tuned against. Once recirculation takes real time instead of being a
+# teleport, pebbles are continuously in the pipe and OUT of the core, so a naive
+# implementation would silently run the bed short (≈ ride_time / EXTRACT_INTERVAL
+# ≈ 13 pebbles, ~3%), shifting k_cold in a core whose burn-in trough already grazes
+# 1 — and the headless suites would NOT catch it, since they drive sim/ directly and
+# never see this mechanic. So the inventory is topped up by the buffer and the bed is
+# refilled from a staging queue to keep the IN-CORE count pinned at TARGET_POPULATION.
+# That decouples ride time from the physics entirely: the ride can be as slow and
+# legible as we like at zero reactivity cost.
+#
+# SIZING: must comfortably exceed worst-case pebbles-in-flight, or the queue starves
+# and the bed runs short — the exact failure it exists to prevent. A back-of-envelope
+# ride_time / EXTRACT_INTERVAL is NOT enough: the measured peak is ~25 in flight (the
+# ride takes longer than nominal whenever the scene runs below real time, and
+# extraction bursts), which starved a buffer of 24 and dropped the bed to 379.
+# tests/live_fuel_loop.gd measures the real peak and fails if it reaches the buffer;
+# this is sized ~2x it. Surplus is nearly free — the extra pebbles just stage at the
+# top — so prefer margin over a tight fit.
+const LOOP_BUFFER := 48
 const SPAWN_PER_TICK := 3
 const SPAWN_INTERVAL := 0.12    # seconds between injection ticks
 const PEBBLE_RADIUS := 8.0
@@ -98,7 +121,15 @@ const CRIT_BAND := 0.01
 const THERMAL_MW_SCALE := 0.035
 
 var _physics: PhysicsBackend
-var _pebbles: Dictionary = {}   # id -> Pebble (the Lagrangian registry)
+var _pebbles: Dictionary = {}   # id -> Pebble (the FULL inventory: bed + machine)
+# The fuel-handling machine outside the vessel, and the two places a pebble can be
+# while it has no body. A pebble is in exactly one of three states: in the bed (has a
+# physics body), riding the machine, or staged in `_queue` at the top waiting for a
+# slot. `_out_of_core` is the id set for the latter two — main-side only, so Pebble
+# stays a pure sim struct with no notion of the game's fuel handling.
+var _loop: FuelLoop
+var _queue: Array = []          # [{id, x}] arrived at the top, waiting to enter the bed
+var _out_of_core: Dictionary = {}   # id -> true for every pebble with no body
 var _rng := RandomNumberGenerator.new()
 var _next_id := 0
 var _spawn_accum := 0.0
@@ -220,6 +251,12 @@ func _ready() -> void:
 	# field, pebbles on top — the two-worlds-at-once view).
 	_field_display = FieldDisplay.new()
 	add_child(_field_display)
+
+	# The fuel-handling machine (conveyor / sorter / spent bin / fresh hopper). Added
+	# after the field display so it draws on top of the background heatmap, and it
+	# sits outside the vessel walls so it never occludes the bed.
+	_loop = FuelLoop.new()
+	add_child(_loop)
 
 	# Flux is normalized to peak = 1 by the solver, so a fixed [0, 1] linear
 	# range is naturally stable frame-to-frame (CLAUDE.md: no per-frame
@@ -380,6 +417,21 @@ func _physics_process(delta: float) -> void:
 	# Native self-steps; kept explicit so an external engine slots in cleanly.
 	_physics.step(delta)
 
+	# The fuel-handling machine: advance every pebble riding between the outlet and
+	# the top, then act on the ones that arrived. Riders carry no body and no flux,
+	# so this is transport bookkeeping only — it touches no physics.
+	for arrival in _loop.advance(delta):
+		var aid: int = arrival["id"]
+		if arrival["kind"] == FuelLoop.DISCHARGE:
+			# Reached the bin: gone for good. This is the ONLY thing that shrinks the
+			# inventory, and so the only thing that opens a fresh-fuel slot.
+			_pebbles.erase(aid)
+			_out_of_core.erase(aid)
+			_total_extracted += 1
+		else:
+			# Recirculated or fresh: stage at the top for the next free bed slot.
+			_queue.push_back({"id": aid, "x": arrival["x"]})
+
 	_spawn_accum += delta
 	while _spawn_accum >= SPAWN_INTERVAL:
 		_spawn_accum -= SPAWN_INTERVAL
@@ -409,26 +461,57 @@ func _physics_process(delta: float) -> void:
 	_deplete(_clocks.campaign_dt(delta))
 
 
+## Pebbles currently in the BED (i.e. holding a physics body, homogenized, fissioning).
+## Derived rather than counted so it cannot drift out of step with the registry.
+func _core_count() -> int:
+	return _pebbles.size() - _out_of_core.size()
+
+
+## Two jobs per tick, in priority order: mint inventory until the design load exists,
+## then top the BED back up to TARGET_POPULATION from the staging queue. Keeping the
+## bed pinned at its calibrated count — regardless of how many pebbles are riding the
+## machine — is what makes the visible fuel loop free of physics consequences
+## (see LOOP_BUFFER).
 func _inject_batch() -> void:
-	if _pebbles.size() >= TARGET_POPULATION:
-		return
 	for i in SPAWN_PER_TICK:
-		if _pebbles.size() >= TARGET_POPULATION:
-			return
-		var id := _next_id
-		_next_id += 1
-		var peb := Pebble.new(id, PEBBLE_RADIUS)
-		_stamp_enrichment(peb, _enrichment)
-		peb.fuel_loading = _fuel_loading   # M5b design moderation, stamped at manufacture
-		# The INITIAL bed is seeded to online-refueling equilibrium (a spread of
-		# burnups), not all-fresh. Later injections — refuel replacements for
-		# discharged pebbles — are genuinely fresh (burnup 0).
-		if _total_injected < TARGET_POPULATION:
-			_seed_burned(peb)
-		_pebbles[id] = peb
-		var pos := Vector2(Silo.spawn_x(_rng, PEBBLE_RADIUS + 2.0), Silo.spawn_y())
-		_physics.spawn_pebble(id, pos, PEBBLE_RADIUS)
-		_total_injected += 1
+		if _pebbles.size() < TARGET_POPULATION + LOOP_BUFFER:
+			_mint_pebble()
+		if _core_count() < TARGET_POPULATION and not _queue.is_empty():
+			_spawn_from_queue()
+
+
+## Manufacture one pebble at the CURRENT design settings and hand it to the loop.
+func _mint_pebble() -> void:
+	var id := _next_id
+	_next_id += 1
+	var peb := Pebble.new(id, PEBBLE_RADIUS)
+	_stamp_enrichment(peb, _enrichment)
+	peb.fuel_loading = _fuel_loading   # M5b design moderation, stamped at manufacture
+	_pebbles[id] = peb
+	_out_of_core[id] = true
+	_total_injected += 1
+	# The INITIAL load is seeded to online-refueling equilibrium (a spread of burnups),
+	# not all-fresh — including the buffer, since those pebbles cycle into the bed too
+	# and a slug of fresh fuel entering early would be a reactivity bump the equilibrium
+	# does not have. It is staged straight to the queue: making the opening load ride in
+	# from the hopper one at a time would take minutes of real time.
+	if _total_injected <= TARGET_POPULATION + LOOP_BUFFER:
+		_seed_burned(peb)
+		_queue.push_back({"id": id, "x": Silo.spawn_x(_rng, PEBBLE_RADIUS + 2.0)})
+		return
+	# Steady state: this is a genuinely fresh replacement for a pebble that just
+	# discharged (1:1), so it rides in from the fresh-fuel hopper.
+	_loop.add(id, FuelLoop.FRESH, FuelLoop.HOPPER, Silo.spawn_x(_rng, PEBBLE_RADIUS + 2.0),
+			PebbleBody.DEFAULT_TINT)
+
+
+## Move a staged pebble from the top of the machine into the bed, at exactly the x its
+## ride ended on, so the hand-off from conveyor to physics body has no visible jump.
+func _spawn_from_queue() -> void:
+	var slot: Dictionary = _queue.pop_front()
+	var id: int = slot["id"]
+	_out_of_core.erase(id)
+	_physics.spawn_pebble(id, Vector2(slot["x"], Silo.spawn_y()), PEBBLE_RADIUS)
 
 
 ## Pre-burn a seed pebble to a random point in its life so the INITIAL core starts
@@ -465,7 +548,11 @@ func _extract_lowest() -> void:
 	# another pass (population conserved); a spent pebble leaves for good and its
 	# vacancy is refilled by a FRESH pebble at injection — steady online refueling,
 	# which holds reactivity roughly flat instead of a batch sawtooth.
-	if _pebbles.size() < TARGET_POPULATION:
+	# Gate on the BED being full, not on total inventory: the machine holds pebbles
+	# that are in `_pebbles` but not in the core, so the old total-based test would
+	# fire while the bed was still filling. It also means a starved staging queue
+	# stalls extraction rather than quietly draining the bed — a safe failure.
+	if _core_count() < TARGET_POPULATION:
 		return  # let the bed fill first
 	var lowest_id := -1
 	var lowest_y := -INF
@@ -482,25 +569,46 @@ func _extract_lowest() -> void:
 		_recirculate(lowest_id, peb)
 	else:
 		_discharge(lowest_id, peb)
+	# Close the vacancy in the SAME step the sorter opened it, rather than waiting for
+	# the next injection tick: otherwise the bed sits one pebble short for up to
+	# SPAWN_INTERVAL, and the flux solve (a shorter cadence still) would sample a core
+	# that is momentarily under-fuelled. Tiny, but the whole point of the staging queue
+	# is that the bed count is EXACTLY invariant — an almost-invariant would leave a
+	# real, if small, mechanism-shaped wobble in k for someone to chase later.
+	if not _queue.is_empty():
+		_spawn_from_queue()
 
 
 ## Send a not-yet-spent pebble back to the top for another pass, keeping ALL its
-## burned state (isotopics, burnup, poison). Population is unchanged, so injection
+## burned state (isotopics, burnup, poison). Population is unchanged, so minting
 ## does not add a fresh pebble for it — only a true discharge opens a slot.
+##
+## It now RIDES the machine to get there instead of teleporting: the body is
+## destroyed here and rebuilt when the ride ends (_spawn_from_queue). In between the
+## pebble has no body, so it is invisible to homogenization, and main freezes its
+## state — a pebble in the transport pipe is out of the flux, so it neither fissions
+## nor burns. That makes this behavior-identical to the old instant hop apart from
+## the delay, which the LOOP_BUFFER absorbs.
 func _recirculate(id: int, peb: Pebble) -> void:
 	peb.pass_count += 1
+	var from := _physics.get_position(id)
 	_physics.remove_pebble(id)
-	var pos := Vector2(Silo.spawn_x(_rng, PEBBLE_RADIUS + 2.0), Silo.spawn_y())
-	_physics.spawn_pebble(id, pos, PEBBLE_RADIUS)  # same id → same Pebble in _pebbles
+	_out_of_core[id] = true
+	_loop.add(id, FuelLoop.RECIRC, from, Silo.spawn_x(_rng, PEBBLE_RADIUS + 2.0),
+			PebbleBody.DEFAULT_TINT)
 	_total_recirculated += 1
 
 
-## Remove a spent pebble for good and fold its composition into the outflow readout.
+## Retire a spent pebble: it rides out to the spent-fuel bin and is erased from the
+## inventory on arrival (see _physics_process), which is what opens the slot the next
+## mint fills with fresh fuel. The outflow readout is recorded HERE, at the sorter's
+## decision, so its semantics are unchanged by the ride.
 func _discharge(id: int, peb: Pebble) -> void:
 	_record_outflow(peb)
+	var from := _physics.get_position(id)
 	_physics.remove_pebble(id)
-	_pebbles.erase(id)
-	_total_extracted += 1
+	_out_of_core[id] = true
+	_loop.add(id, FuelLoop.DISCHARGE, from, 0.0, PebbleBody.DEFAULT_TINT)
 
 
 ## Accumulate the discharged pebble's composition for the outflow readout — the
@@ -533,6 +641,11 @@ func _deplete(campaign_dt: float) -> void:
 	# full rate and over-depletes k_cold below 1, forcing a spurious shutdown.
 	var power_frac := _amplitude / Thermal.A_REF
 	for id in _pebbles:
+		# A pebble riding the fuel machine (or staged at the top) is OUT of the core
+		# and out of the flux, so it must not burn. Its last local_flux is stale and
+		# non-zero, so without this skip it would keep depleting inside the pipe.
+		if _out_of_core.has(id):
+			continue
 		var peb: Pebble = _pebbles[id]
 		Depletion.step(peb, peb.local_flux * power_frac, campaign_dt)
 
@@ -692,6 +805,14 @@ func _thermal_step(delta: float) -> void:
 	var sum_delivered := 0.0    # bed-total delivered fuel heat (prompt + decay)
 	var count := 0
 	for id in _pebbles:
+		# Riding / staged pebbles are outside the core: no fission heat (their stale
+		# local_flux would otherwise keep making power in the pipe), and no place in
+		# the coolant loop — including them would inflate the headline extracted power
+		# and the peak/mean bed temperatures with pebbles that are not in the bed.
+		# Their state is FROZEN for the ride, exactly as the old instant hop preserved
+		# it; cooling in the pipe is a physics refinement for later.
+		if _out_of_core.has(id):
+			continue
 		var peb: Pebble = _pebbles[id]
 		# M4b: each pebble is cooled by its LOCAL coolant temperature (from the
 		# downstream transport field), not a uniform inlet — a deep pebble sheds heat
@@ -794,13 +915,21 @@ func _update_pebble_colors() -> void:
 	for id in _pebbles:
 		# desc.color = the field's own colormap through the same normalization as
 		# the colorbar, so pebble tints and legend can never disagree.
-		_physics.set_pebble_tint(id, desc.color(getter.call(_pebbles[id])))
+		var c := desc.color(getter.call(_pebbles[id]))
+		# The Lagrangian view should not stop at the vessel wall: a pebble riding the
+		# machine keeps its field color, so you can follow one spent (or hot) pebble
+		# all the way out to the bin. set_pebble_tint no-ops for a body-less pebble.
+		if _out_of_core.has(id):
+			_loop.set_rider_tint(id, c)
+		else:
+			_physics.set_pebble_tint(id, c)
 
 
 ## Restore graphite grey (used when switching from a PEBBLE field back to a GRID one).
 func _reset_pebble_tints() -> void:
 	for id in _pebbles:
 		_physics.set_pebble_tint(id, PebbleBody.DEFAULT_TINT)
+		_loop.set_rider_tint(id, PebbleBody.DEFAULT_TINT)
 
 
 ## Stamp FRESH fuel at injection: the toy heavy-metal split grid._enrichment_of()
@@ -1032,7 +1161,8 @@ func _update_hud() -> void:
 		+ _row("fuel temp", "peak %.0f K (ΔT %.0f)   mean %.0f K" % [_peak_temp, _peak_temp - Feedback.T_REF, _mean_temp]) \
 		+ _row("coolant", "%.0f → %.0f K (bed ΔT %.0f)" % [_inlet_temp, _coolant_out, _coolant_out - _inlet_temp]) \
 		+ _section("FUEL CYCLE") \
-		+ _row("pebbles", "%d / %d   recirculated %d   injected %d" % [_pebbles.size(), TARGET_POPULATION, _total_recirculated, _total_injected]) \
+		+ _row("in core", "%d / %d   (%d riding the loop)" % [_core_count(), TARGET_POPULATION, _loop.count()]) \
+		+ _row("cycle", "recirculated %d   discharged %d   made %d" % [_total_recirculated, _total_extracted, _total_injected]) \
 		+ _section("SPENT FUEL OUT") \
 		+ outflow \
 		+ _section("DESIGN & CONTROLS") \
