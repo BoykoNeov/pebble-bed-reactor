@@ -42,5 +42,11 @@ func set_tint(color: Color) -> void:
 
 
 func _draw() -> void:
-	draw_circle(Vector2.ZERO, radius, tint)
-	draw_arc(Vector2.ZERO, radius, 0.0, TAU, 20, Color(0, 0, 0, 0.25), 1.0, true)
+	# Shaded ball: darkened full disc as the rim, the tinted body offset toward
+	# the up-left "light", and a faint specular dot. The offsets are small so the
+	# dominant color stays the FIELD tint — the per-pebble heatmaps must remain
+	# readable (the shading is depth cue, not information).
+	draw_circle(Vector2.ZERO, radius, tint.darkened(0.35))
+	draw_circle(Vector2(-0.15, -0.15) * radius, radius * 0.85, tint)
+	draw_circle(Vector2(-0.32, -0.32) * radius, radius * 0.3, Color(1, 1, 1, 0.13))
+	draw_arc(Vector2.ZERO, radius, 0.0, TAU, 24, Color(0, 0, 0, 0.35), 1.0, true)

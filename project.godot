@@ -16,8 +16,17 @@ config/features=PackedStringArray("4.7", "Forward Plus")
 
 [display]
 
-window/size/viewport_width=720
+window/size/viewport_width=1200
 window/size/viewport_height=1080
+; Scale the whole canvas to whatever window the OS actually grants instead of
+; cropping it: on a 1080p screen at 125-150% display scale the bare window is
+; smaller than the viewport and, without stretch, the reactor is cut off.
+window/stretch/mode="canvas_items"
+window/stretch/aspect="keep"
+
+[rendering]
+
+environment/defaults/default_clear_color=Color(0.05, 0.06, 0.09, 1)
 
 [physics]
 

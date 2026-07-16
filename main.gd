@@ -197,7 +197,7 @@ var _last_out_fissile := 0.0
 # Readouts
 var _total_injected := 0
 var _total_extracted := 0
-var _label: Label
+var _readout: RichTextLabel
 
 
 func _ready() -> void:
@@ -236,21 +236,26 @@ func _ready() -> void:
 	# WHERE the core sits relative to the k_inf(M) peak (~1.2) — the field the player
 	# reshapes with the loading lever to build (or avoid) the over-moderated instability.
 	# Fixed range spanning the lever's reach (M_REF/LOADING_MAX … M_REF/LOADING_MIN).
+	# DIVERGING colormap pivoted on the peak itself: blue = under-moderated (stable
+	# MTC), red = over-moderated (unstable) — the field shows the SIGN of the regime,
+	# not just a magnitude (CLAUDE.md: diverging map for signed quantities).
 	_moderation_desc = FieldDescriptor.new("Moderation M", "ratio", FieldDescriptor.GRID,
-		CrossSections.M_REF / LOADING_MAX, CrossSections.M_REF / LOADING_MIN, false)
+		CrossSections.M_REF / LOADING_MAX, CrossSections.M_REF / LOADING_MIN, false,
+		Colormap.COOLWARM, MOD_PEAK_M)
 	# Fuel temperature (M2 heatmap; M4 makes it the REAL homogenized field). Fixed
 	# range from inlet to the over-temp line so the scale is stable across transients
-	# (CLAUDE.md); hotter cells clamp to the top.
-	_temp_desc = FieldDescriptor.new("Fuel temperature", "K", FieldDescriptor.GRID, Feedback.T_REF, OVER_TEMP_K, false)
+	# (CLAUDE.md); hotter cells clamp to the top. All temperature/heat fields share
+	# inferno so "hot" has one visual language across grid and pebble views.
+	_temp_desc = FieldDescriptor.new("Fuel temperature", "K", FieldDescriptor.GRID, Feedback.T_REF, OVER_TEMP_K, false, Colormap.INFERNO)
 	# Coolant (helium) temperature (M4b) — a GRID field like flux/fuel-temp, showing
 	# the cold inlet at the top warming to a hot outlet at the bottom of the bed. A
 	# tighter fixed range than fuel temp (coolant stays well below the fuel) keeps the
 	# downstream gradient legible; hotter cells clamp to the top of the scale.
-	_coolant_desc = FieldDescriptor.new("Coolant temperature", "K", FieldDescriptor.GRID, Feedback.T_REF, 900.0, false)
+	_coolant_desc = FieldDescriptor.new("Coolant temperature", "K", FieldDescriptor.GRID, Feedback.T_REF, 900.0, false, Colormap.INFERNO)
 	# Per-pebble temperature (M4) — the Lagrangian view of the SAME real energy
 	# balance: watch one hot pebble travel down the bed. Same fixed range as the grid
 	# field so the two views are directly comparable.
-	_pebble_temp_desc = FieldDescriptor.new("Pebble temperature", "K", FieldDescriptor.PEBBLE, Feedback.T_REF, OVER_TEMP_K, false)
+	_pebble_temp_desc = FieldDescriptor.new("Pebble temperature", "K", FieldDescriptor.PEBBLE, Feedback.T_REF, OVER_TEMP_K, false, Colormap.INFERNO)
 	# Burnup (M3) — the FIRST per-pebble (Lagrangian) field: each pebble colored by
 	# its own burnup, so you can literally watch a burned pebble descend the bed
 	# (CLAUDE.md two render modes). Fixed range [0, discharge] keeps the scale stable.
@@ -260,14 +265,15 @@ func _ready() -> void:
 	# operation, but after a SCRAM it is the ONLY heat source, so this view shows the
 	# decay-heat tail lingering (and draining) once fission has stopped. Fixed range up to
 	# ~γ·S at the peak-flux operating pebble keeps the scale stable.
-	_decay_desc = FieldDescriptor.new("Decay heat", "a.u.", FieldDescriptor.PEBBLE, 0.0, 2.0, false)
+	_decay_desc = FieldDescriptor.new("Decay heat", "a.u.", FieldDescriptor.PEBBLE, 0.0, 2.0, false, Colormap.INFERNO)
 	# Xe-135 (M5c) — a per-pebble (Lagrangian) field: each pebble colored by its transient
 	# xenon inventory. During normal operation the bed sits near a uniform equilibrium
 	# xenon; after a SCRAM (or flow cut) the pebbles' trapped I-135 keeps decaying into Xe
 	# with no flux to burn it out, so this view shows xenon SURGING up (the pit) then
 	# draining. Fixed range spans equilibrium up past the pit peak so it reads on a stable
 	# scale (single-pebble equilibrium ~2.9e-5, pit crest ~5e-5; range to 8e-5 leaves headroom).
-	_xenon_desc = FieldDescriptor.new("Xenon-135", "a.u.", FieldDescriptor.PEBBLE, 0.0, 8.0e-5, false)
+	# Magma: visually distinct from the inferno heat fields it is watched alongside.
+	_xenon_desc = FieldDescriptor.new("Xenon-135", "a.u.", FieldDescriptor.PEBBLE, 0.0, 8.0e-5, false, Colormap.MAGMA)
 
 	# Field registry: each entry pairs a descriptor with a getter for its latest
 	# values. GRID fields expose `get` → a per-cell array; PEBBLE fields expose
@@ -289,17 +295,80 @@ func _ready() -> void:
 	_build_hud()
 
 
+# HUD text colors (BBCode). Dim for labels/keys, bright for values, semantic
+# colors for the status line — the one thing that must be readable at a glance.
+const HUD_DIM := "8a97ab"
+const HUD_HEAD := "5c81c4"
+
 func _build_hud() -> void:
 	var layer := CanvasLayer.new()
 	add_child(layer)
-	_label = Label.new()
-	_label.position = Vector2(12, 10)
-	_label.add_theme_font_size_override("font_size", 16)
-	layer.add_child(_label)
+	var root := Control.new()
+	root.set_anchors_preset(Control.PRESET_FULL_RECT)
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	layer.add_child(root)
 
+	# Readout panel — the dedicated left column (the vessel + reflector band
+	# start at x ≈ 424, see Silo), so the instrument panel never covers the core.
+	var panel := PanelContainer.new()
+	panel.position = Vector2(12, 12)
+	panel.add_theme_stylebox_override("panel", _panel_style())
+	root.add_child(panel)
+	_readout = RichTextLabel.new()
+	_readout.bbcode_enabled = true
+	_readout.fit_content = true
+	_readout.scroll_active = false
+	_readout.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_readout.custom_minimum_size = Vector2(386, 0)
+	_readout.add_theme_font_size_override("normal_font_size", 13)
+	_readout.add_theme_font_size_override("bold_font_size", 13)
+	_readout.add_theme_color_override("default_color", Color(0.93, 0.95, 0.98))
+	panel.add_child(_readout)
+
+	# Colorbar — the dedicated right column, beside the reflector band.
 	_color_bar = ColorBar.new()
-	_color_bar.position = Vector2(560, 120)
-	layer.add_child(_color_bar)
+	_color_bar.position = Vector2(1036, 120)
+	root.add_child(_color_bar)
+
+	# Key-hints bar along the bottom, out of the way of everything.
+	var help := PanelContainer.new()
+	help.set_anchors_preset(Control.PRESET_BOTTOM_WIDE)
+	help.offset_left = 12
+	help.offset_right = -12
+	help.offset_top = -54
+	help.offset_bottom = -12
+	help.add_theme_stylebox_override("panel", _panel_style())
+	root.add_child(help)
+	var keys := RichTextLabel.new()
+	keys.bbcode_enabled = true
+	keys.fit_content = true
+	keys.scroll_active = false
+	keys.add_theme_font_size_override("normal_font_size", 13)
+	keys.add_theme_color_override("default_color", Color(0.75, 0.8, 0.88))
+	keys.text = "[center]%s[/center]" % "   ".join([
+		_key_hint("[ ]", "enrichment"),
+		_key_hint(", .", "coolant flow"),
+		_key_hint("K L", "inlet temp"),
+		_key_hint("; '", "fuel loading"),
+		_key_hint("F", "feedback"),
+		_key_hint("Space", "scram"),
+		_key_hint("V", "field"),
+	])
+	help.add_child(keys)
+
+
+static func _key_hint(key: String, what: String) -> String:
+	return "[b]%s[/b] [color=#%s]%s[/color]" % [key, HUD_DIM, what]
+
+
+static func _panel_style() -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.04, 0.05, 0.08, 0.82)
+	sb.border_color = Color(0.35, 0.42, 0.55, 0.5)
+	sb.set_border_width_all(1)
+	sb.set_corner_radius_all(6)
+	sb.set_content_margin_all(10)
+	return sb
 
 
 func _process(_delta: float) -> void:
@@ -723,8 +792,9 @@ func _update_pebble_colors() -> void:
 		return
 	var getter: Callable = entry["get_peb"]
 	for id in _pebbles:
-		var t := desc.normalize(getter.call(_pebbles[id]))
-		_physics.set_pebble_tint(id, Colormap.viridis(t))
+		# desc.color = the field's own colormap through the same normalization as
+		# the colorbar, so pebble tints and legend can never disagree.
+		_physics.set_pebble_tint(id, desc.color(getter.call(_pebbles[id])))
 
 
 ## Restore graphite grey (used when switching from a PEBBLE field back to a GRID one).
@@ -870,9 +940,17 @@ func _set_loading(v: float) -> void:
 
 func _draw() -> void:
 	# Silo shell, drawn in the parent's pass so it sits above the background
-	# heatmap but below the pebbles.
+	# heatmap but below the pebbles. Two passes give the wall visual weight: a
+	# wide dark underlay (the vessel steel) with a bright inner line on top.
 	for seg in Silo.wall_segments():
-		draw_line(seg[0], seg[1], Color(0.9, 0.9, 0.95, 0.9), 3.0)
+		draw_line(seg[0], seg[1], Color(0.05, 0.06, 0.09, 0.9), 9.0)
+		draw_line(seg[0], seg[1], Color(0.82, 0.86, 0.93, 0.95), 3.0)
+	# Discharge chute mark under the closed hopper bottom: where the metered
+	# extraction conceptually pulls pebbles out.
+	var mouth_l := Vector2(Silo.CENTER_X - Silo.OUTLET_HALF, Silo.OUTLET_Y + 8.0)
+	var mouth_r := Vector2(Silo.CENTER_X + Silo.OUTLET_HALF, Silo.OUTLET_Y + 8.0)
+	draw_line(mouth_l, mouth_l + Vector2(12, 22), Color(0.55, 0.6, 0.7, 0.8), 3.0)
+	draw_line(mouth_r, mouth_r + Vector2(-12, 22), Color(0.55, 0.6, 0.7, 0.8), 3.0)
 
 
 func _update_hud() -> void:
@@ -881,11 +959,15 @@ func _update_hud() -> void:
 	# Status. A core at online-refueling equilibrium is CRITICAL (k_cold ~ 1), so the
 	# strict k>1 test would flicker; treat within CRIT_BAND of 1 as self-regulating,
 	# and reserve "shutting down" for a clearly subcritical core (the passive-safety demo).
+	# Each status carries its own color — the status line is the one glanceable thing.
 	var status := ""
+	var status_col := "6ecf7a"
 	if not _feedback_on:
 		status = "UNCONTROLLED — no self-limiting"
+		status_col = "ff5555"
 	elif _scrammed:
 		status = "SCRAMMED — subcritical, decay-heat cooling"
+		status_col = "ffaa44"
 	elif _k_cold < 1.0 - CRIT_BAND:
 		# Distinguish a genuine xenon "dead time" from an ordinary subcritical core. The
 		# dead-time condition is PRECISE: subcritical NOW, but the core WOULD be critical if
@@ -898,11 +980,18 @@ func _update_hud() -> void:
 		# true dead time only if the core is run near-critical (e.g. enrichment dialed down)
 		# and then scrammed while carrying its xenon load.
 		var xenon_pit := _xenon_worth > 0.005 and _k_cold + _xenon_worth > 1.0
-		status = "SUBCRITICAL — XENON PIT (dead time; wait for Xe decay)" if xenon_pit else "SUBCRITICAL — shutting down"
+		if xenon_pit:
+			status = "SUBCRITICAL — XENON PIT (dead time; wait for Xe decay)"
+			status_col = "c792ea"
+		else:
+			status = "SUBCRITICAL — shutting down"
+			status_col = "7aa2f7"
 	elif _peak_temp >= OVER_TEMP_K:
 		status = "OVER-TEMP — Doppler can't hold; needs control rods"
+		status_col = "ff7043"
 	else:
 		status = "SELF-REGULATING (critical)"
+		status_col = "6ecf7a"
 
 	# When scrammed, the multiplication the kinetics actually sees is k_eff − SCRAM_WORTH
 	# (far subcritical). Show THAT, not the Doppler-regulated ~1.0, so "SCRAMMED" doesn't
@@ -913,39 +1002,52 @@ func _update_hud() -> void:
 	# flowing out the bottom" deliverable: running averages + the last discharge.
 	var outflow := ""
 	if _out_count > 0:
-		outflow = "spent fuel out: %d   avg burnup %.0f  avg passes %.1f\n" \
-				% [_out_count, _out_burnup_sum / _out_count, float(_out_passes_sum) / _out_count] \
-			+ "  avg residual fissile %.1f%%   Pu-239 %.3f   poison %.4f\n" \
-				% [(_out_fissile_sum / _out_count) * 100.0, _out_pu_sum / _out_count, _out_poison_sum / _out_count] \
-			+ "  last out: burnup %.0f  passes %d  fissile %.1f%% (fresh in %.1f%%)\n" \
-				% [_last_out_burnup, _last_out_passes, _last_out_fissile * 100.0, _enrichment * 100.0]
+		outflow = _row("discharged %d" % _out_count,
+				"avg burnup %.0f   passes %.1f" % [_out_burnup_sum / _out_count, float(_out_passes_sum) / _out_count]) \
+			+ _row("composition", "fissile %.1f%%   Pu-239 %.3f   poison %.4f"
+				% [(_out_fissile_sum / _out_count) * 100.0, _out_pu_sum / _out_count, _out_poison_sum / _out_count]) \
+			+ _row("last out", "burnup %.0f   passes %d   fissile %.1f%%"
+				% [_last_out_burnup, _last_out_passes, _last_out_fissile * 100.0])
 	else:
-		outflow = "spent fuel out: 0   (fuel still below discharge burnup)\n"
+		outflow = _row("discharged 0", "fuel still below discharge burnup")
 
 	# Moderation regime from the DESIGN fuel loading: M = M_REF / loading, labeled by
 	# which side of the k_inf(M) peak it sits on — the sign of the moderator coefficient.
 	var m_design := CrossSections.moderation(_fuel_loading)
-	var mod_regime := "OVER-moderated (MTC +, unstable)" if m_design > MOD_PEAK_M else "under-moderated (MTC −, stable)"
+	var mod_regime := "[color=#ff7043]OVER-moderated (MTC +, unstable)[/color]" if m_design > MOD_PEAK_M \
+			else "[color=#7aa2f7]under-moderated (MTC −, stable)[/color]"
 
 	# Xenon readout: worth = how much reactivity Xe-135 is eating now (Δk). After a scram
 	# or flow cut, fission stops but trapped I-135 keeps decaying into Xe, so this climbs
 	# — the iodine pit. Flag that state so the player can watch the pit build and drain.
-	var xe_note := "  — post-scram pit building" if (_scrammed and _xenon_worth > 0.006) else ""
+	var xe_note := "  [color=#c792ea]pit building[/color]" if (_scrammed and _xenon_worth > 0.006) else ""
 
-	_label.text = "PEBBLE BED — M5c xenon transient & poisoning\n" \
-		+ "active: %d / %d   recirculated: %d\n" % [_pebbles.size(), TARGET_POPULATION, _total_recirculated] \
-		+ "injected: %d   discharged: %d\n" % [_total_injected, _total_extracted] \
-		+ "design enrichment: %.1f%%  ( [ / ] )    coolant flow: %.2f  ( , / . )\n" % [_enrichment * 100.0, _coolant_flow] \
-		+ "fuel loading: %.2f → M %.2f  %s  ( ; / ' )\n" % [_fuel_loading, m_design, mod_regime] \
-		+ "coolant inlet: %.0f K  ( K / L )\n" % _inlet_temp \
-		+ "feedback: %s  (F)   scram: %s  (Space)   campaign: %.0f\n" % [("ON" if _feedback_on else "OFF"), ("TRIPPED" if _scrammed else "off"), _clocks.campaign_elapsed] \
-		+ "k-eff: %.4f   %s\n" % [k_show, status] \
-		+ "  cold / uncontrolled k: %.4f\n" % _k_cold \
-		+ "fuel temp:  peak %.0f K (ΔT %.0f)   mean %.0f K\n" % [_peak_temp, _peak_temp - Feedback.T_REF, _mean_temp] \
-		+ "coolant: inlet %.0f K → outlet %.0f K  (bed ΔT %.0f)\n" % [_inlet_temp, _coolant_out, _coolant_out - _inlet_temp] \
-		+ "extracted power: %.0f MWth (toy, secondary side)\n" % _power \
-		+ "decay heat: %.0f MWth  (%.0f%% of fuel heat)\n" % [_decay_power, _decay_frac * 100.0] \
-		+ "xenon: worth %.2f%% Δk   mean Xe %.1f (×1e-5)%s\n" % [_xenon_worth * 100.0, _mean_xenon * 1e5, xe_note] \
+	_readout.text = "[b]PEBBLE BED REACTOR[/b]  [color=#%s]toy sim — M5c[/color]\n" % HUD_DIM \
+		+ "[color=#%s]● %s[/color]\n" % [status_col, status] \
+		+ _section("CORE") \
+		+ _row("k-eff", "[b]%.4f[/b]    cold / uncontrolled %.4f" % [k_show, _k_cold]) \
+		+ _row("xenon", "worth %.2f%% Δk   mean Xe %.1f ×1e-5%s" % [_xenon_worth * 100.0, _mean_xenon * 1e5, xe_note]) \
+		+ _section("POWER & HEAT") \
+		+ _row("power", "[b]%.0f MWth[/b] extracted   decay heat %.0f MWth (%.0f%%)" % [_power, _decay_power, _decay_frac * 100.0]) \
+		+ _row("fuel temp", "peak %.0f K (ΔT %.0f)   mean %.0f K" % [_peak_temp, _peak_temp - Feedback.T_REF, _mean_temp]) \
+		+ _row("coolant", "%.0f → %.0f K (bed ΔT %.0f)" % [_inlet_temp, _coolant_out, _coolant_out - _inlet_temp]) \
+		+ _section("FUEL CYCLE") \
+		+ _row("pebbles", "%d / %d   recirculated %d   injected %d" % [_pebbles.size(), TARGET_POPULATION, _total_recirculated, _total_injected]) \
+		+ _section("SPENT FUEL OUT") \
 		+ outflow \
-		+ "field: %s   (V)\n" % field_name \
-		+ "solve iters: %d   fps: %d" % [_solve_iters, Engine.get_frames_per_second()]
+		+ _section("DESIGN & CONTROLS") \
+		+ _row("enrichment", "%.1f%% fresh fuel   flow %.2f   inlet %.0f K" % [_enrichment * 100.0, _coolant_flow, _inlet_temp]) \
+		+ _row("loading", "%.2f → M %.2f  %s" % [_fuel_loading, m_design, mod_regime]) \
+		+ _row("feedback", "%s   scram %s   campaign %.0f" % [("[color=#6ecf7a]ON[/color]" if _feedback_on else "[color=#ff5555]OFF[/color]"), ("[color=#ffaa44]TRIPPED[/color]" if _scrammed else "off"), _clocks.campaign_elapsed]) \
+		+ _section("FIELD") \
+		+ _row(field_name, "solve iters %d   fps %d" % [_solve_iters, Engine.get_frames_per_second()])
+
+
+## One dim section header line of the readout panel.
+static func _section(title: String) -> String:
+	return "[color=#%s][b]%s[/b][/color]\n" % [HUD_HEAD, title]
+
+
+## One "label value…" line of the readout panel: dim label, bright value.
+static func _row(label: String, value: String) -> String:
+	return "[color=#%s]%s[/color]  %s\n" % [HUD_DIM, label, value]

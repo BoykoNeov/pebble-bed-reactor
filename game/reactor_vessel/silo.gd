@@ -12,9 +12,13 @@
 class_name Silo
 extends RefCounted
 
-# Inner core rectangle (viewport is 720 x 1080; see project.godot).
-const LEFT := 190.0
-const RIGHT := 530.0
+# Inner core rectangle (viewport is 1200 x 1080; see project.godot). The vessel
+# sits right-of-center so the HUD gets a dedicated column on the left and the
+# colorbar one on the right — nothing overlaps the core. Translating LEFT/RIGHT
+# together is physically free: the grid, spawn band, and tests all derive from
+# these constants, and the diffusion solve is translation-invariant.
+const LEFT := 560.0
+const RIGHT := 900.0
 const TOP := 120.0
 const FUNNEL_TOP := 760.0   # where vertical walls give way to the funnel
 const OUTLET_Y := 900.0
