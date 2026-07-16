@@ -30,6 +30,11 @@ var ny: int
 var h: float                  # square cell size (px)
 var ox: float                 # grid origin (left/top edge), px
 var oy: float
+# Width of the reflector band (in cells) between the vessel wall and the grid edge.
+# Kept because the band is not merely padding: it locates the reflector columns the
+# M5d control rods occupy (control_rods.gd derives its rod columns from this, so a
+# grid built with a different band still rods the column against the wall).
+var band_cells: int
 
 # Silo interior rect: inside → fuel-or-void, outside (within grid) → reflector.
 var _in_left: float
@@ -82,6 +87,7 @@ var coolant_temp: PackedFloat32Array
 static func for_silo(cell := DEFAULT_CELL, band_cells := DEFAULT_BAND_CELLS) -> Grid:
 	var g := Grid.new()
 	g.h = cell
+	g.band_cells = band_cells
 	var band := band_cells * cell
 	g.ox = Silo.LEFT - band
 	g.oy = Silo.TOP - band

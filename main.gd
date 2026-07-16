@@ -105,9 +105,15 @@ const ENRICH_DEFAULT := 0.113
 # through several regulating states — power/temperature up, k pinned ~1 — first.
 const ENRICH_STEP := 0.0005
 # Above this equilibrium fuel temperature the toy calls the core "over-temp": the
-# point where Doppler alone stops being a safe hold (real cores use control rods
-# for that excess — M5). ~1800 K ≈ 1500 °C, near the TRISO integrity limit.
+# point where Doppler alone stops being a safe hold. Real cores hold that excess with
+# control rods — which, as of M5d, this one has too (N/M; sim/control_rods.gd), so the
+# status naming this condition now names a lever the player actually holds.
+# ~1800 K ≈ 1500 °C, near the TRISO integrity limit.
 const OVER_TEMP_K := 1800.0
+# Control-rod drawing (M5d). Amber deliberately matches the rod bar in the HUD, so the
+# thing on screen and the thing in the readout are recognizably one control.
+const ROD_W := 13.0
+const ROD_COLOR := Color(1.0, 0.67, 0.27, 0.95)
 # A core AT online-refueling equilibrium is critical: k_cold → 1 by definition, so
 # it hovers at 1.0 ± a hair and the strict k_cold>1 test flickers. Treat anything
 # within this band of 1 as "critical / self-regulating"; only a core clearly below
@@ -198,6 +204,16 @@ var _decay_frac := 0.0                # decay heat as a fraction of total delive
 var _xenon_desc: FieldDescriptor      # per-pebble Xe-135 heatmap (Lagrangian)
 var _xenon_worth := 0.0               # reactivity worth of current xenon (k_no_xe − k), Δk
 var _mean_xenon := 0.0                # bed-average Xe-135 inventory (a.u.)
+
+# Control rods (M5d) — the operator's DIRECT reactivity lever, and the answer to the
+# "OVER-TEMP — Doppler can't hold" status this HUD has always been able to show
+# without offering a way out. Unlike scram (a lumped kinetics term) these are real
+# absorbers in the side-reflector cells (sim/control_rods.gd), so their worth is
+# EMERGENT from the diffusion solve — including its S-curve in insertion depth.
+# Default 0.0 = fully withdrawn = adds literally nothing to the solve, which is what
+# keeps every pre-M5d calibration untouched.
+var _rod_insertion := 0.0             # fraction of the grid height the rods span
+var _rod_worth := 0.0                 # reactivity the rods are holding down (k_norod − k), Δk
 
 # Coolant transport & loop closure (M4b). The coolant is no longer a uniform inlet:
 # it enters cold at the top and warms as it flows down the bed, so each pebble sees a
@@ -386,7 +402,7 @@ func _build_hud() -> void:
 	help.offset_right = -12
 	help.offset_top = -54
 	help.offset_bottom = -12
-	help.add_theme_stylebox_override("panel", _panel_style())
+	help.add_theme_stylebox_override("panel", _panel_style(true))
 	root.add_child(help)
 	var keys := RichTextLabel.new()
 	keys.bbcode_enabled = true
@@ -399,6 +415,7 @@ func _build_hud() -> void:
 		_key_hint(", .", "coolant flow"),
 		_key_hint("K L", "inlet temp"),
 		_key_hint("; '", "fuel loading"),
+		_key_hint("N M", "control rods"),
 		_key_hint("F", "feedback"),
 		_key_hint("Space", "scram"),
 		_key_hint("V", "field"),
@@ -410,9 +427,14 @@ static func _key_hint(key: String, what: String) -> String:
 	return "[b]%s[/b] [color=#%s]%s[/color]" % [key, HUD_DIM, what]
 
 
-static func _panel_style() -> StyleBoxFlat:
+## `opaque` for panels the SCENE can run underneath. The default 0.82 alpha is fine
+## over empty background, but the grid — and so the control rods drawn along it (M5d) —
+## extends to the bottom of the viewport, and a fully-inserted rod bled through the
+## key-hint bar as a bright amber stripe across the text. A HUD panel should occlude the
+## scene, not compete with it.
+static func _panel_style(opaque := false) -> StyleBoxFlat:
 	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.04, 0.05, 0.08, 0.82)
+	sb.bg_color = Color(0.04, 0.05, 0.08, 1.0 if opaque else 0.82)
 	sb.border_color = Color(0.35, 0.42, 0.55, 0.5)
 	sb.set_border_width_all(1)
 	sb.set_corner_radius_all(6)
@@ -677,6 +699,19 @@ func _solve_flux() -> void:
 		return
 	_grid.homogenize(_pebbles, positions)
 
+	# CONTROL RODS (M5d) go in HERE — after homogenize, BEFORE the bases are snapshot.
+	# WHY here and not alongside the feedbacks below: a rod is not feedback, it is part
+	# of the core's physical CONFIGURATION, exactly like enrichment or burnup. Applying
+	# it to the base means every downstream solve — cold, xenon-worth, warm, AND the
+	# feedback-OFF branch — sees the rods for free, with no chance of one path silently
+	# forgetting them (withdrawing a rod during the F-toggle demo must still do something).
+	# It cannot stack across frames because homogenize unconditionally REWRITES sigma_a2
+	# in every cell (fuel/void/reflector branches are exhaustive) before this runs.
+	# Snapshot the rod-FREE absorption first, but only when rods are actually in — it is
+	# the reference the worth measurement below re-solves against.
+	var sa2_norod := _grid.sigma_a2.duplicate() if _rod_insertion > 0.0 else PackedFloat32Array()
+	ControlRods.apply_rods(_grid, _rod_insertion)
+
 	# Snapshot the temperature-FREE base FAST absorption homogenize just wrote
 	# (Neutronics only reads the grid, never mutates it, so this stays clean across
 	# the cold solve). M5b: Doppler perturbs sigma_a1; the moderator-temperature
@@ -705,6 +740,26 @@ func _solve_flux() -> void:
 	var cold_noxe := Neutronics.solve(_grid)
 	_grid.sigma_a2 = sa2_xe   # restore xenon-in absorption before the feedback branch
 	_xenon_worth = cold_noxe.k_eff - cold.k_eff   # >0: xenon is suppressing reactivity
+
+	# Control-rod worth (M5d), measured the same honest way as xenon's: re-solve against
+	# the rod-FREE absorption snapshot and difference the two. Nothing here knows a rod
+	# "worth" number — it is whatever the eigenproblem says the absorbers are costing,
+	# which is why it varies with insertion depth (the S-curve), with where the fuel
+	# actually sits, and with the rest of the core state.
+	#
+	# Measured COLD (like xenon worth) so it is the rod's OWN reactivity, not tangled with
+	# the feedback's response to it — inserting a rod drops power, which cools the fuel,
+	# which releases Doppler and gives some k back; that is the core answering the rod, not
+	# the rod's worth. Costs an extra solve ONLY while the rods are in: fully withdrawn,
+	# worth is exactly zero by definition and no solve is needed.
+	if _rod_insertion > 0.0:
+		var sa2_rod := _grid.sigma_a2
+		_grid.sigma_a2 = sa2_norod
+		var cold_norod := Neutronics.solve(_grid)
+		_grid.sigma_a2 = sa2_rod
+		_rod_worth = cold_norod.k_eff - cold.k_eff   # >0: the rods are holding k down
+	else:
+		_rod_worth = 0.0
 
 	# One-time thermal seed: start the bed near its Doppler equilibrium temperature so
 	# the sim opens close to steady state and merely settles, instead of a violent
@@ -1003,6 +1058,10 @@ func _input(event: InputEvent) -> void:
 		_set_loading(_fuel_loading + LOADING_STEP)
 	elif event.is_action_pressed("loading_down"):
 		_set_loading(_fuel_loading - LOADING_STEP)
+	elif event.is_action_pressed("rod_in"):
+		_set_rods(_rod_insertion + ControlRods.INSERT_STEP)
+	elif event.is_action_pressed("rod_out"):
+		_set_rods(_rod_insertion - ControlRods.INSERT_STEP)
 	elif event.is_action_pressed("scram"):
 		_toggle_scram()
 	elif event is InputEventKey:
@@ -1033,6 +1092,13 @@ func _input(event: InputEvent) -> void:
 				_set_loading(_fuel_loading - LOADING_STEP)
 			KEY_APOSTROPHE:
 				_set_loading(_fuel_loading + LOADING_STEP)
+			# CONTROL RODS (M5d) — the direct reactivity lever. M drives them IN (down,
+			# more absorber → k falls), N pulls them OUT. Worth per step is small near the
+			# top of the stroke and large mid-bed: that is the S-curve, not a bug.
+			KEY_M:
+				_set_rods(_rod_insertion + ControlRods.INSERT_STEP)
+			KEY_N:
+				_set_rods(_rod_insertion - ControlRods.INSERT_STEP)
 			# SCRAM (M5) — emergency shutdown. Space trips / resets it; pair with a flow
 			# cut (,) to watch the decay-heat tail bound the temperature (walk-away safe).
 			KEY_SPACE:
@@ -1056,6 +1122,20 @@ func _set_enrichment(e: float) -> void:
 ## the next physics step (it only changes the convective conductance in _thermal_step).
 func _set_flow(f: float) -> void:
 	_coolant_flow = clampf(f, Thermal.FLOW_MIN, Thermal.FLOW_MAX)
+
+
+## Drive the control rods (M5d) to a new insertion depth — the operator's direct
+## reactivity lever, and the one control that acts on the core's REACTIVITY rather than
+## on its heat removal (flow/inlet) or its fuel design (enrichment/loading).
+##
+## Takes effect on the next flux solve, where the rods' absorption is folded into the
+## grid before anything is solved. Re-solving here immediately would fight the solve
+## cadence for no gain: unlike the F-toggle (which shows an instant contrast), rod motion
+## is a physical change the core answers over its own thermal timescale, so letting the
+## next scheduled solve pick it up is both cheaper and honest.
+func _set_rods(x: float) -> void:
+	_rod_insertion = clampf(x, ControlRods.INSERT_MIN, ControlRods.INSERT_MAX)
+	queue_redraw()   # the shell is static and only repaints on request; the rods move
 
 
 ## Change the coolant INLET temperature — the M4b load-following lever (advisor).
@@ -1111,6 +1191,29 @@ func _draw() -> void:
 	draw_line(mouth_l, mouth_l + Vector2(12, 22), Color(0.55, 0.6, 0.7, 0.8), 3.0)
 	draw_line(mouth_r, mouth_r + Vector2(-12, 22), Color(0.55, 0.6, 0.7, 0.8), 3.0)
 
+	# CONTROL RODS (M5d), drawn OUTSIDE the vessel walls — which is the point of them:
+	# they ride in borings in the side reflector because a rod cannot be pushed into a
+	# packed pebble bed. Seeing them alongside the bed rather than in it is the geometry
+	# lesson, so it is worth drawing them literally where the solve absorbs.
+	#
+	# Geometry comes from ControlRods.rod_columns(_grid) and the grid's own origin/cell
+	# size — never from re-derived constants — so the picture cannot drift out of sync
+	# with the cells actually being absorbed in. If it looks wrong, the physics IS wrong.
+	if _grid != null:
+		var col_h := float(_grid.ny) * _grid.h
+		var depth := _rod_insertion * col_h
+		for i in ControlRods.rod_columns(_grid):
+			var cx := _grid.ox + (float(i) + 0.5) * _grid.h
+			# The empty channel: always visible, so the rods have a legible home to slide
+			# down and a withdrawn rod doesn't look like a missing feature.
+			draw_line(Vector2(cx, _grid.oy), Vector2(cx, _grid.oy + col_h), Color(1, 1, 1, 0.07), ROD_W)
+			if depth > 0.0:
+				var tip := Vector2(cx, _grid.oy + depth)
+				draw_line(Vector2(cx, _grid.oy), tip, Color(0.10, 0.07, 0.03, 0.95), ROD_W)
+				draw_line(Vector2(cx, _grid.oy), tip, ROD_COLOR, ROD_W * 0.45)
+				# Mark the tip: the tip's depth is what the worth curve is all about.
+				draw_line(tip - Vector2(ROD_W * 0.5, 0), tip + Vector2(ROD_W * 0.5, 0), ROD_COLOR, 2.5)
+
 
 func _update_hud() -> void:
 	var field_name: String = _fields[_current_field]["desc"].name if not _fields.is_empty() else "-"
@@ -1139,14 +1242,27 @@ func _update_hud() -> void:
 		# true dead time only if the core is run near-critical (e.g. enrichment dialed down)
 		# and then scrammed while carrying its xenon load.
 		var xenon_pit := _xenon_worth > 0.005 and _k_cold + _xenon_worth > 1.0
-		if xenon_pit:
+		# The rod analogue of the pit test, and PRECISE in the same way (M5d): subcritical
+		# now, but the core WOULD be critical if the rods came out — so the operator's rods,
+		# not spent fuel or poison, are what is holding it down. Checked FIRST because it is
+		# the one cause here that is a deliberate human action: if the player just drove the
+		# rods in, "held down by control rods" is the true explanation and "shutting down"
+		# would read as though the core had failed. A core that is subcritical for other
+		# reasons while rods happen to be part-in still falls through to the real cause.
+		var rod_held := _rod_worth > 0.005 and _k_cold + _rod_worth > 1.0
+		if rod_held:
+			status = "SUBCRITICAL — held down by control rods (N to withdraw)"
+			status_col = "ffaa44"
+		elif xenon_pit:
 			status = "SUBCRITICAL — XENON PIT (dead time; wait for Xe decay)"
 			status_col = "c792ea"
 		else:
 			status = "SUBCRITICAL — shutting down"
 			status_col = "7aa2f7"
 	elif _peak_temp >= OVER_TEMP_K:
-		status = "OVER-TEMP — Doppler can't hold; needs control rods"
+		# The rods are the answer to this one (M5d). Before they existed this status named a
+		# control the player did not have; now it names the key that fixes it.
+		status = "OVER-TEMP — Doppler can't hold alone; insert rods (M)"
 		status_col = "ff7043"
 	else:
 		status = "SELF-REGULATING (critical)"
@@ -1181,11 +1297,21 @@ func _update_hud() -> void:
 	# — the iodine pit. Flag that state so the player can watch the pit build and drain.
 	var xe_note := "  [color=#c792ea]pit building[/color]" if (_scrammed and _xenon_worth > 0.006) else ""
 
-	_readout.text = "[b]PEBBLE BED REACTOR[/b]  [color=#%s]toy sim — M5c[/color]\n" % HUD_DIM \
+	# Control-rod readout (M5d): the bar shows WHERE in the stroke the rods are, the worth
+	# beside it shows what that position is actually buying. Showing the pair together is
+	# what makes the S-curve legible — the bar moves in equal steps while the worth does
+	# not, which is the whole lesson of a rod-worth curve.
+	var rod_pips := int(round(_rod_insertion * 10.0))
+	var rod_bar := "[color=#ffaa44]%s[/color][color=#%s]%s[/color] %.0f%% in" \
+		% ["█".repeat(rod_pips), HUD_DIM, "·".repeat(10 - rod_pips), _rod_insertion * 100.0]
+	var rod_note := "  [color=#%s]withdrawn[/color]" % HUD_DIM if _rod_insertion <= 0.0 else ""
+
+	_readout.text = "[b]PEBBLE BED REACTOR[/b]  [color=#%s]toy sim — M5d[/color]\n" % HUD_DIM \
 		+ "[color=#%s]● %s[/color]\n" % [status_col, status] \
 		+ _section("CORE") \
 		+ _row("k-eff", "[b]%.4f[/b]    cold / uncontrolled %.4f" % [k_show, _k_cold]) \
 		+ _row("xenon", "worth %.2f%% Δk   mean Xe %.1f ×1e-5%s" % [_xenon_worth * 100.0, _mean_xenon * 1e5, xe_note]) \
+		+ _row("rods", "%s   worth %.2f%% Δk%s" % [rod_bar, _rod_worth * 100.0, rod_note]) \
 		+ _section("POWER & HEAT") \
 		+ _row("power", "[b]%.0f MWth[/b] extracted   decay heat %.0f MWth (%.0f%%)" % [_power, _decay_power, _decay_frac * 100.0]) \
 		+ _row("fuel temp", "peak %.0f K (ΔT %.0f)   mean %.0f K" % [_peak_temp, _peak_temp - Feedback.T_REF, _mean_temp]) \

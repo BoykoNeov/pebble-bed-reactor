@@ -38,7 +38,7 @@ Early development. Built in milestone order:
 - **M5a** — Decay heat and scram (walk-away-safe demo)
 - **M5b** — Two-group diffusion and the emergent-sign moderator coefficient
 - **M5c** — Xenon transient and poisoning (Xe-135 worth, post-scram iodine pit)
-- **M5+** — Control rods, further safety/instability demos
+- **M5d** — Control rods in the side reflector (emergent worth and S-curve)
 
 ## Tech stack
 

@@ -150,7 +150,31 @@ For plausible defaults only. Do not treat as accurate.
   **not a day-one build.**
 - **M5+ — Stretch.** Two-group diffusion; xenon transient; control (rods /
   coolant flow / scram); decay-heat / loss-of-flow passive-safety demo; a
-  demonstrable under- vs over-moderation instability.
+  demonstrable under- vs over-moderation instability. *(All of these now exist:
+  coolant flow M4a, scram M5a, two-group + moderation instability M5b, xenon M5c,
+  control rods M5d — see the control-rod note below.)*
+
+> **M5d — control rods live in the SIDE REFLECTOR, and their worth is emergent.**
+> Two decisions worth not re-litigating. **(1) Placement.** Rods are in the reflector
+> columns against the vessel wall, never in the bed — you cannot drive a rod into a
+> packed pebble bed without crushing pebbles, which is why real HTR-PMs use borings in
+> the side reflector. This also means the rods touch the Lagrangian/pebble world not at
+> all: they are pure Eulerian grid state. It is not a compromise, either — the reflector
+> is where the THERMAL flux peaks in the two-group model (measured: 37.4 in the rod
+> column vs 33.5 in the best fuel column), so a thermal absorber parked there is a
+> strong rod. That is *why* reflector rods work in a PBR, and one-group M1 could not
+> have shown it. **(2) Emergent worth.** A rod adds real thermal absorption
+> (`ROD_SIGMA_A2` on `sigma_a2`) and everything else falls out of the eigenvalue solve —
+> nothing names a "rod worth". The S-shaped integral worth curve is a *consequence* of
+> the flux profile the rod tip travels through (differential worth peaks at tip row 10.4;
+> the thermal flux peaks at row 10), not a shape anyone coded. Worth is measured for the
+> HUD the same way xenon's is: re-solve with the rods stripped and difference.
+> **Calibration-neutral at zero insertion** — a withdrawn rod adds *exactly* nothing, so
+> every pre-M5d calibration is untouched bit-for-bit (gated by `test_control_rods.gd`).
+> **Scram is deliberately NOT unified with the rods**: `Thermal.SCRAM_WORTH` remains an
+> independent lumped kinetics term with its own calibration and gate. Unifying them
+> ("scram = slam the rods in") is a real, user-facing calibration change, not a side
+> effect — leave it opt-in. See `sim/control_rods.gd`.
 
 ## Validation targets — "is it actually working"
 
@@ -163,6 +187,10 @@ The sim should be able to demonstrate these behaviors:
 - Under- vs over-moderation flips the sign of the moderator coefficient — a
   player should be able to accidentally build an unstable core and see why.
 - Xenon poisoning transient (if implemented).
+- Control rods hold a core Doppler alone cannot: a fresh, over-reactive LEU core
+  saturates the Doppler feedback (over-temp / `feedback_insufficient`), and
+  inserting rods brings it back to a critical, self-regulating state at a sane
+  temperature — with rod worth following the classic S-curve in insertion depth.
 
 ## Thermal & cooling model — planned extension (M4)
 
