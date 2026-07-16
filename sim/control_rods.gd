@@ -64,6 +64,20 @@ const ROD_SIGMA_A2 := 0.12
 # fully inserted.
 const INSERT_MIN := 0.0
 const INSERT_MAX := 1.0
+# One step is ~0.005-0.008 Dk near the top of the stroke — deliberately the same
+# reactivity granularity as the enrichment lever's ENRICH_STEP (~0.006 Dk), so the two
+# controls feel alike, and 20 presses covers the full stroke.
+#
+# KNOWN TRADE-OFF, worth understanding before retuning: the nominal core only carries
+# ~2% excess reactivity, so anything past ~20% insertion shuts it down — the live usable
+# band is only ~4 steps. That is not a rod problem, it is the narrow Doppler band this
+# sim has always had (see the M2 notes: enrichment is steep and Doppler is weak); a core
+# with 2% excess is genuinely shut down by 2% of rod worth. Consequence for the player:
+# on a NOMINAL core they feel the S-curve's flat lead-in and then shutdown, and only meet
+# its steep middle on a hotter core — or by watching the worth readout, which keeps
+# climbing (0.025 -> 0.20 -> 0.32) long after the core is off. Halving this to 0.025 buys
+# a finer band at the cost of 40 presses for a full stroke; it is a taste call, not a
+# physics one.
 const INSERT_STEP := 0.05
 
 

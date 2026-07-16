@@ -189,8 +189,20 @@ The sim should be able to demonstrate these behaviors:
 - Xenon poisoning transient (if implemented).
 - Control rods hold a core Doppler alone cannot: a fresh, over-reactive LEU core
   saturates the Doppler feedback (over-temp / `feedback_insufficient`), and
-  inserting rods brings it back to a critical, self-regulating state at a sane
-  temperature — with rod worth following the classic S-curve in insertion depth.
+  inserting rods restores a critical equilibrium at a sane temperature — with rod
+  worth following the classic S-curve in insertion depth.
+  *Scope, deliberately: this rescue is verified QUASI-STATICALLY, through
+  `Feedback.solve_equilibrium` (the M2 critical-power search, which is NOT wired
+  into the live loop — the game runs dynamic point-kinetics). So what is proven is
+  that a critical equilibrium EXISTS at 40–45% insertion, not that the live loop
+  settles there. Dynamic settling is inferred, not measured: the rod-trimmed core
+  sits at k_cold ~1.007 / peak ~543 K — cooler and lower power than the nominal
+  operating point whose dynamic stability IS verified (~1100 K), and this project's
+  limit-cycle failures were all HIGH-power_frac ones, so a rod-trimmed core is
+  further inside the safe regime, not nearer the edge. Treat as plausible, not
+  confirmed. The live loop's rod wiring is separately proven end-to-end by
+  `tests/live_rods.gd` (k_cold drop = reported worth; full insertion shuts the
+  running scene down; withdrawal restarts it).*
 
 ## Thermal & cooling model — planned extension (M4)
 

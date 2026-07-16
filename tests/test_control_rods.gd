@@ -242,7 +242,23 @@ func _test_worth_saturates() -> void:
 ## Doppler — the critical-power search saturates DT_MAX and raises feedback_insufficient,
 ## i.e. "there is no fuel temperature at which this core is critical". main.gd surfaces
 ## exactly this as "OVER-TEMP — Doppler can't hold". Rods must turn it into a core that
-## regulates at a sane temperature.
+## has a critical equilibrium at a sane temperature.
+##
+## SCOPE THIS CLAIM HONESTLY (advisor). This runs through Feedback.solve_equilibrium —
+## the M2 QUASI-STATIC critical-power search, which main.gd does NOT use in its running
+## loop (it integrates dynamic point-kinetics instead; solve_equilibrium survives only as
+## the startup seed). So what is proven here is that a critical equilibrium EXISTS with
+## rods in — a real neutronics statement, and the one the over-temp condition is about —
+## but NOT that the live dynamic loop settles onto it. That distinction has bitten this
+## project before: a fine-looking equilibrium coexisting with a relaxation limit cycle is
+## exactly the A_REF story (see sim/thermal.gd's A_REF comment).
+##
+## Why it is nonetheless expected to hold dynamically: the rescued core sits at k_cold
+## ~1.007 and peak ~543 K — COOLER and LOWER power than the nominal operating point whose
+## dynamic stability is already verified live (~1100 K), and every limit cycle this
+## project has hit was a HIGH-power_frac failure. A rod-trimmed core moves AWAY from that
+## regime. Plausible, not confirmed; the rod WIRING into the live loop is separately and
+## directly proven by tests/live_rods.gd.
 ##
 ## Searches for a rescuing rod position rather than asserting a hardcoded one: the claim
 ## that matters is "a position EXISTS that holds this core", which stays true (and stays
