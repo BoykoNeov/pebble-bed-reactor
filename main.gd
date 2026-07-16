@@ -114,6 +114,12 @@ const OVER_TEMP_K := 1800.0
 # thing on screen and the thing in the readout are recognizably one control.
 const ROD_W := 13.0
 const ROD_COLOR := Color(1.0, 0.67, 0.27, 0.95)
+# Vessel shell livery. Cool structural greys: the shell must frame the core without
+# competing with the field heatmap it surrounds, so the steel is dark and only the two
+# faces carry contrast (bright liner inside, dim edge outside).
+const WALL_STEEL := Color(0.15, 0.17, 0.22, 1.0)
+const WALL_EDGE := Color(0.32, 0.37, 0.46, 0.9)
+const WALL_LINER := Color(0.82, 0.86, 0.93, 0.95)
 # A core AT online-refueling equilibrium is critical: k_cold → 1 by definition, so
 # it hovers at 1.0 ± a hair and the strict k_cold>1 test flickers. Treat anything
 # within this band of 1 as "critical / self-regulating"; only a core clearly below
@@ -1215,18 +1221,23 @@ func _set_loading(v: float) -> void:
 
 
 func _draw() -> void:
-	# Silo shell, drawn in the parent's pass so it sits above the background
-	# heatmap but below the pebbles. Two passes give the wall visual weight: a
-	# wide dark underlay (the vessel steel) with a bright inner line on top.
-	for seg in Silo.wall_segments():
-		draw_line(seg[0], seg[1], Color(0.05, 0.06, 0.09, 0.9), 9.0)
-		draw_line(seg[0], seg[1], Color(0.82, 0.86, 0.93, 0.95), 3.0)
-	# Discharge chute mark under the closed hopper bottom: where the metered
-	# extraction conceptually pulls pebbles out.
-	var mouth_l := Vector2(Silo.CENTER_X - Silo.OUTLET_HALF, Silo.OUTLET_Y + 8.0)
-	var mouth_r := Vector2(Silo.CENTER_X + Silo.OUTLET_HALF, Silo.OUTLET_Y + 8.0)
-	draw_line(mouth_l, mouth_l + Vector2(12, 22), Color(0.55, 0.6, 0.7, 0.8), 3.0)
-	draw_line(mouth_r, mouth_r + Vector2(-12, 22), Color(0.55, 0.6, 0.7, 0.8), 3.0)
+	# Silo shell as STRUCTURAL WALLS, not lines. Drawn in the parent's pass so it sits
+	# above the background heatmap but below the pebbles.
+	#
+	# The steel is a filled band per wall segment, offset OUTWARD from the collision face
+	# (Silo.shell_quads) — so the vessel gained thickness without the bed losing a single
+	# pixel of volume, and every pre-existing calibration is untouched by construction
+	# (see Silo.WALL_T). Opaque on purpose: a wall should occlude the field behind it.
+	# The bright INNER liner is drawn last and lies exactly on the collision face, so what
+	# the eye reads as "the wall" is precisely where a pebble actually stops.
+	for quad in Silo.shell_quads():
+		draw_colored_polygon(quad, WALL_STEEL)
+		draw_line(quad[3], quad[2], WALL_EDGE, 1.5)    # outer face of the steel
+		draw_line(quad[0], quad[1], WALL_LINER, 2.5)   # inner face = the collision face
+
+	# The discharge chute mark that used to be here is gone: the fuel machine now draws a
+	# real pipe out of the hopper bottom (FuelLoop), which pierces this floor and says the
+	# same thing literally instead of by suggestion.
 
 	# CONTROL RODS (M5d), drawn OUTSIDE the vessel walls — which is the point of them:
 	# they ride in borings in the side reflector because a rod cannot be pushed into a
