@@ -399,6 +399,11 @@ func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int,
 		var h := Thermal.h_of_flow(cur_flow)
 		if i % solve_every == 0:
 			grid.homogenize(pebbles, positions)          # rebuilds XS + grid.temperature
+			# Scram = rods fully in, applied to the grid before ANY solve (mirrors main's
+			# _solve_flux ordering, so the trip lands in k_cold and k alike). Unscrammed
+			# this passes 0.0, which apply_rods returns from having touched nothing — the
+			# property that keeps the two CALIBRATED callers below on a byte-identical path.
+			ControlRods.apply_rods(grid, 1.0 if scrammed else 0.0)
 			var base_sa := grid.sigma_a1.duplicate()
 			k_cold = Neutronics.solve(grid).k_eff         # temp-free reference
 			grid.sigma_a1 = base_sa
@@ -456,10 +461,10 @@ func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int,
 					Thermal.seed_decay_heat(p.decay_e, s0)
 					Depletion.seed_xenon(p, p.local_flux)
 				a = Thermal.A_REF
-		# Scram is KINETICS-only negative reactivity (mirrors main._toggle_scram): the
-		# thermal/decay/xenon loop keeps integrating, which is the whole point of the trip.
-		var k_kin := k - (Thermal.SCRAM_WORTH if scrammed else 0.0)
-		a = Thermal.step_power(a, k_kin, dt)
+		# No scram term here: the trip is already IN k, because scram inserted real rods
+		# into the grid above (mirrors main._toggle_scram). The thermal/decay/xenon loop
+		# keeps integrating regardless, which is the whole point of the trip.
+		a = Thermal.step_power(a, k, dt)
 		var power_frac := a / Thermal.A_REF
 		var campaign_dt := dt * Clocks.TIME_ACCEL
 		var peak := Feedback.T_REF
@@ -553,8 +558,8 @@ func _test_coupled_with_burnup_settles() -> void:
 ##     flow -> 0.5 (half)           32.3%       27.5%       36.1%
 ##     flow -> 0.3                  43.2%       28.0%       27.6%
 ##     flow -> FLOW_MIN             70.9%       29.9%       15.2%
-##     scram + recovery            171.4%       63.5%       13.3%
-##     scram + flow cut            193.4%       69.2%       13.0%
+##     scram + recovery            171.4%       63.5%       13.3%   <- stale, see below
+##     scram + flow cut            193.4%       69.2%       13.0%   <- stale, see below
 ##
 ## Every kick DECAYS, and each ends QUIETER than the unkicked baseline. The big early
 ## numbers are the recovery transient, not a cycle — measuring only t=240-400 (as a first
@@ -566,6 +571,15 @@ func _test_coupled_with_burnup_settles() -> void:
 ## 70.9%->15.2% there vs 64.2%->14.5% after. The pattern is what the table is for, and the
 ## fix does not touch it. Not re-swept: it is six 16000-step runs to restate a conclusion the
 ## gated case re-measures on every run anyway.)
+##
+## The two SCRAM rows are additionally stale since the scram unification: they were measured
+## against the old lumped SCRAM_WORTH = 0.15, and a trip is now a full rod insertion worth
+## ~0.38 — a DEEPER kick, so those two rows would read larger early swings and recover from
+## further down. Left in place rather than deleted or re-swept because what the table is for
+## is the PATTERN (every kick decays; each ends quieter than baseline), and a deeper kick can
+## only strengthen that reading — the gated case below is a flow cut and never touched them.
+## NOTE the `scram` kick key that produced these rows is exercised by NO gated test; it exists
+## for re-sweeping this table by hand. It is kept correct anyway (it drives the real rods now).
 ##
 ## WHY ONLY THE DECAY IS GATED, not the absolute swing: the baseline's OWN swing grows with
 ## window length (24.5 -> 37.9%) because the harness's position-based refueling is batchy —
@@ -745,7 +759,8 @@ func _test_decay_heat() -> void:
 
 
 ## The M5 headline (advisor): the walk-away-safe story. Settle the coupled core, then
-## SCRAM (effective k = k − SCRAM_WORTH) AND cut coolant flow at once — the worst case.
+## SCRAM (drive the control rods fully in — k itself collapses, ~1.01 → ~0.62; there is
+## no lumped scram worth any more) AND cut coolant flow at once — the worst case.
 ## Fission power must collapse, yet decay heat persists; the always-on ambient loss must
 ## keep the fuel temperature BOUNDED (never runs away) and the core cools below its
 ## operating point as the reservoirs drain. Uses the real coupled path incl. decay heat.
@@ -781,6 +796,10 @@ func _test_scram_passive_safety() -> void:
 		var h := Thermal.h_of_flow(flow)
 		if i % solve_every == 0:
 			grid.homogenize(pebbles, positions)          # rebuilds XS + grid.temperature
+			# The scram itself: real absorbers in the grid, ahead of the solve. Pre-trip
+			# this is 0.0 and touches nothing, so the settle that gives us a running start
+			# is unaffected by the rods' existence.
+			ControlRods.apply_rods(grid, 1.0 if scrammed else 0.0)
 			Thermal.solve_coolant_field(grid, flow, inlet)
 			Thermal.apply_field_doppler(grid)
 			var sol := Neutronics.solve(grid)
@@ -789,9 +808,9 @@ func _test_scram_passive_safety() -> void:
 			for id in positions:
 				pebbles[id].local_flux = grid.sample(flux, positions[id])
 				pebbles[id].local_coolant = grid.sample(grid.coolant_temp, positions[id])
-		# Scram is a KINETICS-only negative reactivity; the thermal/decay loop keeps running.
-		var k_kin := k - (Thermal.SCRAM_WORTH if scrammed else 0.0)
-		a = Thermal.step_power(a, k_kin, dt)
+		# The trip is already in k (the rods are in the solve); the thermal/decay loop keeps
+		# running regardless — heat continues after fission stops, which is the demo.
+		a = Thermal.step_power(a, k, dt)
 		var power_frac := a / Thermal.A_REF
 		var campaign_dt := dt * Clocks.TIME_ACCEL
 		for id in pebbles:

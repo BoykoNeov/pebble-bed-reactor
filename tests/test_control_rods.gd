@@ -305,9 +305,11 @@ func _test_rods_hold_a_core_doppler_cannot() -> void:
 ## otherwise happily critical. Without this, "control rod" would be an overstatement —
 ## a lever that can only trim is not a shutdown mechanism.
 ##
-## This is deliberately NOT compared against Thermal.SCRAM_WORTH: scram remains an
-## independent lumped kinetics term (M5a) with its own calibration and its own gate.
-## Unifying the two is a separate, opt-in change — not a side effect of this milestone.
+## SINCE THE SCRAM UNIFICATION this is also the SCRAM's calibration gate, because a full
+## insertion is exactly what scram now does (main._toggle_scram; Thermal.SCRAM_WORTH is
+## deleted). The margin checked below — k 1.0091 → 0.6247, worth 0.3845 — IS the trip's
+## worth, replacing the hand-tuned 0.15 constant with a number the eigenvalue solve
+## produces. It is 2.5× deeper than the constant was, so the trip got stronger, not weaker.
 func _test_full_insertion_shuts_down_a_critical_core() -> void:
 	var bare := Neutronics.solve(_core(NOMINAL_ENRICH)).k_eff
 	var g := _core(NOMINAL_ENRICH)

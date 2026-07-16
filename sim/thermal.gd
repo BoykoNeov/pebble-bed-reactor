@@ -97,17 +97,26 @@ const DECAY_FRACS := [0.030, 0.025, 0.010]     # f_i (Σ = DECAY_GAMMA)
 const DECAY_LAMBDAS := [0.40, 0.05, 0.008]     # λ_i (1/s): τ ≈ 2.5 / 20 / 125 s
 const DECAY_GAMMA := 0.065                      # Σ f_i; prompt fraction = 1 − this
 
-# --- Scram (M5) -------------------------------------------------------------
+# --- Scram: MOVED (M5a → M5d-unified) ---------------------------------------
 #
-# Emergency shutdown: a full control-rod insertion — a large negative reactivity
-# that drives the power kinetics far subcritical, so fission power collapses over a
-# ~1/(SCRAM_WORTH·KINETICS_GAIN) ≈ 1.7 s e-fold. Applied to the KINETICS ONLY (an
-# effective k = k_eff − SCRAM_WORTH): unlike the feedback-OFF demo, scram does NOT
-# freeze the thermal / decay-heat loop, because the whole point of the passive-safety
-# demo is that heat CONTINUES after fission stops. Worth is large enough to hold the
-# core subcritical even after Doppler fully releases as it cools (k_cold ~ 1.02 ⇒ need
-# ≫ 0.02), so the amplitude pins at its source floor. Foreshadows M5 control rods.
-const SCRAM_WORTH := 0.15
+# Scram used to live here as `SCRAM_WORTH := 0.15` — a lumped negative reactivity
+# subtracted from k in the kinetics only. It is GONE: scram is now simply a full
+# insertion of the real control rods (main._toggle_scram → _rod_insertion = 1.0,
+# sim/control_rods.gd), so its worth is EMERGENT from the eigenvalue solve like every
+# other reactivity effect in this sim, rather than a constant that had to be
+# hand-calibrated to be "big enough".
+#
+# WHY the unification is a strict improvement, not just a tidy-up: the lumped term was
+# invisible to the flux — it could not depress the flux shape, could not interact with
+# xenon, and its worth could not depend on core state. The rod bank does all three, and
+# it measures DEEPER than the constant it replaces (full insertion is worth 0.3845 Δk on
+# the nominal core, k 1.0091 → 0.6247 — see tests/test_control_rods.gd), so the trip is
+# stronger than it was: the e-fold tightens from ~1.7 s to ~0.7 s, and the core stays
+# subcritical after Doppler fully releases with far more margin than the old ≫0.02 need.
+#
+# UNCHANGED, and still the point: scram does NOT freeze the thermal / decay-heat loop
+# (unlike the feedback-OFF demo). Heat CONTINUES after fission stops — that is the
+# walk-away-safe demo, gated by tests/test_thermal.gd _test_scram_passive_safety.
 
 # --- Power kinetics (toy point-kinetics) ------------------------------------
 

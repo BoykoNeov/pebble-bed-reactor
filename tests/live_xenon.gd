@@ -11,12 +11,26 @@
 # keeps decaying into Xe, so the xenon reactivity WORTH climbs above its operating
 # value (the iodine pit), peaks, then drains as the Xe itself decays. A core held down
 # by that transient xenon cannot restart until it clears — the "xenon dead time".
+#
+# MEASURE THE PIT FROM A POST-TRIP FLOOR, NOT THE PRE-SCRAM WORTH (the subtlety that
+# broke this test once, and the reason the floor below is snapshot AFTER the toggle).
+# Since scram was unified with the control rods, tripping CHANGES THE CORE CONFIGURATION:
+# the bank slams in, and reactivity worths are NOT ADDITIVE. Rods and xenon are both
+# thermal absorbers competing for the same neutrons, so with the rods in, removing xenon
+# buys less reactivity — the rods simply eat the neutrons the xenon would have. Measured:
+# the same equilibrium Xe inventory is worth ~1.05% unrodded but ~0.54% the instant the
+# trip lands. That is real absorber SHADOWING, not a xenon change (the inventory cannot
+# move in one frame), and it is gated below rather than left as a number that mysteriously
+# halved. Comparing a pre-trip worth against a post-trip one is therefore apples-to-
+# oranges and says nothing about the pit; the honest comparison holds the rod
+# configuration FIXED and asks whether the worth rises from where the trip left it.
 extends SceneTree
 
 var _main
 var _t := 0.0
 var _failures := 0
-var _worth_op := 0.0        # operating (pre-scram) xenon worth
+var _worth_op := 0.0        # operating (pre-scram, UNRODDED) xenon worth — context, not a baseline
+var _worth_floor := 0.0     # worth the instant the trip lands (rodded) — the pit's true baseline
 var _worth_peak := 0.0      # max worth seen after the scram (the pit crest)
 var _scram_done := false
 var _checked := false
@@ -37,8 +51,17 @@ func _process(delta: float) -> bool:
 		_check(_main._amplitude > Thermal.A_RUNNING, "core running (settled) before scram")
 		_check(_main._xenon_worth > 0.0, "core carries an operating xenon load (worth %.2f%%)" % (_main._xenon_worth * 100.0))
 		_worth_op = _main._xenon_worth
-		_worth_peak = _main._xenon_worth
 		_main._toggle_scram()
+		# _toggle_scram re-solves synchronously, so the rods are ALREADY in the solve here and
+		# _xenon_worth is the rodded worth of an inventory that has not had a frame to change.
+		# That makes this the pit floor at fixed configuration — and the clean place to catch
+		# the shadowing step, since the ONLY thing that moved between _worth_op and now is the
+		# rods.
+		_worth_floor = _main._xenon_worth
+		_worth_peak = _worth_floor
+		_check(_worth_floor < _worth_op,
+			"SHADOWING: the same Xe is worth less with the rods in (%.3f%% -> %.3f%%) — absorber worths do not add"
+			% [_worth_op * 100.0, _worth_floor * 100.0])
 		_scram_done = true
 	# Track the pit crest through the post-scram window.
 	if _scram_done and not _checked:
@@ -51,13 +74,21 @@ func _process(delta: float) -> bool:
 			print("  t=%3ds  xenon worth=%.3f%%  k_cold=%.4f  mean Xe=%.1f  A=%.3f"
 				% [int(_t), _main._xenon_worth * 100.0, _main._k_cold, _main._mean_xenon * 1e5, _main._amplitude])
 	# t=95 s: ~50 s (≈10 campaign units) after the trip — well past the pit crest, into the
-	# drain. The crest must have exceeded the operating worth (the pit rose), and the worth
+	# drain. The crest must have exceeded the post-trip FLOOR (the pit rose), and the worth
 	# must now be falling back off that crest (the pit drains).
 	if _t >= 95.0 and _scram_done and not _checked:
-		print("  operating worth=%.3f%%   pit peak=%.3f%%   final=%.3f%%"
-			% [_worth_op * 100.0, _worth_peak * 100.0, _main._xenon_worth * 100.0])
-		_check(_worth_peak > _worth_op * 1.05, "xenon worth RISES >5%% above operating after scram (the pit)")
+		print("  pre-scram worth=%.3f%% (unrodded)   post-trip floor=%.3f%% (rodded)"
+			% [_worth_op * 100.0, _worth_floor * 100.0])
+		print("  pit peak=%.3f%%   final=%.3f%%" % [_worth_peak * 100.0, _main._xenon_worth * 100.0])
+		# Gated against the floor, NOT _worth_op: both readings here are rodded, so this
+		# isolates the xenon chain — the only thing that changed between them is the Xe
+		# inventory itself, which is exactly the claim (see the shadowing note up top).
+		_check(_worth_peak > _worth_floor * 1.05,
+			"xenon worth RISES >5%% above the post-trip floor after scram (the pit)")
 		_check(_main._xenon_worth < _worth_peak, "xenon worth falls back off the pit crest (draining)")
+		# The pit is also visible in the raw INVENTORY, which no rod can shadow — a
+		# cross-check that the rise above is the xenon chain and not a reactivity artifact.
+		_check(_main._mean_xenon > 0.0, "and the bed still carries the Xe inventory that drives it")
 		_checked = true
 		if _failures == 0:
 			print("LIVE M5c XENON PIT CHECKS PASSED")

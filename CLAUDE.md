@@ -171,10 +171,50 @@ For plausible defaults only. Do not treat as accurate.
 > HUD the same way xenon's is: re-solve with the rods stripped and difference.
 > **Calibration-neutral at zero insertion** — a withdrawn rod adds *exactly* nothing, so
 > every pre-M5d calibration is untouched bit-for-bit (gated by `test_control_rods.gd`).
-> **Scram is deliberately NOT unified with the rods**: `Thermal.SCRAM_WORTH` remains an
-> independent lumped kinetics term with its own calibration and gate. Unifying them
-> ("scram = slam the rods in") is a real, user-facing calibration change, not a side
-> effect — leave it opt-in. See `sim/control_rods.gd`.
+> See `sim/control_rods.gd`.
+
+> **SCRAM IS UNIFIED WITH THE RODS (supersedes the M5d note above).** M5d deliberately
+> left scram separate and flagged unification as an opt-in change; it has since been
+> **taken**, so `Thermal.SCRAM_WORTH` no longer exists. **Scram is now a full rod
+> insertion and nothing else** — `main._toggle_scram` sets `_rod_insertion = 1.0`, and the
+> trip's reactivity is whatever the eigenvalue solve says the absorbers cost. This closes
+> the last place in the sim where a reactivity effect was a hand-tuned constant instead of
+> a solve result: the old lumped term was invisible to the flux — it could not depress the
+> flux shape, could not interact with xenon, and its worth could not depend on core state.
+> **The trip got stronger, not weaker:** measured full-bank worth is **0.3845 Δk**
+> (k 1.0091 → 0.6247 on the nominal core), 2.5× the 0.15 constant it replaced, tightening
+> the power e-fold from ~1.7 s to ~0.7 s. Worth is on a saturated plateau (4× the absorber
+> buys only 0.4167), so the trip cannot be accidentally weakened by retuning `ROD_SIGMA_A2`
+> nor run away. **Still calibration-neutral**: the trip only acts through rods, rods at
+> zero add exactly nothing, so every pre-existing calibration is untouched — the whole
+> thermal suite passes unchanged, numerically identical outside the scram path.
+> Two invariants worth not re-litigating: **(1)** reset restores the *pre-scram* insertion,
+> never zero — withdrawing to zero would re-expose the exact excess the player's rods were
+> holding, making the un-scram itself the cause of an over-temp; **(2)** `_set_rods` is
+> inert while scrammed, so a manual jog cannot walk a tripped bank back out. Gated by
+> `test_thermal.gd` (`_test_scram_passive_safety`), `test_control_rods.gd`
+> (`_test_full_insertion_shuts_down_a_critical_core` — now also the trip's calibration),
+> and end-to-end by `tests/live_scram.gd` (the trip drives the bank, the gate holds, reset
+> restores the trim) plus `tests/live_rods.gd` (the deep-shutdown mechanism it rides on).
+
+> **ABSORBER WORTHS ARE NOT ADDITIVE — rods and xenon shadow each other.** Discovered (not
+> designed) when the scram unification first *broke* the M5c pit gate, and worth knowing
+> before touching either readout. Rods and Xe-135 are both thermal absorbers competing for
+> the same neutrons, so with the bank in, removing xenon buys *less* reactivity — the rods
+> just eat the neutrons the xenon would have. **Measured:** the same equilibrium Xe
+> inventory is worth **1.05% Δk unrodded but 0.54% the instant a trip lands** — halved by
+> the rods alone, with the inventory unchanged (it cannot move in one frame). This is real
+> physics and is exactly the rod↔xenon interaction a lumped scram constant could never have
+> shown. **Consequences, both handled:** (1) any test comparing a xenon worth measured
+> before a trip against one measured after is apples-to-oranges — `live_xenon.gd` gates the
+> pit against a *post-trip floor* at fixed rod configuration (floor 0.539% → peak 0.697% →
+> drain 0.473%) and gates the shadowing step itself; (2) the HUD's "pit building" threshold
+> is halved (0.006 → 0.003) to sit on the rodded scale — well-defined because the note is
+> gated on `_scrammed`, and a scrammed core is always at *exactly* full insertion.
+> **Consequence for the player, accepted:** tripping scram now makes the *displayed* xenon
+> worth step down before the pit rises. The Xe-135 heatmap still shows the clean build-and-
+> drain, and the worth still rises off its floor — but the pit demo's reactivity readout no
+> longer starts from the operating worth. Inherent to "scram = rods", not a bug.
 
 ## Validation targets — "is it actually working"
 

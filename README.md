@@ -38,7 +38,9 @@ Early development. Built in milestone order:
 - **M5a** — Decay heat and scram (walk-away-safe demo)
 - **M5b** — Two-group diffusion and the emergent-sign moderator coefficient
 - **M5c** — Xenon transient and poisoning (Xe-135 worth, post-scram iodine pit)
-- **M5d** — Control rods in the side reflector (emergent worth and S-curve)
+- **M5d** — Control rods in the side reflector (emergent worth and S-curve).
+  Scram is unified with them: tripping drives the bank fully in, so the trip's
+  worth comes from the diffusion solve rather than a hand-tuned constant.
 
 ## Tech stack
 

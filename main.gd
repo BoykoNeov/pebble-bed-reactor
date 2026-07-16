@@ -190,10 +190,16 @@ var _running := false                 # core producing power (gates depletion)
 # Decay heat & scram (M5). Decay heat is the fraction of the fuel heat that comes
 # from decaying fission products — it PERSISTS after fission stops, so it must still
 # be cooled (CLAUDE.md decay-heat / passive-safety). SCRAM is an emergency shutdown
-# (large negative reactivity into the kinetics) that collapses fission power WITHOUT
-# freezing the thermal/decay loop — the walk-away-safe demo watches the decay-heat
-# tail bound the temperature after the reactor trips.
-var _scrammed := false                # emergency shutdown engaged (kinetics only)
+# that collapses fission power WITHOUT freezing the thermal/decay loop — the
+# walk-away-safe demo watches the decay-heat tail bound the temperature after the trip.
+#
+# Scram is now a FULL ROD INSERTION and nothing more (_toggle_scram): the trip acts
+# through the control rods in the flux solve, not through a lumped kinetics constant.
+# So _scrammed is a MODE flag, not a reactivity — it records that the bank was driven
+# in by the trip rather than by the player, which is what lets reset put the rods back
+# where the player had them.
+var _scrammed := false                # emergency shutdown engaged (drives rods full in)
+var _pre_scram_insertion := 0.0       # rod position to restore on reset (see _toggle_scram)
 var _decay_power := 0.0               # bed-total delivered decay heat (readout, a.u.)
 var _decay_frac := 0.0                # decay heat as a fraction of total delivered heat
 
@@ -857,12 +863,14 @@ func _thermal_step(delta: float) -> void:
 	# the contrast (M2's "no self-limiting"). Toggling back ON resumes from the held state.
 	if delta <= 0.0 or not _feedback_on:
 		return
-	# Power amplitude: exact exponential update at the frozen-between-solves k. SCRAM
-	# (M5) subtracts a large negative reactivity here ONLY — the effective kinetics k
-	# goes far subcritical so fission power collapses, while the thermal/decay loop
-	# below keeps integrating (that is the whole point: heat continues after trip).
-	var k_kin := _k_eff - (Thermal.SCRAM_WORTH if _scrammed else 0.0)
-	_amplitude = Thermal.step_power(_amplitude, k_kin, delta)
+	# Power amplitude: exact exponential update at the frozen-between-solves k.
+	#
+	# NO scram term here any more, and its absence is load-bearing: scram is now a full
+	# rod insertion (_toggle_scram), and the rods are REAL absorbers folded into the grid
+	# before the solve (_solve_flux), so _k_eff ALREADY carries the trip — it reads ~0.62
+	# on a scrammed core. Subtracting a scram worth on top would double-count it.
+	# The thermal/decay loop below keeps integrating either way: heat continues after trip.
+	_amplitude = Thermal.step_power(_amplitude, _k_eff, delta)
 	var h := Thermal.h_of_flow(_coolant_flow)
 	var peak := Feedback.T_REF
 	var sum_t := 0.0
@@ -1012,14 +1020,34 @@ func _toggle_feedback() -> void:
 	_solve_flux()   # re-solve immediately so the contrast is instant
 
 
-## Trip / reset the scram (M5). Scram inserts a large negative reactivity into the
-## power kinetics (Thermal.SCRAM_WORTH) so fission power collapses over ~2 s, but —
-## unlike the feedback-OFF freeze — the thermal and decay-heat loop keeps running, so
-## the player watches the decay-heat tail keep the core hot and bounded after the trip
-## (the walk-away-safe demo — pair it with a flow cut). Toggling off lets the core
-## restart from its held state if it is still cold-supercritical.
+## Trip / reset the scram. Scram SLAMS THE CONTROL RODS FULLY IN — that is the whole
+## mechanism, and there is no longer any lumped "scram worth" anywhere (M5a's
+## Thermal.SCRAM_WORTH is deleted). The rods are real absorbers in the solve, so the
+## trip's reactivity is EMERGENT: fully in, the bank is worth ~0.38 Δk and drives
+## k ~1.01 → ~0.62, collapsing fission power over a ~0.7 s e-fold. That is both deeper
+## and faster than the 0.15 constant it replaces, and — unlike the constant — it depresses
+## the flux shape, interacts with xenon, and answers to core state.
+##
+## Unchanged, and still the point: unlike the feedback-OFF freeze, the thermal and
+## decay-heat loop keeps running, so the player watches the decay-heat tail keep the core
+## hot and bounded after the trip (the walk-away-safe demo — pair it with a flow cut).
+##
+## RESTORES THE PRE-SCRAM INSERTION on reset rather than withdrawing to zero. Withdrawing
+## to zero would re-expose exactly the excess reactivity the player's rods were holding
+## down — a core trimmed to critical at 40% would come back supercritical and over-temp,
+## with the un-scram itself as the cause. Reset means "undo the trip", not "pull every rod".
+##
+## Re-solves immediately (like _toggle_feedback, and unlike a manual rod jog): a trip must
+## register NOW, not whenever the solve cadence next comes around.
 func _toggle_scram() -> void:
 	_scrammed = not _scrammed
+	if _scrammed:
+		_pre_scram_insertion = _rod_insertion
+		_rod_insertion = ControlRods.INSERT_MAX
+	else:
+		_rod_insertion = _pre_scram_insertion
+	queue_redraw()   # the rods are drawn from _rod_insertion; the shell only repaints on request
+	_solve_flux()
 
 
 func _cycle_field() -> void:
@@ -1132,8 +1160,17 @@ func _set_flow(f: float) -> void:
 ## grid before anything is solved. Re-solving here immediately would fight the solve
 ## cadence for no gain: unlike the F-toggle (which shows an instant contrast), rod motion
 ## is a physical change the core answers over its own thermal timescale, so letting the
-## next scheduled solve pick it up is both cheaper and honest.
+## next scheduled solve pick it up is both cheaper and honest. (A SCRAM is the exception
+## and does re-solve — see _toggle_scram: a trip must register immediately.)
+##
+## INERT WHILE SCRAMMED. Now that the trip acts through these same rods, a manual jog
+## would otherwise walk a scrammed bank back out and quietly defeat the scram — the
+## player could "un-trip" the reactor with the rod keys while the HUD still said SCRAMMED.
+## Space (reset) is the only way out of a trip, which also keeps the restore-to-pre-scram
+## contract intact: nothing can edit _rod_insertion out from under it mid-trip.
 func _set_rods(x: float) -> void:
+	if _scrammed:
+		return
 	_rod_insertion = clampf(x, ControlRods.INSERT_MIN, ControlRods.INSERT_MAX)
 	queue_redraw()   # the shell is static and only repaints on request; the rods move
 
@@ -1268,11 +1305,6 @@ func _update_hud() -> void:
 		status = "SELF-REGULATING (critical)"
 		status_col = "6ecf7a"
 
-	# When scrammed, the multiplication the kinetics actually sees is k_eff − SCRAM_WORTH
-	# (far subcritical). Show THAT, not the Doppler-regulated ~1.0, so "SCRAMMED" doesn't
-	# sit next to a critical-looking k and read like a bug (advisor).
-	var k_show := _k_eff - (Thermal.SCRAM_WORTH if _scrammed else 0.0)
-
 	# Outflow composition of discharged (spent) fuel — the "inspect the spent fuel
 	# flowing out the bottom" deliverable: running averages + the last discharge.
 	var outflow := ""
@@ -1295,7 +1327,17 @@ func _update_hud() -> void:
 	# Xenon readout: worth = how much reactivity Xe-135 is eating now (Δk). After a scram
 	# or flow cut, fission stops but trapped I-135 keeps decaying into Xe, so this climbs
 	# — the iodine pit. Flag that state so the player can watch the pit build and drain.
-	var xe_note := "  [color=#c792ea]pit building[/color]" if (_scrammed and _xenon_worth > 0.006) else ""
+	#
+	# The threshold HALVED (0.006 -> 0.003) when scram was unified with the rods, and the
+	# reason is absorber SHADOWING, not a xenon change: a scrammed core has the rod bank
+	# fully in, and rods and xenon compete for the same thermal neutrons, so the SAME Xe
+	# inventory that is worth ~1.05% unrodded measures only ~0.54% once the trip lands
+	# (gated in tests/live_xenon.gd). Against the old 0.006 the post-trip pit range of
+	# ~0.5-0.7% straddled the bar and the note would flicker mid-transient.
+	# This is well-defined rather than a fudge BECAUSE the note is gated on _scrammed: a
+	# scrammed core is always at EXACTLY full insertion, so there is only ever one rod
+	# configuration in which this threshold is read, and one scale to tune it against.
+	var xe_note := "  [color=#c792ea]pit building[/color]" if (_scrammed and _xenon_worth > 0.003) else ""
 
 	# Control-rod readout (M5d): the bar shows WHERE in the stroke the rods are, the worth
 	# beside it shows what that position is actually buying. Showing the pair together is
@@ -1304,12 +1346,23 @@ func _update_hud() -> void:
 	var rod_pips := int(round(_rod_insertion * 10.0))
 	var rod_bar := "[color=#ffaa44]%s[/color][color=#%s]%s[/color] %.0f%% in" \
 		% ["█".repeat(rod_pips), HUD_DIM, "·".repeat(10 - rod_pips), _rod_insertion * 100.0]
-	var rod_note := "  [color=#%s]withdrawn[/color]" % HUD_DIM if _rod_insertion <= 0.0 else ""
+	# Name the SCRAM as the reason the bank is buried, and say the keys are dead — otherwise
+	# a tripped core just shows rods pinned at 100% and the player is left pressing N at a
+	# bank that (correctly) refuses to move, with nothing on screen explaining why.
+	var rod_note := ""
+	if _scrammed:
+		rod_note = "  [color=#ffaa44]SCRAM — driven in (Space to reset)[/color]"
+	elif _rod_insertion <= 0.0:
+		rod_note = "  [color=#%s]withdrawn[/color]" % HUD_DIM
 
 	_readout.text = "[b]PEBBLE BED REACTOR[/b]  [color=#%s]toy sim — M5d[/color]\n" % HUD_DIM \
 		+ "[color=#%s]● %s[/color]\n" % [status_col, status] \
 		+ _section("CORE") \
-		+ _row("k-eff", "[b]%.4f[/b]    cold / uncontrolled %.4f" % [k_show, _k_cold]) \
+		# k-eff needs no scram special case any more: a scrammed core has the rods IN the
+		# solve, so this reads an honestly subcritical ~0.62 on its own. The old lumped term
+		# needed a display hack here to avoid printing a critical-looking ~1.0 next to
+		# "SCRAMMED" — don't reintroduce one; the physics covers it.
+		+ _row("k-eff", "[b]%.4f[/b]    cold / uncontrolled %.4f" % [_k_eff, _k_cold]) \
 		+ _row("xenon", "worth %.2f%% Δk   mean Xe %.1f ×1e-5%s" % [_xenon_worth * 100.0, _mean_xenon * 1e5, xe_note]) \
 		+ _row("rods", "%s   worth %.2f%% Δk%s" % [rod_bar, _rod_worth * 100.0, rod_note]) \
 		+ _section("POWER & HEAT") \

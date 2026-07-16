@@ -53,10 +53,16 @@ extends RefCounted
 # transparent), and a fuel cell's total thermal absorption is ~0.012 — so this is a
 # LARGE local perturbation, as a real rod is. Calibrated (tests/test_control_rods.gd)
 # so that a full insertion is worth enough to hold a core Doppler alone cannot, which
-# is the milestone's whole reason to exist. It is NOT tuned to match
-# Thermal.SCRAM_WORTH: scram remains an independent lumped kinetics term (M5a), and
-# unifying the two is a deliberate, separately-calibrated change — not a side effect
-# of this module.
+# is the milestone's whole reason to exist.
+#
+# SINCE THE SCRAM UNIFICATION this constant is also the scram's worth: scram is a full
+# insertion of these rods and nothing else (Thermal.SCRAM_WORTH is gone), so retuning
+# ROD_SIGMA_A2 retunes the trip. That is safer than it sounds, and the reason is the
+# SATURATION the test measures: worth is on a plateau (0.03 → 0.2938, 0.12 → 0.3845,
+# 4× → 0.4167), because a rod this black already eats every thermal neutron reaching
+# it and more absorber cannot eat them twice. So the trip cannot be accidentally
+# weakened by a small change here, and cannot be run away by a large one — the bank is
+# worth ~0.38 Δk against a core carrying ~0.01, i.e. ~38× the excess it must hold.
 const ROD_SIGMA_A2 := 0.12
 
 # Player lever range. Insertion is a FRACTION of the grid's full height: 0 = fully
