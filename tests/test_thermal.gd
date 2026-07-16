@@ -30,6 +30,7 @@ func _initialize() -> void:
 	_test_pebble_time_constant()
 	_test_coupled_self_regulates_with_overshoot()
 	_test_coupled_with_burnup_settles()
+	_test_physical_kick_recovers()
 	_test_inlet_load_following()
 	_test_loss_of_flow_bounded()
 	_test_decay_heat()
@@ -364,8 +365,12 @@ func _build_core_pebbles(enrichment: float) -> Array:
 ## asks "does raising the inlet move the settled point DOWN", and that comparison is
 ## calibrated on the cold-start path (seeded, its two inlets need ~3x the window to
 ## separate from the breathing noise — measured, not assumed).
+## `kick` is an OPT-IN physical disturbance window, used only by the kick-stability probe:
+## {"at": step, "until": step, "flow": f, "inlet": T, "scram": bool}. Empty by default, and
+## every kicked quantity falls back to the caller's own value, so the two calibrated callers
+## above run a byte-identical path — the kick must never become a silent tax on them.
 func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int,
-		seed_at_equilibrium := false) -> Dictionary:
+		seed_at_equilibrium := false, kick := {}) -> Dictionary:
 	var built := _build_core_pebbles(enrichment)
 	var grid: Grid = built[0]
 	var pebbles: Dictionary = built[1]
@@ -374,14 +379,24 @@ func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int,
 	var solve_every := 4
 	var refuel_every := 6         # ~0.3 s at dt=0.05, mirroring EXTRACT_INTERVAL
 	var a := Thermal.A_NOMINAL
-	var h := Thermal.h_of_flow(flow)
 	var k := 1.0
 	var k_cold := 1.0
 	var flux := PackedFloat32Array()
 	var peakt_hist := PackedFloat32Array()
 	var kcold_hist := PackedFloat32Array()
 	var a_hist := PackedFloat32Array()
+	var cur_flow := flow
+	var cur_inlet := inlet
+	var scrammed := false
 	for i in range(steps):
+		# The kick window. Outside it (and always, when `kick` is empty) these hold the
+		# caller's nominal flow/inlet and no scram, so h and the coolant solve are unchanged.
+		if not kick.is_empty():
+			var on: bool = i >= int(kick["at"]) and i < int(kick["until"])
+			cur_flow = float(kick.get("flow", flow)) if on else flow
+			cur_inlet = float(kick.get("inlet", inlet)) if on else inlet
+			scrammed = bool(kick.get("scram", false)) and on
+		var h := Thermal.h_of_flow(cur_flow)
 		if i % solve_every == 0:
 			grid.homogenize(pebbles, positions)          # rebuilds XS + grid.temperature
 			var base_sa := grid.sigma_a1.duplicate()
@@ -393,7 +408,7 @@ func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int,
 			flux = sol.flux
 			# M4b: coolant field at THIS inlet/flow from the freshly homogenized cell
 			# temps, then sample it onto each pebble as its local cooling sink.
-			Thermal.solve_coolant_field(grid, flow, inlet)
+			Thermal.solve_coolant_field(grid, cur_flow, cur_inlet)
 			for id in positions:
 				pebbles[id].local_flux = grid.sample(flux, positions[id])
 				pebbles[id].local_coolant = grid.sample(grid.coolant_temp, positions[id])
@@ -437,11 +452,14 @@ func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int,
 				for id in positions:
 					var p: Pebble = pebbles[id]
 					var s0 := Thermal.pebble_power(Thermal.A_REF, p.local_flux)
-					p.temperature = Thermal.steady_temp(s0, inlet, h)
+					p.temperature = Thermal.steady_temp(s0, cur_inlet, h)
 					Thermal.seed_decay_heat(p.decay_e, s0)
 					Depletion.seed_xenon(p, p.local_flux)
 				a = Thermal.A_REF
-		a = Thermal.step_power(a, k, dt)
+		# Scram is KINETICS-only negative reactivity (mirrors main._toggle_scram): the
+		# thermal/decay/xenon loop keeps integrating, which is the whole point of the trip.
+		var k_kin := k - (Thermal.SCRAM_WORTH if scrammed else 0.0)
+		a = Thermal.step_power(a, k_kin, dt)
 		var power_frac := a / Thermal.A_REF
 		var campaign_dt := dt * Clocks.TIME_ACCEL
 		var peak := Feedback.T_REF
@@ -481,7 +499,11 @@ func _run_burnup_loop(enrichment: float, inlet: float, flow: float, steps: int,
 	for j in range(0, peakt_hist.size(), stride):
 		traj += "    t=%3.0fs  k_cold=%.4f  peakT=%4.0f  A=%6.1f\n" \
 			% [j * 20 * dt, kcold_hist[j], peakt_hist[j], a_hist[j]]
-	return {"mean_peakT": mt, "sd_peakT": sd, "mean_kcold": mk, "mean_a": ma, "sd_a": sd_a, "traj": traj}
+	# The raw histories are returned alongside the tail means so a caller can measure a
+	# window of its OWN choosing (the kick probe needs the recovery window AFTER the
+	# disturbance, not the whole-run tail). Sample stride is `20` steps = 1 s at dt=0.05.
+	return {"mean_peakT": mt, "sd_peakT": sd, "mean_kcold": mk, "mean_a": ma, "sd_a": sd_a,
+		"traj": traj, "a_hist": a_hist, "peakt_hist": peakt_hist, "kcold_hist": kcold_hist}
 
 
 func _test_coupled_with_burnup_settles() -> void:
@@ -507,6 +529,73 @@ func _test_coupled_with_burnup_settles() -> void:
 	# steady temperature + k_cold>1 already prove the operating point; the magnitude is free.
 	_check(sda < 0.30 * maxf(ma, 1.0),
 		"power amplitude is settled (tail swing < 30%% of mean) — no relaxation oscillation")
+
+
+## Does a PHYSICAL disturbance knock the core into the relaxation limit cycle?
+##
+## THE GAP THIS CLOSES. `_test_coupled_with_burnup_settles` proves the operating point is
+## locally stable, but only because it now STARTS there (seed_at_equilibrium). Its own notes
+## record why: the post-xenon core is bistable, and the old dead-cold start fell into a
+## coexisting limit cycle. Seeding AVOIDS that trajectory rather than guarding it — which is
+## correct, because the cold start drives peak fuel to ~3700 K, far past TRISO failure
+## (~1900-2050 K), so it is a path the live scene never takes. But it left one question open:
+## the cycle had ONLY ever been reached by that nonphysical route. Nobody had checked whether
+## a REALISTIC disturbance — one the player can actually cause — reaches it too. If it did,
+## the seeded settle test would be proving stability the player does not really have.
+##
+## MEASURED ANSWER: it does not. From the seeded operating point, every physical kick decays
+## back. Loss of flow is the strongest of them (the flow lever is the primary operating
+## control and the walk-away-safe demo tells the player to pull it), so it is the case gated
+## here. Swing in power amplitude, per window, kick at t=100-160 s:
+##
+##     kick                      t=240-440   t=440-640   t=640-800
+##     none (baseline)              24.5%       27.5%       37.9%
+##     flow -> 0.5 (half)           32.3%       27.5%       36.1%
+##     flow -> 0.3                  43.2%       28.0%       27.6%
+##     flow -> FLOW_MIN             70.9%       29.9%       15.2%
+##     scram + recovery            171.4%       63.5%       13.3%
+##     scram + flow cut            193.4%       69.2%       13.0%
+##
+## Every kick DECAYS, and each ends QUIETER than the unkicked baseline. The big early
+## numbers are the recovery transient, not a cycle — measuring only t=240-400 (as a first
+## pass did) reads 75% and looks like a limit cycle purely because the window ends before the
+## transient does.
+##
+## WHY ONLY THE DECAY IS GATED, not the absolute swing: the baseline's OWN swing grows with
+## window length (24.5 -> 37.9%) because the harness's position-based refueling is batchy —
+## the "residual breathing" the M4a notes document and accept. So an absolute late-window
+## ceiling would be gating that breathing (settled calibration, not this test's business),
+## and at t=640-800 the unkicked baseline would fail a 30% bar the kicked core passes at
+## 15.2%. The claim here is self-referential and needs no baseline run: the disturbance must
+## SHRINK. A relaxation cycle, by definition, would not.
+func _test_physical_kick_recovers() -> void:
+	print("\n[physical kick: loss of flow decays back, does NOT reach the limit cycle]")
+	var kick := {"at": 2000, "until": 3200, "flow": Thermal.FLOW_MIN}   # cut t=100-160 s
+	var st := _run_burnup_loop(0.113, Thermal.T_INLET, Thermal.FLOW_NOMINAL, 16000, true, kick)
+	var a_hist: PackedFloat32Array = st["a_hist"]
+	var k_hist: PackedFloat32Array = st["kcold_hist"]
+	# Sample stride is 20 steps = 1.0 s, so a history index is a time in seconds. The early
+	# window starts 80 s after the kick ends, so the kick itself is never in the measurement.
+	var early := _swing_window(a_hist, 240, 440)
+	var late := _swing_window(a_hist, 640, 800)
+	var late_k := _swing_window(k_hist, 640, 800)
+	var e_mean: float = early["mean"]; var e_sd: float = early["sd"]
+	var l_mean: float = late["mean"]; var l_sd: float = late["sd"]
+	var e_swing := 100.0 * e_sd / maxf(e_mean, 1.0)
+	var l_swing := 100.0 * l_sd / maxf(l_mean, 1.0)
+	print("  flow cut to FLOW_MIN for 60 s, then restored to nominal")
+	print("    t=240-440 s (just after): mean A=%.1f  swing=%.1f%%" % [e_mean, e_swing])
+	print("    t=640-800 s (settled):    mean A=%.1f  swing=%.1f%%  mean k_cold=%.4f"
+		% [l_mean, l_swing, late_k["mean"]])
+	_check(l_mean > Thermal.A_RUNNING,
+		"core is still RUNNING long after the kick (mean A=%.1f)" % l_mean)
+	_check(late_k["mean"] > 1.0,
+		"k_cold still holds supercritical after the kick (%.4f) — recovered, not shut down"
+			% late_k["mean"])
+	# THE discriminator: a decaying recovery shrinks; a relaxation limit cycle sustains.
+	_check(l_swing < 0.5 * e_swing,
+		"the disturbance DECAYS (%.1f%% -> %.1f%%) — no limit cycle reached from a physical kick"
+			% [e_swing, l_swing])
 
 
 ## M4b load-following (advisor): raising the coolant INLET temperature must settle the
@@ -720,6 +809,26 @@ func _test_scram_passive_safety() -> void:
 		"decay heat PERSISTS after fission stops (core still producing heat)")
 	_check(decay_final < decay_at_scram, "decay heat declines over time as the reservoirs drain")
 	_check(peak_final < peak_before, "core cools below its operating point after scram")
+
+
+## Mean + standard deviation of a history slice [from_i, to_i). The tail means inside
+## _run_burnup_loop answer "where did the whole run settle"; this answers the same question
+## about an ARBITRARY window, which is what the kick test needs: it has to compare two
+## windows of one run, and it must exclude the kick and its recovery transient — measure
+## across those and a damped recovery reads as a huge swing purely from the kick itself.
+func _swing_window(hist: PackedFloat32Array, from_i: int, to_i: int) -> Dictionary:
+	var hi := mini(to_i, hist.size())
+	var n := 0
+	var mean := 0.0
+	for j in range(from_i, hi):
+		mean += hist[j]; n += 1
+	if n == 0:
+		return {"mean": 0.0, "sd": 0.0}
+	mean /= n
+	var v := 0.0
+	for j in range(from_i, hi):
+		v += (hist[j] - mean) * (hist[j] - mean)
+	return {"mean": mean, "sd": sqrt(v / n)}
 
 
 ## Peak pebble temperature across the bed (test helper).
