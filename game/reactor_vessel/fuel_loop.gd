@@ -145,11 +145,19 @@ static func pool_capacity() -> int:
 ## Push a pebble onto the machine. `from` is where it physically left the bed (or
 ## the hopper mouth for FRESH); `spawn_x` is the x it will re-enter the bed at, so
 ## the ride ENDS exactly where the body will appear — no jump at the hand-off.
-func add(id: int, kind: int, from: Vector2, spawn_x: float, tint: Color) -> void:
+##
+## `radius` is the RIDER'S OWN size, not the nominal: once size is a design lever the
+## machine carries a mix, and drawing every rider at PEBBLE_R would show a uniform
+## stream while the bed fills with pebbles of another size — the transport pipe would
+## be the one place the player's edit is invisible. It also sets the pick radius, so
+## clicking a big pebble on the conveyor hits where it actually LOOKS.
+## Defaults to PEBBLE_R so a caller that has no opinion gets today's behaviour exactly.
+func add(id: int, kind: int, from: Vector2, spawn_x: float, tint: Color,
+		radius: float = PEBBLE_R) -> void:
 	var pts := _path_for(kind, from, spawn_x)
 	_riders.append({
 		"id": id, "kind": kind, "pts": pts, "d": 0.0,
-		"len": _length_of(pts), "x": spawn_x, "tint": tint,
+		"len": _length_of(pts), "x": spawn_x, "tint": tint, "r": radius,
 	})
 
 
@@ -191,7 +199,7 @@ func count() -> int:
 ## and the player would click a pebble and select its neighbour.
 func rider_at(at: Vector2) -> int:
 	for r in _riders:
-		if _point_at(r["pts"], r["d"]).distance_to(at) <= PEBBLE_R:
+		if _point_at(r["pts"], r["d"]).distance_to(at) <= float(r["r"]):
 			return r["id"]
 	return -1
 
@@ -313,8 +321,9 @@ func _draw() -> void:
 	# Riders on top of their pipework.
 	for r in _riders:
 		var p: Vector2 = _point_at(r["pts"], r["d"])
-		draw_circle(p, PEBBLE_R, r["tint"])
-		draw_arc(p, PEBBLE_R, 0.0, TAU, 12, Color(0, 0, 0, 0.35), 1.0)
+		var rr: float = r["r"]
+		draw_circle(p, rr, r["tint"])
+		draw_arc(p, rr, 0.0, TAU, 12, Color(0, 0, 0, 0.35), 1.0)
 
 
 ## The static plant: pipework, the sorter, the bin, the hopper. Drawn every frame with

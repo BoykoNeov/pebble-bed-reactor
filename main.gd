@@ -47,6 +47,30 @@ const LOOP_BUFFER := 48
 const SPAWN_PER_TICK := 3
 const SPAWN_INTERVAL := 0.12    # seconds between injection ticks
 const PEBBLE_RADIUS := 8.0
+# Design SIZE lever (the third of CLAUDE.md's three knobs, after enrichment and
+# loading). Stamped at manufacture like the other two, so it reaches the bed only as
+# fresh fuel cycles in — you watch the new size arrive one pebble at a time.
+#
+# WHAT SIZE ACTUALLY DOES HERE, stated plainly because it is easy to assume otherwise:
+# radius reaches the physics through exactly one path — grid.gd sums PI*r^2 into each
+# cell's packing. Packing fraction is SCALE-INVARIANT (bigger circles settle at the
+# same ~0.61 areal packing), so a UNIFORM size change does not move any cross-section.
+# What it does move is GEOMETRY: the bed holds a pinned COUNT, so bigger pebbles need
+# more volume, the bed grows taller into more fuel cells, and leakage falls — k rises.
+# That is a real lever, but it is a leakage lever, not the surface-to-volume /
+# self-shielding one CLAUDE.md describes; no self-shielding term exists yet (see the
+# corrected note in sim/pebble.gd). MIXING sizes is different and IS already modelled:
+# small pebbles fill the gaps between big ones, packing genuinely rises, and the
+# area-summing homogenization picks that up with no new physics.
+#
+# The ceiling is DERIVED from the transport bore, not picked: the fuel machine is a
+# pipe of fixed width, and a pebble wider than its bore would be drawn outside the
+# casing it is supposed to be travelling inside. Tying the two together means the pipe
+# can never be retuned into a lie — widen BORE_W and the lever follows.
+const RADIUS_DEFAULT := PEBBLE_RADIUS
+const RADIUS_MIN := 5.0
+const RADIUS_MAX := FuelLoop.BORE_W * 0.5   # the pebble must fit the pipe it rides in
+const RADIUS_STEP := 0.25
 const EXTRACT_INTERVAL := 0.30  # metered discharge cadence (lowest pebble out)
 # Neutronics re-solve cadence (quasi-static flux). Tightened from M2's 0.5 s for
 # M4: the flux (hence k) is stale between solves, but the power amplitude and
@@ -214,6 +238,7 @@ var _last_temp: PackedFloat32Array = PackedFloat32Array()
 var _feedback_on := true
 var _enrichment := ENRICH_DEFAULT
 var _fuel_loading := LOADING_DEFAULT   # design moderation lever (M5b); stamped on fresh fuel
+var _pebble_radius := RADIUS_DEFAULT   # design size lever; stamped on fresh fuel
 var _k_cold := 0.0            # k with feedback OFF — the reactivity being suppressed
 var _peak_temp := Feedback.T_REF
 
@@ -598,7 +623,7 @@ func _inject_batch() -> void:
 func _mint_pebble() -> void:
 	var id := _next_id
 	_next_id += 1
-	var peb := Pebble.new(id, PEBBLE_RADIUS)
+	var peb := Pebble.new(id, _pebble_radius)
 	_stamp_enrichment(peb, _enrichment)
 	peb.fuel_loading = _fuel_loading   # M5b design moderation, stamped at manufacture
 	_pebbles[id] = peb
@@ -611,21 +636,34 @@ func _mint_pebble() -> void:
 	# from the hopper one at a time would take minutes of real time.
 	if _total_injected <= TARGET_POPULATION + LOOP_BUFFER:
 		_seed_burned(peb)
-		_queue.push_back({"id": id, "x": Silo.spawn_x(_rng, PEBBLE_RADIUS + 2.0)})
+		# Wall margin comes from THIS pebble's radius, not the nominal: a bigger pebble
+		# spawned at the nominal margin would be born overlapping the vessel wall and get
+		# kicked out by the solver.
+		_queue.push_back({"id": id, "x": Silo.spawn_x(_rng, peb.radius + 2.0)})
 		return
 	# Steady state: this is a genuinely fresh replacement for a pebble that just
 	# discharged (1:1), so it rides in from the fresh-fuel hopper.
-	_loop.add(id, FuelLoop.FRESH, FuelLoop.HOPPER, Silo.spawn_x(_rng, PEBBLE_RADIUS + 2.0),
-			PebbleBody.DEFAULT_TINT)
+	_loop.add(id, FuelLoop.FRESH, FuelLoop.HOPPER, Silo.spawn_x(_rng, peb.radius + 2.0),
+			PebbleBody.DEFAULT_TINT, peb.radius)
 
 
 ## Move a staged pebble from the top of the machine into the bed, at exactly the x its
 ## ride ended on, so the hand-off from conveyor to physics body has no visible jump.
+##
+## The body is built at the PEBBLE'S OWN radius, never the nominal. This is the only
+## place in the game a body is created, so it is the single point where the two worlds
+## could silently disagree: peb.radius is what grid.gd homogenizes (PI*r^2 → packing),
+## while the radius passed here is what collides and what is drawn. Passing the nominal
+## constant would mean an edited pebble is neutronically large and physically small —
+## the bed would pack one way and the flux solve would see another, with nothing on
+## screen to show it. Reading it off the pebble keeps the Lagrangian and Eulerian views
+## of the same object in agreement by construction.
 func _spawn_from_queue() -> void:
 	var slot: Dictionary = _queue.pop_front()
 	var id: int = slot["id"]
+	var peb: Pebble = _pebbles[id]
 	_out_of_core.erase(id)
-	_physics.spawn_pebble(id, Vector2(slot["x"], Silo.spawn_y()), PEBBLE_RADIUS)
+	_physics.spawn_pebble(id, Vector2(slot["x"], Silo.spawn_y()), peb.radius)
 
 
 ## Pre-burn a seed pebble to a random point in its life so the INITIAL core starts
@@ -708,8 +746,12 @@ func _recirculate(id: int, peb: Pebble) -> void:
 	var from := _physics.get_position(id)
 	_physics.remove_pebble(id)
 	_out_of_core[id] = true
-	_loop.add(id, FuelLoop.RECIRC, from, Silo.spawn_x(_rng, PEBBLE_RADIUS + 2.0),
-			PebbleBody.DEFAULT_TINT)
+	# peb.radius, not the nominal: a recirculating pebble was manufactured at whatever
+	# the design was AT THE TIME, so mid-campaign the machine legitimately carries a mix
+	# of sizes. This is the site where using the constant would be silently wrong even
+	# for an UNEDITED pebble — it only needs the design to have moved since it was made.
+	_loop.add(id, FuelLoop.RECIRC, from, Silo.spawn_x(_rng, peb.radius + 2.0),
+			PebbleBody.DEFAULT_TINT, peb.radius)
 	_total_recirculated += 1
 
 
@@ -722,7 +764,7 @@ func _discharge(id: int, peb: Pebble) -> void:
 	var from := _physics.get_position(id)
 	_physics.remove_pebble(id)
 	_out_of_core[id] = true
-	_loop.add(id, FuelLoop.DISCHARGE, from, 0.0, PebbleBody.DEFAULT_TINT)
+	_loop.add(id, FuelLoop.DISCHARGE, from, 0.0, PebbleBody.DEFAULT_TINT, peb.radius)
 
 
 ## Accumulate the discharged pebble's composition for the outflow readout — the

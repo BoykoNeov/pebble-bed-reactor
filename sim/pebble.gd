@@ -14,8 +14,25 @@ extends RefCounted
 ## Lagrangian state here and the Eulerian body over there never get confused.
 var id: int = -1
 
-## Pebble radius in simulation units. Uniform size changes affect
-## surface-to-volume / self-shielding (not packing fraction) — see CLAUDE.md.
+## Pebble radius in simulation units.
+##
+## What this actually drives TODAY, which is not what CLAUDE.md's physics note might
+## lead you to expect. Radius reaches the neutronics through exactly one path:
+## grid.gd sums PI*r^2 into each cell's pebble area, and packing = area / cell_area.
+##
+##   - UNIFORM size change: packing fraction is SCALE-INVARIANT — bigger circles settle
+##     at the same ~0.61 areal packing — so no cross-section moves. The effect is
+##     GEOMETRIC instead: the bed holds a pinned COUNT, so bigger pebbles need more
+##     volume, the bed grows into more fuel cells, and leakage falls (k rises).
+##   - MIXED sizes: small pebbles fill the gaps between big ones, packing genuinely
+##     rises, and the area-summing homogenization captures that with no new physics.
+##
+## CLAUDE.md says uniform size change "affects surface-to-volume and self-shielding".
+## That is true of a real PBR and is NOT modelled here — there is no self-shielding
+## term in cross_sections.gd. This comment used to assert the effect existed, which was
+## a lie the code never backed; adding it would be new physics (and, per the M5d
+## pattern, would want a factor of exactly 1.0 at the nominal radius so every existing
+## calibration survives).
 var radius: float = 8.0
 
 ## Fuel loading: heavy-metal mass per pebble relative to nominal (1.0). One of
