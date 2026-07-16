@@ -142,6 +142,20 @@ var _pebbles: Dictionary = {}   # id -> Pebble (the FULL inventory: bed + machin
 var _loop: FuelLoop
 var _queue: Array = []          # [{id, x}] arrived at the top, waiting to enter the bed
 var _out_of_core: Dictionary = {}   # id -> true for every pebble with no body
+# Pebbles that finished their last pass and settled in the spent-fuel pool, oldest
+# first. A FOURTH state, and deliberately OUTSIDE `_pebbles`: a spent pebble is out
+# of the inventory for good, so it must not hold a slot against the mint gate
+# (`_pebbles.size() < TARGET_POPULATION + LOOP_BUFFER`) or be walked by any of the
+# per-pebble hot loops. Erasing from `_pebbles`/`_out_of_core` on arrival is exactly
+# what it always was — this only catches the Pebble on its way out instead of
+# dropping it, so the fuel cycle's arithmetic is untouched and calibration-neutral.
+#
+# It must ALSO never get a physics body. The spent pool sits at (480, ~1000), and
+# the neutronics grid spans x ∈ [424, 1036], y ∈ [-16, 1072] (Grid.for_silo) — so a
+# body there would land in a VALID cell, not outside the grid, and homogenize() would
+# blend the pool into the flux solve as if it were fuel in the core. The pool is
+# static art over dead cells for that reason, not for cheapness.
+var _spent: Array = []
 var _rng := RandomNumberGenerator.new()
 var _next_id := 0
 var _spawn_accum := 0.0
@@ -457,6 +471,7 @@ static func _panel_style(opaque := false) -> StyleBoxFlat:
 func _process(_delta: float) -> void:
 	_update_hud()
 	_update_pebble_colors()   # render-clock consumer of sim state (never writes back)
+	_refresh_pool()
 
 
 func _physics_process(delta: float) -> void:
@@ -469,8 +484,11 @@ func _physics_process(delta: float) -> void:
 	for arrival in _loop.advance(delta):
 		var aid: int = arrival["id"]
 		if arrival["kind"] == FuelLoop.DISCHARGE:
-			# Reached the bin: gone for good. This is the ONLY thing that shrinks the
-			# inventory, and so the only thing that opens a fresh-fuel slot.
+			# Reached the pool: out of the fuel cycle for good. This is still the ONLY
+			# thing that shrinks the inventory, and so the only thing that opens a
+			# fresh-fuel slot — the pebble is caught on its way out rather than
+			# dropped, but the arithmetic below is exactly what it always was.
+			_spent.push_back(_pebbles[aid])
 			_pebbles.erase(aid)
 			_out_of_core.erase(aid)
 			_total_extracted += 1
@@ -1011,6 +1029,42 @@ func _reset_pebble_tints() -> void:
 	for id in _pebbles:
 		_physics.set_pebble_tint(id, PebbleBody.DEFAULT_TINT)
 		_loop.set_rider_tint(id, PebbleBody.DEFAULT_TINT)
+
+
+## The selected PEBBLE field's color for one pebble, or graphite grey when the
+## selected field is a GRID one (then the heatmap carries it, not the pebbles).
+##
+## Split out of _update_pebble_colors because the pool needs the same color for a
+## pebble that no longer has a body OR a rider — the two paths that function knows.
+func _pebble_tint(peb: Pebble) -> Color:
+	if _fields.is_empty():
+		return PebbleBody.DEFAULT_TINT
+	var entry: Dictionary = _fields[_current_field]
+	var desc: FieldDescriptor = entry["desc"]
+	if desc.world != FieldDescriptor.PEBBLE:
+		return PebbleBody.DEFAULT_TINT
+	return desc.color(entry["get_peb"].call(peb))
+
+
+## Push the spent pool's DISPLAY state to the machine (render clock, pure consumer).
+##
+## The Lagrangian view follows a pebble all the way to the END of its life: it keeps
+## its field color in the bed, keeps it riding the machine, and keeps it settled in
+## the pool. So the pool is a readable slice of the outflow — switch to Burnup and
+## every pebble in it is at discharge burnup; switch to Xenon and you watch the
+## settled ones drain. That is the "inspect the composition of outflowing pebbles"
+## goal (CLAUDE.md) finally having something to inspect.
+##
+## Shows the NEWEST arrivals, because the tray holds fewer than a campaign discharges
+## (see FuelLoop's pool comment) and a frozen pile would read as stalled discharge.
+## The true total goes with them so the cap is stated, not hidden.
+func _refresh_pool() -> void:
+	var cap := FuelLoop.pool_capacity()
+	var from: int = maxi(0, _spent.size() - cap)
+	var tints := PackedColorArray()
+	for i in range(from, _spent.size()):
+		tints.append(_pebble_tint(_spent[i]))
+	_loop.set_pool(tints, _spent.size())
 
 
 ## Stamp FRESH fuel at injection: the toy heavy-metal split grid._enrichment_of()

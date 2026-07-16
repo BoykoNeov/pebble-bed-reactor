@@ -1,9 +1,9 @@
 # game/reactor_vessel/fuel_loop.gd
 #
 # The fuel-handling machine OUTSIDE the vessel: the conveyor that carries a
-# discharged pebble back up to the top for another pass, the spent-fuel bin that
-# swallows a pebble that has finished its last pass, and the fresh-fuel hopper
-# that feeds a replacement in.
+# discharged pebble back up to the top for another pass, the spent-fuel pool that
+# a pebble settles into once it has finished its last pass, and the fresh-fuel
+# hopper that feeds a replacement in.
 #
 # WHY it exists: through M5 every pebble moved by TELEPORT — a recirculating
 # pebble vanished at the outlet and reappeared in the spawn band in the same
@@ -12,7 +12,8 @@
 # discharge, the thing that keeps reactivity flat instead of a batch sawtooth) is
 # one of the behaviors this toy exists to SHOW, and it was the one part of the
 # flow the player could not see. This makes the cycle visible: you can watch a
-# single pebble ride up and re-enter, and watch a spent one leave for good.
+# single pebble ride up and re-enter, and watch a spent one leave for good — and,
+# since the pool, watch where it ends up instead of watching it wink out.
 #
 # This is PRESENTATION + bookkeeping, NOT physics. A rider has no body, so it is
 # absent from `positions()` and therefore never homogenized — it is out of the
@@ -38,6 +39,38 @@ const CHUTE_Y := 75.0                 # the feed chute, above the vessel top (12
 const BIN_X := 480.0                  # spent-fuel bin, left-hand margin
 const BIN_Y := 986.0                  # clear of the key-hints bar at y ≈ 1026
 const HOPPER := Vector2(480.0, 44.0)  # fresh-fuel hopper, top-left
+
+# --- Spent-fuel pool ---
+#
+# The bin used to be a labelled hole: main erased the Pebble the instant a rider
+# reached it, so the one thing this machine exists to show — where spent fuel ENDS
+# UP — was the one thing it did not. The pool is that ending made real: discharged
+# pebbles settle into it and stay, carrying their own field color, so the outflow
+# can be looked at (CLAUDE.md: "see the composition of outflowing pebbles").
+#
+# WHY IT IS A SHALLOW TRAY AND NOT A TALL SILO, which is the obvious thing to want:
+# the only tall free space is the left corridor x ∈ [414, 546] — and that corridor
+# is NOT free. It is the neutronics grid's LEFT REFLECTOR BAND, and the M5d rod
+# channel runs down it at x ≈ 526 from y = 120. A column there would bury the rod
+# the vessel shell was deliberately kept thin enough (WALL_T = 14) to leave visible.
+# So the pool takes the space that is genuinely dead: below the vessel floor, where
+# the grid cells are void and no rod reaches. That caps it at POOL_COLS × POOL_ROWS.
+#
+# The cap is honest rather than hidden: the pool holds the most RECENT arrivals and
+# main reports the true total discharged alongside it. A pile that silently stopped
+# growing would read as "discharge stopped" — the exact misreading this replaces.
+# Physically it is a transfer pool being emptied to casks, which is what a real
+# plant does with spent pebbles anyway.
+const POOL_LEFT := 418.0
+const POOL_FLOOR := 1017.0    # tray floor; pebbles stack UPWARD from here
+const POOL_PITCH := 16.4      # a hair over a pebble diameter (2·PEBBLE_R = 16)
+const POOL_COLS := 7
+const POOL_ROWS := 3
+const POOL_CAP := POOL_COLS * POOL_ROWS
+const POOL_W := POOL_COLS * POOL_PITCH
+const POOL_H := POOL_ROWS * POOL_PITCH
+const POOL_WALL := Color(0.10, 0.06, 0.06, 0.92)
+const POOL_EDGE := Color(0.55, 0.35, 0.35, 0.8)
 
 # Ride speed (px/s). Purely a legibility knob with ZERO physics cost: main pins the
 # IN-CORE population regardless of how many pebbles are riding (see LOOP_BUFFER),
@@ -74,6 +107,39 @@ const GRAPHITE := Color(0.62, 0.64, 0.68)
 # Riders in flight. Each: id, kind, pts (polyline), d (distance travelled),
 # len (total), x (the spawn-band x it is bound for), tint.
 var _riders: Array = []
+
+# What the pool DISPLAYS: one tint per settled pebble, oldest first, at most
+# POOL_CAP. View state only — main owns the Pebbles themselves and stays the sole
+# owner of every Pebble (see the class comment). Keeping only colors here is what
+# lets the pool render without FuelLoop knowing what a Pebble is.
+var _pool_tints := PackedColorArray()
+var _pool_total := 0   # every pebble ever discharged, including those past the cap
+
+
+## Where the i-th settled pebble sits, filling the tray bottom row first, left to
+## right. Static because the inspector (and any hit-test) must derive the same
+## position from the same index as the renderer — two copies of this layout would
+## be a click that lands on the wrong pebble.
+static func pool_slot(i: int) -> Vector2:
+	var col := i % POOL_COLS
+	var row := i / POOL_COLS   # 0 = bottom row
+	return Vector2(
+		POOL_LEFT + POOL_PITCH * (float(col) + 0.5),
+		POOL_FLOOR - POOL_PITCH * (float(row) + 0.5))
+
+
+## Hand the pool the colors of the settled pebbles it should show (oldest first,
+## already trimmed to POOL_CAP by main) and the true running total.
+func set_pool(tints: PackedColorArray, total: int) -> void:
+	_pool_tints = tints
+	_pool_total = total
+	queue_redraw()
+
+
+## How many pebbles the pool can actually show — main trims to this and reports
+## the remainder as a count rather than dropping it silently.
+static func pool_capacity() -> int:
+	return POOL_CAP
 
 
 ## Push a pebble onto the machine. `from` is where it physically left the bed (or
@@ -269,11 +335,23 @@ func _draw_plant() -> void:
 	draw_circle(hub, BORE_W * 0.5, PIPE_BORE)
 	_label("SORT", hub + Vector2(-14.0, 32.0))
 
-	# Spent-fuel bin.
-	var bin := Rect2(BIN_X - 34.0, BIN_Y - 10.0, 68.0, 34.0)
-	draw_rect(bin, Color(0.10, 0.06, 0.06, 0.92))
-	draw_rect(bin, Color(0.55, 0.35, 0.35, 0.8), false, 1.5)
-	_label("SPENT", Vector2(BIN_X - 20.0, BIN_Y - 18.0))
+	# Spent-fuel pool — where the discharge leg actually ends.
+	var pool := Rect2(POOL_LEFT, POOL_FLOOR - POOL_H, POOL_W, POOL_H)
+	draw_rect(pool, POOL_WALL)
+	draw_rect(pool, POOL_EDGE, false, 1.5)
+	# The settled pebbles, each in its own field color — this is the whole point of
+	# the pool: a spent pebble arrives carrying whatever the selected field says
+	# about it (burnup, xenon, temperature) and keeps saying it.
+	for i in _pool_tints.size():
+		var at := pool_slot(i)
+		draw_circle(at, PEBBLE_R, _pool_tints[i])
+		draw_arc(at, PEBBLE_R, 0.0, TAU, 12, POOL_EDGE, 1.0)
+	# Name the pool and state the true total, so a full tray cannot be misread as a
+	# stalled one. The count is the honest part of a capped view.
+	var caption := "SPENT %d" % _pool_total
+	if _pool_total > POOL_CAP:
+		caption += "  (newest %d)" % POOL_CAP
+	_label(caption, Vector2(POOL_LEFT + 2.0, POOL_FLOOR - POOL_H - 6.0))
 
 	# Fresh-fuel hopper — drawn as a funnel feeding the chute.
 	var hop := PackedVector2Array([
