@@ -561,6 +561,12 @@ func _test_coupled_with_burnup_settles() -> void:
 ## pass did) reads 75% and looks like a limit cycle purely because the window ends before the
 ## transient does.
 ##
+## (That sweep was measured before `_refuel_most_burned` was corrected to clear i135/xe135,
+## so its absolute numbers are ~10% off what this test now prints — the gated case reads
+## 70.9%->15.2% there vs 64.2%->14.5% after. The pattern is what the table is for, and the
+## fix does not touch it. Not re-swept: it is six 16000-step runs to restate a conclusion the
+## gated case re-measures on every run anyway.)
+##
 ## WHY ONLY THE DECAY IS GATED, not the absolute swing: the baseline's OWN swing grows with
 ## window length (24.5 -> 37.9%) because the harness's position-based refueling is batchy —
 ## the "residual breathing" the M4a notes document and accept. So an absolute late-window
@@ -642,10 +648,19 @@ func _refuel_most_burned(pebbles: Dictionary, enrichment: float) -> void:
 		peb.u235 = enrichment; peb.u238 = 1.0 - enrichment; peb.pu239 = 0.0
 		peb.poison = 0.0; peb.burnup = 0.0; peb.pass_count = 0
 		peb.temperature = Thermal.T_INLET
-		# Fresh fuel has NO fission-product inventory → no decay heat (advisor blind spot):
-		# live _inject_batch makes a brand-new Pebble so it is clean, but this proxy mutates
-		# in place, so the reservoirs must be explicitly cleared on discharge-and-refresh.
-		peb.decay_e = PackedFloat32Array()
+		# Fresh fuel has NO fission-product inventory of ANY kind. Live _mint_pebble makes a
+		# brand-new Pebble so it is clean by construction, but this proxy mutates in place, so
+		# every inventory must be cleared explicitly on discharge-and-refresh — miss one and
+		# "fresh" fuel silently arrives carrying the spent pebble's load.
+		peb.decay_e = PackedFloat32Array()   # decay-heat reservoirs
+		# The I-135/Xe-135 chain, for the same reason. M5c added xenon without revisiting this
+		# proxy, so "fresh" fuel inherited the spent pebble's equilibrium xenon and skipped the
+		# poison-in transient real fresh fuel has. Measured effect is small — it moves the
+		# settled point +0.5% (A 59.9→60.2, peakT 1381→1391 K), inside the breathing noise, and
+		# it does NOT explain the A_REF power_frac gap (0.69 either way). Corrected anyway: the
+		# proxy's whole job is to mirror main._extract_lowest + _mint_pebble.
+		peb.i135 = 0.0
+		peb.xe135 = 0.0
 	else:
 		peb.pass_count += 1
 

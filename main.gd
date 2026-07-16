@@ -207,6 +207,12 @@ var _mean_xenon := 0.0                # bed-average Xe-135 inventory (a.u.)
 var _inlet_temp := Thermal.INLET_MIN   # coolant inlet temperature (K), player lever
 var _coolant_out := Thermal.INLET_MIN  # hottest coolant seen (bed outlet, readout)
 var _coolant_desc: FieldDescriptor     # grid coolant-temperature heatmap
+# Height of the coolant heatmap's window above the current inlet. Covers the largest bed
+# rise the player can produce (~143 K, at FLOW_MIN — measured in test_thermal's coolant
+# transport check) with a little headroom, so the gradient fills the colormap without the
+# hot end clamping. This is a LEGIBILITY constant, not physics: nothing reads it but the
+# display, and the coolant field itself is unaffected.
+const COOLANT_SPAN_K := 160.0
 var _last_coolant: PackedFloat32Array = PackedFloat32Array()
 
 # Burnup / outflow (M3)
@@ -284,11 +290,17 @@ func _ready() -> void:
 	# (CLAUDE.md); hotter cells clamp to the top. All temperature/heat fields share
 	# inferno so "hot" has one visual language across grid and pebble views.
 	_temp_desc = FieldDescriptor.new("Fuel temperature", "K", FieldDescriptor.GRID, Feedback.T_REF, OVER_TEMP_K, false, Colormap.INFERNO)
-	# Coolant (helium) temperature (M4b) — a GRID field like flux/fuel-temp, showing
-	# the cold inlet at the top warming to a hot outlet at the bottom of the bed. A
-	# tighter fixed range than fuel temp (coolant stays well below the fuel) keeps the
-	# downstream gradient legible; hotter cells clamp to the top of the scale.
-	_coolant_desc = FieldDescriptor.new("Coolant temperature", "K", FieldDescriptor.GRID, Feedback.T_REF, 900.0, false, Colormap.INFERNO)
+	# Coolant (helium) temperature (M4b) — a GRID field like flux/fuel-temp, showing the
+	# cold inlet at the top warming to a hot outlet at the bottom of the bed.
+	#
+	# The range TRACKS THE INLET LEVER instead of being a fixed span (see _sync_coolant_range).
+	# WHY: what this field exists to show is the downstream RISE, and the rise is ~83 K at
+	# nominal flow (~143 K at low flow) wherever the inlet happens to sit. A fixed span wide
+	# enough for every reachable state needs to reach INLET_MAX(700) + ~143 ≈ 843 K — and then
+	# the DEFAULT view, the one every player sees first, packs the whole rise into the bottom
+	# ~17% of the colormap and reads as flat black. That was the shipped behavior; it was only
+	# ever visible on screen, never headless (a dummy renderer draws no pixels).
+	_coolant_desc = FieldDescriptor.new("Coolant temperature", "K", FieldDescriptor.GRID, Feedback.T_REF, Feedback.T_REF + COOLANT_SPAN_K, false, Colormap.INFERNO)
 	# Per-pebble temperature (M4) — the Lagrangian view of the SAME real energy
 	# balance: watch one hot pebble travel down the bed. Same fixed range as the grid
 	# field so the two views are directly comparable.
@@ -1055,6 +1067,24 @@ func _set_flow(f: float) -> void:
 ## the next coolant solve (it only re-seeds the top-of-bed march temperature).
 func _set_inlet(t: float) -> void:
 	_inlet_temp = clampf(t, Thermal.INLET_MIN, Thermal.INLET_MAX)
+	_sync_coolant_range()
+
+
+## Slide the coolant heatmap's window to sit on the current inlet, so the bed's downstream
+## rise always fills the colormap instead of being squashed into the bottom of an
+## inlet-independent scale.
+##
+## This is NOT the per-frame auto-ranging CLAUDE.md forbids — that is banned because a scale
+## that moves every frame makes transients incomparable. This window moves ONLY when the
+## player moves the inlet lever (K/L), so within any run at a fixed inlet the normalization is
+## as stable as a constant; it is the "slowly-adapting range with the legend visible" the same
+## section allows. The colorbar labels via FieldDescriptor.value_at, i.e. through this exact
+## mapping, so the legend re-labels itself and cannot disagree with the colors.
+func _sync_coolant_range() -> void:
+	if _coolant_desc == null:
+		return
+	_coolant_desc.vmin = _inlet_temp
+	_coolant_desc.vmax = _inlet_temp + COOLANT_SPAN_K
 
 
 ## Change the DESIGN fuel loading — the M5b moderation lever. Like enrichment it is
