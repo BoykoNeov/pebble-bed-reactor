@@ -28,12 +28,20 @@ extends SceneTree
 const FIELD := 5
 # Let the bed fill, seed, and start turning first.
 const START_AT := 38.0
-const GIVE_UP_AT := 150.0
+const GIVE_UP_AT := 200.0
+# A raised inlet, to prove the coolant window actually tracks the lever. The whole point of
+# the lever-relative range is that it stays legible when the player raises the inlet — the
+# case a fixed ceiling handles worst — so capturing only the default inlet would verify the
+# easy half of the claim.
+const RAISED_INLET := 500.0
+const RAISE_AT := 46.0   # after the default-inlet shot, with time to re-solve the field
 
 var _main
 var _t := 0.0
 var _out := ""
 var _shot_field := false
+var _shot_raised := false
+var _raised := false
 var _shot_bin := 0
 var _done_at := -1.0
 
@@ -59,10 +67,21 @@ func _process(delta: float) -> bool:
 	# Capture on a LATER frame than the switch (trap 1).
 	if not _shot_field:
 		_shot_field = true
-		var d = _main._fields[FIELD]["desc"]
 		_capture("field_%d.png" % FIELD)
-		print("  field '%s' scale %.0f-%.0f %s (inlet %.0f K, bed outlet %.0f K)"
-			% [d.name, d.vmin, d.vmax, d.units, _main._inlet_temp, _main._coolant_out])
+		_report_scale()
+		return false
+
+	# Now raise the inlet (the K key's lever) and capture again: the coolant window should
+	# have slid up with it, keeping the same gradient legible instead of clamping.
+	if not _raised and _t >= RAISE_AT:
+		_raised = true
+		_main._set_inlet(RAISED_INLET)
+		print("  inlet lever raised to %.0f K" % _main._inlet_temp)
+		return false
+	if _raised and not _shot_raised and _t >= RAISE_AT + 6.0:
+		_shot_raised = true
+		_capture("field_%d_inlet_raised.png" % FIELD)
+		_report_scale()
 		return false
 
 	# Wait for a REAL discharge and catch it heading into the spent bin. Discharges are rare
@@ -76,7 +95,7 @@ func _process(delta: float) -> bool:
 					% [r["id"], 100.0 * r["d"] / r["len"]])
 				break
 
-	if _shot_field and _shot_bin >= 3 and _done_at < 0.0:
+	if _shot_field and _shot_raised and _shot_bin >= 3 and _done_at < 0.0:
 		_done_at = _t
 	if _done_at > 0.0 and _t > _done_at + 0.5:
 		print("[render capture complete] %s" % _out)
@@ -85,6 +104,16 @@ func _process(delta: float) -> bool:
 		print("[render capture timed out] field=%s  bin shots=%d" % [str(_shot_field), _shot_bin])
 		quit(1)
 	return false
+
+
+## The numbers behind the picture: if the field's display range does not sit on the span the
+## HUD reports, the heatmap is a flat rectangle however correct the physics behind it is.
+func _report_scale() -> void:
+	var d = _main._fields[FIELD]["desc"]
+	print("  field '%s' scale %.0f-%.0f %s   inlet %.0f K, bed outlet %.0f K (rise %.0f K = %.0f%% of scale)"
+		% [d.name, d.vmin, d.vmax, d.units, _main._inlet_temp, _main._coolant_out,
+			_main._coolant_out - _main._inlet_temp,
+			100.0 * (_main._coolant_out - _main._inlet_temp) / maxf(d.vmax - d.vmin, 1.0)])
 
 
 func _capture(name: String) -> void:
