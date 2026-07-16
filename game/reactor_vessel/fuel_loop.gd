@@ -183,6 +183,37 @@ func count() -> int:
 	return _riders.size()
 
 
+## The id of the rider under `at`, or -1 if none.
+##
+## Deliberately routed through the SAME _point_at the renderer uses: a rider's
+## position is not stored anywhere, it is derived from its arc-length each frame, so
+## a hit-test with its own idea of where riders are would drift from what is drawn
+## and the player would click a pebble and select its neighbour.
+func rider_at(at: Vector2) -> int:
+	for r in _riders:
+		if _point_at(r["pts"], r["d"]).distance_to(at) <= PEBBLE_R:
+			return r["id"]
+	return -1
+
+
+## Where a rider currently is, or Vector2.INF if it is not on the machine.
+func rider_position(id: int) -> Vector2:
+	for r in _riders:
+		if r["id"] == id:
+			return _point_at(r["pts"], r["d"])
+	return Vector2.INF
+
+
+## Index into the pool's DISPLAYED window under `at`, or -1. The index is into what
+## is shown, not into main's full spent list — main maps it back, since main is what
+## knows where the window starts.
+func pool_index_at(at: Vector2) -> int:
+	for i in _pool_tints.size():
+		if pool_slot(i).distance_to(at) <= PEBBLE_R:
+			return i
+	return -1
+
+
 # Riders move every frame, so the machine repaints on the RENDER clock. Like the
 # rest of visualization it is a pure consumer — it may lag the sim harmlessly.
 func _process(_delta: float) -> void:

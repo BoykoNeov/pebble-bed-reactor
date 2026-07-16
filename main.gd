@@ -120,6 +120,10 @@ const ROD_COLOR := Color(1.0, 0.67, 0.27, 0.95)
 const WALL_STEEL := Color(0.15, 0.17, 0.22, 1.0)
 const WALL_EDGE := Color(0.32, 0.37, 0.46, 0.9)
 const WALL_LINER := Color(0.82, 0.86, 0.93, 0.95)
+# Selection ring (inspector). Cyan on purpose: every field colormap in the registry is
+# a warm or purple ramp (inferno / magma / viridis), so a cyan ring cannot be mistaken
+# for a field value no matter which heatmap is up.
+const SELECT_RING := Color(0.35, 0.95, 1.0, 0.95)
 # A core AT online-refueling equilibrium is critical: k_cold → 1 by definition, so
 # it hovers at 1.0 ± a hair and the strict k_cold>1 test flickers. Treat anything
 # within this band of 1 as "critical / self-regulating"; only a core clearly below
@@ -156,6 +160,22 @@ var _out_of_core: Dictionary = {}   # id -> true for every pebble with no body
 # blend the pool into the flux solve as if it were fuel in the core. The pool is
 # static art over dead cells for that reason, not for cheapness.
 var _spent: Array = []
+
+# --- Inspector (read-only) ---
+#
+# The pebble the player has clicked, or null. Held as the Pebble itself rather than
+# an id because a spent pebble HAS no id in `_pebbles` any more — it left the
+# inventory — and the inspector's whole point is that it reaches every pebble,
+# including the ones that have finished.
+#
+# Read-only BY CONSTRUCTION, and that is not timidity: visualization is a pure
+# consumer of sim state and never writes back (CLAUDE.md). Editing is a separate,
+# narrower thing — it is confined to pebbles OUTSIDE the core, where a change cannot
+# perturb a running solve mid-step.
+var _selected: Pebble = null
+var _selected_where := ""
+var _overlay: Node2D
+var _inspector: RichTextLabel
 var _rng := RandomNumberGenerator.new()
 var _next_id := 0
 var _spawn_accum := 0.0
@@ -306,6 +326,14 @@ func _ready() -> void:
 	_loop = FuelLoop.new()
 	add_child(_loop)
 
+	# The selection ring, above EVERYTHING: the pebble bodies draw after both the field
+	# display and the plant, so the marker for a bed pebble has to outrank them or it is
+	# painted over by the pebble it points at.
+	_overlay = Node2D.new()
+	_overlay.z_index = 50
+	_overlay.draw.connect(_draw_selection)
+	add_child(_overlay)
+
 	# Flux is normalized to peak = 1 by the solver, so a fixed [0, 1] linear
 	# range is naturally stable frame-to-frame (CLAUDE.md: no per-frame
 	# auto-ranging). It stays within one order of magnitude, so no log needed.
@@ -390,6 +418,8 @@ func _ready() -> void:
 # colors for the status line — the one thing that must be readable at a glance.
 const HUD_DIM := "8a97ab"
 const HUD_HEAD := "5c81c4"
+# Top of the inspector panel — clear of the readout above it, which runs to y ≈ 440.
+const INSPECTOR_Y := 460.0
 
 func _build_hud() -> void:
 	var layer := CanvasLayer.new()
@@ -415,6 +445,24 @@ func _build_hud() -> void:
 	_readout.add_theme_font_size_override("bold_font_size", 13)
 	_readout.add_theme_color_override("default_color", Color(0.93, 0.95, 0.98))
 	panel.add_child(_readout)
+
+	# Inspector panel — same left column, below the readout. That column is the only
+	# large free area that is entirely OUTSIDE the neutronics grid (which starts at
+	# x = 424): a panel any further right would cover the left reflector band, and flux
+	# peaking at the reflector is one of the behaviors this toy exists to show.
+	var ins := PanelContainer.new()
+	ins.position = Vector2(12, INSPECTOR_Y)
+	ins.add_theme_stylebox_override("panel", _panel_style())
+	root.add_child(ins)
+	_inspector = RichTextLabel.new()
+	_inspector.bbcode_enabled = true
+	_inspector.fit_content = true
+	_inspector.scroll_active = false
+	_inspector.custom_minimum_size = Vector2(386, 0)
+	_inspector.add_theme_font_size_override("normal_font_size", 13)
+	_inspector.add_theme_font_size_override("bold_font_size", 13)
+	_inspector.add_theme_color_override("default_color", Color(0.93, 0.95, 0.98))
+	ins.add_child(_inspector)
 
 	# Colorbar — the dedicated right column, beside the reflector band.
 	_color_bar = ColorBar.new()
@@ -472,6 +520,8 @@ func _process(_delta: float) -> void:
 	_update_hud()
 	_update_pebble_colors()   # render-clock consumer of sim state (never writes back)
 	_refresh_pool()
+	_update_inspector()
+	_overlay.queue_redraw()   # the ring tracks a moving pebble (bed flow, or a ride)
 
 
 func _physics_process(delta: float) -> void:
@@ -1067,6 +1117,84 @@ func _refresh_pool() -> void:
 	_loop.set_pool(tints, _spent.size())
 
 
+## Select whatever pebble is under `at`, or clear the selection if that is nothing.
+##
+## Searched in DRAW ORDER, nearest layer first (pool, then the machine, then the bed),
+## so a click resolves to the pebble the player can actually see at that pixel — the
+## pool and the pipework are drawn over the bed's grid region, and picking the bed
+## first would select a pebble hidden behind the plant.
+func _pick_at(at: Vector2) -> void:
+	var pi := _loop.pool_index_at(at)
+	if pi != -1:
+		# The pool shows a WINDOW of the newest arrivals; map the slot back through the
+		# same offset _refresh_pool draws with, or the click lands on the wrong pebble.
+		var from: int = maxi(0, _spent.size() - FuelLoop.pool_capacity())
+		_select(_spent[from + pi], "spent pool")
+		return
+
+	var rid := _loop.rider_at(at)
+	if rid != -1:
+		_select(_pebbles.get(rid), "fuel machine")
+		return
+
+	# The bed. Nearest hit wins rather than first: pebbles overlap slightly in a packed
+	# bed, so "first within radius" would depend on dictionary order and feel arbitrary.
+	var positions: Dictionary = _physics.positions()
+	var best_id := -1
+	var best_d := INF
+	for id in positions:
+		var peb: Pebble = _pebbles.get(id)
+		if peb == null:
+			continue
+		var d: float = positions[id].distance_to(at)
+		if d <= peb.radius and d < best_d:
+			best_d = d
+			best_id = id
+	_select(_pebbles.get(best_id) if best_id != -1 else null,
+		"core bed" if best_id != -1 else "")
+
+
+func _select(peb: Pebble, where: String) -> void:
+	_selected = peb
+	_selected_where = where
+	_overlay.queue_redraw()
+
+
+## Where the selected pebble is on screen, or Vector2.INF if it has no position.
+##
+## A STAGED pebble genuinely has none: it has arrived at the top and is waiting for a
+## bed slot, holding no body and no rider, so nothing draws it. That is a real gap in
+## the fuel cycle's visibility (the "pebbles going in" have nowhere to be seen) and it
+## is why the inspector can reach a staged pebble only indirectly today.
+func _selected_pos() -> Vector2:
+	if _selected == null:
+		return Vector2.INF
+	var idx := _spent.find(_selected)
+	if idx != -1:
+		var from: int = maxi(0, _spent.size() - FuelLoop.pool_capacity())
+		return FuelLoop.pool_slot(idx - from) if idx >= from else Vector2.INF
+	var rp := _loop.rider_position(_selected.id)
+	if rp != Vector2.INF:
+		return rp
+	var positions: Dictionary = _physics.positions()
+	return positions.get(_selected.id, Vector2.INF)
+
+
+## Ring the selected pebble. Drawn by a dedicated overlay node with a high z_index
+## rather than in main._draw, because main draws BENEATH the field display, the plant
+## and the pebble bodies — a ring there would be painted over by the very pebble it
+## marks.
+func _draw_selection() -> void:
+	if _selected == null:
+		return
+	var at := _selected_pos()
+	if at == Vector2.INF:
+		return
+	_overlay.draw_arc(at, _selected.radius + 4.0, 0.0, TAU, 24, SELECT_RING, 2.0)
+	_overlay.draw_arc(at, _selected.radius + 7.0, 0.0, TAU, 24,
+		Color(SELECT_RING.r, SELECT_RING.g, SELECT_RING.b, 0.35), 1.0)
+
+
 ## Stamp FRESH fuel at injection: the toy heavy-metal split grid._enrichment_of()
 ## reads back as the fissile fraction. From here Depletion.step evolves this vector
 ## over the pebble's life (U-235 burns, Pu-239 breeds, poison builds).
@@ -1116,6 +1244,13 @@ func _cycle_field() -> void:
 
 
 func _input(event: InputEvent) -> void:
+	# Click to inspect. Handled before the key chain because a mouse event is never a
+	# key event — an early return here keeps the two input paths from tangling.
+	if event is InputEventMouseButton and event.pressed \
+			and event.button_index == MOUSE_BUTTON_LEFT:
+		_pick_at(event.position)
+		return
+
 	# Ignore key releases and auto-repeat. Non-key events (InputEventAction, which
 	# is what the gdai MCP's simulate_input synthesizes) fall through to the action
 	# checks below so the sim is drivable headlessly / from tooling, not just the
@@ -1445,6 +1580,48 @@ func _update_hud() -> void:
 		+ _row("feedback", "%s   scram %s   campaign %.0f" % [("[color=#6ecf7a]ON[/color]" if _feedback_on else "[color=#ff5555]OFF[/color]"), ("[color=#ffaa44]TRIPPED[/color]" if _scrammed else "off"), _clocks.campaign_elapsed]) \
 		+ _section("FIELD") \
 		+ _row(field_name, "solve iters %d   fps %d" % [_solve_iters, Engine.get_frames_per_second()])
+
+
+## The inspector panel: everything this toy tracks about ONE pebble.
+##
+## The Lagrangian half of the two-worlds model, made legible. The heatmaps show a
+## pebble's field value as a color; this shows the actual vector behind that color —
+## which is what "inspect the composition of outflowing pebbles" (CLAUDE.md) has
+## always meant, and what the burnup gradient down the bed looks like one pebble at a
+## time. Reads sim state and writes nothing back.
+func _update_inspector() -> void:
+	if _selected == null:
+		_inspector.text = _section("INSPECTOR") \
+			+ "[color=#%s]click any pebble — in the bed, riding the machine, or settled\nin the spent pool[/color]" % HUD_DIM
+		return
+
+	var p := _selected
+	# Fissile fraction of heavy metal — the same proxy the homogenizer feeds the
+	# cross-sections (grid._enrichment_of), so this row is what the physics actually
+	# sees, not a separate bookkeeping number that could drift from it.
+	var hm: float = p.u235 + p.u238 + p.pu239
+	var fissile: float = (p.u235 + p.pu239) / hm if hm > 0.0 else 0.0
+	var passes := "%d / %d" % [p.pass_count, Depletion.MAX_PASSES]
+	var spent_note := ""
+	if p.burnup >= Depletion.DISCHARGE_BURNUP or p.pass_count >= Depletion.MAX_PASSES:
+		spent_note = "  [color=#ff7043](spent)[/color]"
+
+	_inspector.text = _section("INSPECTOR") \
+		+ _row("pebble", "#%d   [color=#%s]%s[/color]%s" % [p.id, HUD_DIM, _selected_where, spent_note]) \
+		+ _row("size", "r = %.2f px   (area weight %.2f x)"
+			% [p.radius, (p.radius * p.radius) / (PEBBLE_RADIUS * PEBBLE_RADIUS)]) \
+		+ _row("loading", "%.2f  →  M %.2f" % [p.fuel_loading, CrossSections.moderation(p.fuel_loading)]) \
+		+ _section("COMPOSITION") \
+		+ _row("fissile", "%.2f%% of heavy metal" % (fissile * 100.0)) \
+		+ _row("U-235", "%.4f" % p.u235) \
+		+ _row("U-238", "%.4f" % p.u238) \
+		+ _row("Pu-239", "%.4f" % p.pu239) \
+		+ _row("poison", "%.5f   Xe-135 %.2f ×1e-5" % [p.poison, p.xe135 * 1e5]) \
+		+ _section("LIFE") \
+		+ _row("burnup", "%.1f / %.0f MWd/kgHM" % [p.burnup, Depletion.DISCHARGE_BURNUP]) \
+		+ _row("passes", passes) \
+		+ _row("temperature", "%.0f K" % p.temperature) \
+		+ _row("local flux", "%.3f" % p.local_flux)
 
 
 ## One dim section header line of the readout panel.
