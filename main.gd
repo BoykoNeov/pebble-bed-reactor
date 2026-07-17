@@ -128,6 +128,32 @@ const ENRICH_DEFAULT := 0.113
 # power" behavior (a CLAUDE.md validation target). Small steps show the core climb
 # through several regulating states — power/temperature up, k pinned ~1 — first.
 const ENRICH_STEP := 0.0005
+# --- Fuel-cycle policy limits (the live recirculate-vs-discharge criteria; see
+# _discharge_burnup / _max_passes for WHY the policy lives in main and the calibrated
+# constants stay in sim/depletion.gd).
+#
+# The band brackets the HTR-PM ~90-100 MWd/kgHM reference (CLAUDE.md) generously on BOTH
+# sides, because both directions teach something real and neither is a misuse:
+#   * DOWN — discharge fuel long before it is spent. Wasteful (the outflow readout shows
+#     fissile still on the table), and it drives the bed's mean burnup down, so the core
+#     gets MORE reactive. Taken far enough it is the classic once-through-vs-multi-pass
+#     tradeoff made visible. Lowering it below burnups already IN the bed starts a
+#     discharge WAVE as the sorter works through the newly-spent backlog — correct
+#     emergent behavior, not a bug, and metered at one per EXTRACT_INTERVAL rather than
+#     an instant dump.
+#   * UP — squeeze every last MWd out of each pebble. The bed ages, poisons accumulate,
+#     and reactivity falls until the core cannot hold criticality. That is the real
+#     ceiling on discharge burnup, and here the player finds it by hitting it.
+# The floor is not 0: at 0 every pebble is born spent and the cycle degenerates into
+# mint-and-discharge with no reactor in the middle.
+const DISCHARGE_MIN := 10.0
+const DISCHARGE_MAX := 160.0
+const DISCHARGE_STEP := 2.5
+# Passes is a BACKSTOP, not the primary criterion (a pebble parked in a cold spot must
+# not recirculate forever). The floor is 1 — "one pass and out" is once-through fuelling,
+# a real cycle worth being able to build, not a degenerate setting.
+const PASSES_MIN := 1
+const PASSES_MAX := 40
 # Above this equilibrium fuel temperature the toy calls the core "over-temp": the
 # point where Doppler alone stops being a safe hold. Real cores hold that excess with
 # control rods — which, as of M5d, this one has too (N/M; sim/control_rods.gd), so the
@@ -178,11 +204,20 @@ var _out_of_core: Dictionary = {}   # id -> true for every pebble with no body
 # what it always was — this only catches the Pebble on its way out instead of
 # dropping it, so the fuel cycle's arithmetic is untouched and calibration-neutral.
 #
-# It must ALSO never get a physics body. The spent pool sits at (480, ~1000), and
-# the neutronics grid spans x ∈ [424, 1036], y ∈ [-16, 1072] (Grid.for_silo) — so a
-# body there would land in a VALID cell, not outside the grid, and homogenize() would
-# blend the pool into the flux solve as if it were fuel in the core. The pool is
-# static art over dead cells for that reason, not for cheapness.
+# It must ALSO never become FUEL. The spent pool sits at (480, ~1000), and the
+# neutronics grid spans x ∈ [424, 1036], y ∈ [-16, 1072] (Grid.for_silo) — so a pool
+# slot is a VALID cell, not outside the grid, and a pool pebble reaching homogenize()
+# would blend the spent pile into the flux solve as if it were fuel in the core,
+# silently shifting k.
+#
+# Note what that does and does NOT forbid. The guard is neutronic ("not fuel"), not
+# physical ("no body"): the coupling reads `_core_positions()`, which filters on
+# `_out_of_core`, so bed membership is DECLARED rather than inferred from whether the
+# engine happens to hold a body. A pool pebble may therefore have a real body — it
+# must, to collide and to be re-injectable — and still be invisible to the flux. This
+# comment used to say the pile was bodiless "for that reason, not for cheapness";
+# that was true of the mechanism but overstated the requirement, and the distinction
+# is what lets the pool become a real pile of colliding pebbles.
 var _spent: Array = []
 
 # --- Inspector (read-only) ---
@@ -239,6 +274,49 @@ var _feedback_on := true
 var _enrichment := ENRICH_DEFAULT
 var _fuel_loading := LOADING_DEFAULT   # design moderation lever (M5b); stamped on fresh fuel
 var _pebble_radius := RADIUS_DEFAULT   # design size lever; stamped on fresh fuel
+
+# --- Fuel-cycle POLICY, live-editable (the recirculate-vs-discharge criteria).
+#
+# The rule the sorter applies to every pebble that reaches the bottom: below BOTH of
+# these it goes back up for another pass; at or past EITHER it leaves for good. That
+# decision was previously hard-wired to the Depletion constants, so the player could
+# watch the fuel cycle but not operate it — the one part of the cycle with a genuine
+# operating choice in it (how hard do you burn your fuel?) was the part they could not
+# touch.
+#
+# WHY the knob lives HERE and the constants stay in sim/depletion.gd, rather than the
+# constants simply becoming mutable: the constants have SEVERAL readers and only ONE of
+# them wants the live value (see below). They are also calibration-linked — test_depletion
+# pins the burn rates against DISCHARGE_BURNUP ("a pebble reaches discharge over ~6-15
+# passes"), so making them mutable global state would let one test case leak its policy
+# into the next, and would quietly redefine the constant that several calibrations are
+# expressed in terms of. sim/ stays pure; the POLICY (an operating choice) lives with the
+# operator, and the CONSTANT stays what it always was: the calibrated reference default.
+#
+# The split between who reads which — the rule is "what will happen to this pebble" vs
+# "what fixed scale was calibrated":
+#   LIVE (policy — the pebble's fate):  _extract_lowest's decision, and the inspector's
+#       burnup/passes/(spent) rows. The inspector MUST track the live knob or it lies:
+#       a sorter discharging at 40 while the panel reads "45 / 90, not spent" is the
+#       two-worlds-disagree bug that commit 7b0be70 fixed for radius, in another costume.
+#       (Safe by nature, too: the inspector is a pure render consumer that writes nothing
+#       back, so pointing it live cannot perturb a solve.)
+#   DEFAULT (calibrated reference — NOT policy):  the burnup FieldDescriptor's range
+#       (CLAUDE.md demands STABLE normalization — rescaling the colormap because the
+#       player nudged a policy knob would recolor every pebble and destroy exactly the
+#       frame-to-frame comparability the rule exists to protect), and _seed_burned (a
+#       one-time startup calibration; the knob is an operating lever, and moving it must
+#       not rewrite the core's history).
+#
+# Accepted consequence of that split, which is honest rather than a defect: with a lowered
+# threshold a pebble can sit at ~44% of the colormap's 0..90 range and still be tagged
+# (spent). The color is absolute burnup; the tag is the policy verdict. Two real axes.
+#
+# Defaulted BY REFERENCE, never a re-typed 90.0/15 — so "neutral at the default setting"
+# is true by construction (the M5d pattern) and cannot silently drift if anyone retunes
+# the constants.
+var _discharge_burnup := Depletion.DISCHARGE_BURNUP
+var _max_passes := Depletion.MAX_PASSES
 var _k_cold := 0.0            # k with feedback OFF — the reactivity being suppressed
 var _peak_temp := Feedback.T_REF
 
@@ -515,6 +593,8 @@ func _build_hud() -> void:
 		_key_hint("K L", "inlet temp"),
 		_key_hint("; '", "fuel loading"),
 		_key_hint("N M", "control rods"),
+		_key_hint("G H", "discharge at"),
+		_key_hint("O P", "max passes"),
 		_key_hint("F", "feedback"),
 		_key_hint("Space", "scram"),
 		_key_hint("V", "field"),
@@ -600,10 +680,50 @@ func _physics_process(delta: float) -> void:
 	_deplete(_clocks.campaign_dt(delta))
 
 
-## Pebbles currently in the BED (i.e. holding a physics body, homogenized, fissioning).
+## Pebbles currently in the BED (i.e. homogenized, fissioning).
 ## Derived rather than counted so it cannot drift out of step with the registry.
 func _core_count() -> int:
 	return _pebbles.size() - _out_of_core.size()
+
+
+## The BED's positions — every pebble the neutronics is allowed to see.
+##
+## WHY this exists at all, when _physics.positions() looks like the same thing: today
+## it IS the same thing, because nothing outside the bed holds a body. That equality is
+## a COINCIDENCE of the current transport model, not an invariant — and two different
+## meanings are riding on it. "Has a physics body" is a rendering/engine fact;
+## "is in the core" is a NEUTRONICS fact. The flux solve wants the second and has been
+## reading the first, which is correct only for as long as no pebble outside the bed is
+## ever given a body.
+##
+## The spent pool is what proves the stakes are real rather than theoretical: its slots
+## land in VALID grid cells (tests/live_spent_pool.gd asserts exactly this), so a body
+## parked there would be homogenized into the flux solve as if it were fuel in the core,
+## silently shifting k. That hazard is currently held off by a CONVENTION — "we just
+## don't give those pebbles bodies" — enforced by a comment. Routing the coupling through
+## `_out_of_core` moves the guard from convention into code: membership is now declared,
+## not inferred from an engine side-effect, and a pebble can hold a body anywhere in the
+## machine without ever reaching the neutronics.
+##
+## Byte-identical today BY CONSTRUCTION: every id in `_out_of_core` is exactly an id with
+## no body, so this filter removes nothing that positions() would have returned. That is
+## the point — it is the M5d calibration-neutral pattern (a new mechanism that does
+## precisely nothing at its current setting), so every existing calibration survives and
+## the suites prove it rather than a claim doing so.
+##
+## NOT for the inspector (_select_at / _selected_pos): clicking is an INTERACTION concern
+## and must reach every pebble that is drawn, in the bed or not. Those deliberately keep
+## reading _physics.positions() directly.
+func _core_positions() -> Dictionary:
+	# Bind the backend's dictionary ONCE: positions() BUILDS a fresh dictionary per call
+	# (see godot_physics_backend.gd), so calling it inside the loop would rebuild the whole
+	# thing per pebble — O(n^2) on the solve's critical path.
+	var all := _physics.positions()
+	var out := {}
+	for id in all:
+		if not _out_of_core.has(id):
+			out[id] = all[id]
+	return out
 
 
 ## Two jobs per tick, in priority order: mint inventory until the design load exists,
@@ -690,6 +810,23 @@ func _seed_burned(peb: Pebble) -> void:
 	peb.pass_count = mini(Depletion.MAX_PASSES - 1, int(peb.burnup / 9.0))
 
 
+## Is this pebble finished — does the CURRENT policy send it to the pool rather than
+## back around for another pass?
+##
+## THE fuel-cycle rule, in one place. Both the sorter (_extract_lowest) and the inspector
+## panel call this, and that sharing is the point rather than tidiness: the panel's job is
+## to tell the player what will happen to a pebble, so if it carried its own copy of the
+## predicate the two could disagree — the panel would say "not spent" about a pebble the
+## sorter was in the act of discharging. They cannot drift now, because there is only one
+## rule to drift from. (This is the same failure commit 7b0be70 fixed for radius: two
+## worlds each holding their own copy of one fact.)
+##
+## Spent on EITHER criterion: burnup is the real one (the fuel is used up), passes is the
+## backstop (a pebble in a cold spot burns slowly and must not cycle forever).
+func _is_spent(peb: Pebble) -> bool:
+	return peb.burnup >= _discharge_burnup or peb.pass_count >= _max_passes
+
+
 func _extract_lowest() -> void:
 	# Metered discharge: pull the single lowest (most-descended) pebble out of the
 	# closed hopper. Only once the bed is settled at the bottom, so we don't yank
@@ -708,7 +845,7 @@ func _extract_lowest() -> void:
 		return  # let the bed fill first
 	var lowest_id := -1
 	var lowest_y := -INF
-	var positions := _physics.positions()
+	var positions := _core_positions()
 	for id in positions:
 		var y: float = positions[id].y
 		if y > lowest_y:
@@ -717,10 +854,14 @@ func _extract_lowest() -> void:
 	if lowest_id == -1 or lowest_y < Silo.FUNNEL_TOP:
 		return  # nothing has reached the discharge region yet
 	var peb: Pebble = _pebbles[lowest_id]
-	if peb.burnup < Depletion.DISCHARGE_BURNUP and peb.pass_count < Depletion.MAX_PASSES:
-		_recirculate(lowest_id, peb)
-	else:
+	# THE decision, and the only place fuel-cycle POLICY is applied. Reads the live knobs
+	# (_discharge_burnup / _max_passes), not the Depletion constants, so the player can
+	# re-govern the cycle while it runs; every other reader of those constants is either a
+	# calibrated reference or a readout of this same rule (see _discharge_burnup).
+	if _is_spent(peb):
 		_discharge(lowest_id, peb)
+	else:
+		_recirculate(lowest_id, peb)
 	# Close the vacancy in the SAME step the sorter opened it, rather than waiting for
 	# the next injection tick: otherwise the bed sits one pebble short for up to
 	# SPAWN_INTERVAL, and the flux solve (a shorter cadence still) would sample a core
@@ -816,7 +957,7 @@ func _solve_flux() -> void:
 	# grid.temperature (Thermal.apply_field_doppler) and we solve the eigenproblem
 	# ONCE at the current temperature — no search. The retained M2 search survives
 	# only as the one-time equilibrium SEED below (and, later, fast-forward collapse).
-	var positions := _physics.positions()
+	var positions := _core_positions()
 	if positions.is_empty():
 		return
 	_grid.homogenize(_pebbles, positions)
@@ -1364,6 +1505,21 @@ func _input(event: InputEvent) -> void:
 				_set_rods(_rod_insertion + ControlRods.INSERT_STEP)
 			KEY_N:
 				_set_rods(_rod_insertion - ControlRods.INSERT_STEP)
+			# FUEL-CYCLE POLICY — the recirculate-vs-discharge criteria. G/H move the
+			# discharge burnup (down = throw fuel away early → younger bed → MORE reactive,
+			# and a discharge wave while the sorter clears the newly-spent backlog; up =
+			# burn it harder → aged, poisoned bed → reactivity falls until criticality
+			# cannot be held). O/P move the pass backstop; P down to 1 makes the core
+			# once-through. Unlike the design levers these govern the fuel ALREADY in the
+			# bed, not just fresh mints — the rule is the sorter's, not the pebble's.
+			KEY_G:
+				_set_discharge_burnup(_discharge_burnup - DISCHARGE_STEP)
+			KEY_H:
+				_set_discharge_burnup(_discharge_burnup + DISCHARGE_STEP)
+			KEY_O:
+				_set_max_passes(_max_passes - 1)
+			KEY_P:
+				_set_max_passes(_max_passes + 1)
 			# SCRAM (M5) — emergency shutdown. Space trips / resets it; pair with a flow
 			# cut (,) to watch the decay-heat tail bound the temperature (walk-away safe).
 			KEY_SPACE:
@@ -1449,6 +1605,31 @@ func _sync_coolant_range() -> void:
 ## stable under-moderated regime toward the over-moderated instability as it refuels.
 func _set_loading(v: float) -> void:
 	_fuel_loading = clampf(v, LOADING_MIN, LOADING_MAX)
+
+
+## Change the DISCHARGE BURNUP criterion — how hard the player burns their fuel before
+## throwing it away. Unlike enrichment/loading/size (design levers that are STAMPED on
+## fresh fuel and reach the core only as new pebbles cycle in), this is an OPERATING
+## lever: it is not a property of a pebble at all, it is the rule the sorter applies, so
+## it re-governs every pebble already in the bed the instant it moves.
+##
+## That immediacy is the interesting part, and it is physics rather than a shortcut.
+## Lowering it below burnups the bed already holds does NOT retroactively burn anything —
+## it reclassifies pebbles that were "still good" as "spent", and the sorter then works
+## through that backlog one pebble per EXTRACT_INTERVAL. So the core sheds aged fuel and
+## takes fresh in its place faster than the equilibrium replaces it, mean burnup falls,
+## and reactivity RISES. A discharge wave, emergent from the same metered sorter that
+## runs the normal cycle — nothing special-cases it, and nothing should.
+func _set_discharge_burnup(v: float) -> void:
+	_discharge_burnup = clampf(v, DISCHARGE_MIN, DISCHARGE_MAX)
+
+
+## Change the max-passes BACKSTOP — the criterion that catches a pebble the burnup
+## threshold never will (one parked in a cold spot, burning too slowly to ever reach
+## discharge). Drive it to 1 and the core is once-through: every pebble gets exactly one
+## trip through the bed and leaves, however little it burned.
+func _set_max_passes(v: int) -> void:
+	_max_passes = clampi(v, PASSES_MIN, PASSES_MAX)
 
 
 func _draw() -> void:
@@ -1597,6 +1778,23 @@ func _update_hud() -> void:
 	elif _rod_insertion <= 0.0:
 		rod_note = "  [color=#%s]withdrawn[/color]" % HUD_DIM
 
+	# The sorter's BACKLOG: pebbles in the bed that the current policy already calls spent
+	# and which are still riding down to the outlet, since only the lowest pebble can be
+	# extracted (one per EXTRACT_INTERVAL). This is the number that makes the discharge
+	# wave visible instead of mysterious: in equilibrium it sits at a small steady value
+	# (a pebble crosses the threshold mid-bed and takes a while to reach the bottom), but
+	# the instant the player lowers the threshold it JUMPS — a slug of fuel reclassified
+	# as spent in one keystroke — and then drains at the metered rate while fresh fuel
+	# replaces it and reactivity climbs. Without this row the player sees power rise for
+	# no visible reason; with it, they watch the cause drain away.
+	var spent_in_bed := 0
+	for pid in _pebbles:
+		if not _out_of_core.has(pid) and _is_spent(_pebbles[pid]):
+			spent_in_bed += 1
+	var policy_note := ""
+	if spent_in_bed > 0:
+		policy_note = "   [color=#ff7043]%d spent in bed, awaiting the sorter[/color]" % spent_in_bed
+
 	_readout.text = "[b]PEBBLE BED REACTOR[/b]  [color=#%s]toy sim — M5d[/color]\n" % HUD_DIM \
 		+ "[color=#%s]● %s[/color]\n" % [status_col, status] \
 		+ _section("CORE") \
@@ -1614,6 +1812,8 @@ func _update_hud() -> void:
 		+ _section("FUEL CYCLE") \
 		+ _row("in core", "%d / %d   (%d riding the loop)" % [_core_count(), TARGET_POPULATION, _loop.count()]) \
 		+ _row("cycle", "recirculated %d   discharged %d   made %d" % [_total_recirculated, _total_extracted, _total_injected]) \
+		+ _row("policy", "discharge at %.0f MWd/kgHM (G/H)   or %d passes (O/P)%s"
+			% [_discharge_burnup, _max_passes, policy_note]) \
 		+ _section("SPENT FUEL OUT") \
 		+ outflow \
 		+ _section("DESIGN & CONTROLS") \
@@ -1643,9 +1843,13 @@ func _update_inspector() -> void:
 	# sees, not a separate bookkeeping number that could drift from it.
 	var hm: float = p.u235 + p.u238 + p.pu239
 	var fissile: float = (p.u235 + p.pu239) / hm if hm > 0.0 else 0.0
-	var passes := "%d / %d" % [p.pass_count, Depletion.MAX_PASSES]
+	# The LIVE policy, not the Depletion constants: these three rows answer "what happens
+	# to THIS pebble", so they must be judged by the rule the sorter will actually apply.
+	# The verdict goes through _is_spent — the sorter's own predicate — so the panel cannot
+	# tell the player a pebble is live while the sorter discharges it.
+	var passes := "%d / %d" % [p.pass_count, _max_passes]
 	var spent_note := ""
-	if p.burnup >= Depletion.DISCHARGE_BURNUP or p.pass_count >= Depletion.MAX_PASSES:
+	if _is_spent(p):
 		spent_note = "  [color=#ff7043](spent)[/color]"
 
 	_inspector.text = _section("INSPECTOR") \
@@ -1660,7 +1864,7 @@ func _update_inspector() -> void:
 		+ _row("Pu-239", "%.4f" % p.pu239) \
 		+ _row("poison", "%.5f   Xe-135 %.2f ×1e-5" % [p.poison, p.xe135 * 1e5]) \
 		+ _section("LIFE") \
-		+ _row("burnup", "%.1f / %.0f MWd/kgHM" % [p.burnup, Depletion.DISCHARGE_BURNUP]) \
+		+ _row("burnup", "%.1f / %.0f MWd/kgHM" % [p.burnup, _discharge_burnup]) \
 		+ _row("passes", passes) \
 		+ _row("temperature", "%.0f K" % p.temperature) \
 		+ _row("local flux", "%.3f" % p.local_flux)

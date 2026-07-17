@@ -12,11 +12,20 @@
 # hypothetical: the pool sits at x ≈ 418..533, y ≈ 968..1017, and the neutronics grid
 # spans x ∈ [424, 1036], y ∈ [-16, 1072] (Grid.for_silo). So a pool slot lands in a
 # VALID grid cell, not outside the grid — cell_of() returns a real index there. If a
-# settled pebble ever got a physics body, homogenize() would read it through
-# positions() and blend the spent pool into the flux solve as core fuel, quietly
-# shifting k. The test asserts the hazard is real (the slots ARE in-grid) and that the
-# pool is nonetheless invisible to the physics — otherwise the guard is untestable and
-# the next person "optimizes" the bodiless pile into real bodies.
+# settled pebble reached homogenize(), the spent pool would blend into the flux solve as
+# core fuel, quietly shifting k. The test asserts the hazard is real (the slots ARE
+# in-grid) and that the pool is nonetheless absent from the flux solve's input —
+# otherwise the guard is untestable.
+#
+# WHAT THIS TEST IS CAREFUL *NOT* TO FORBID. The guard is "the pool is not fuel", which
+# is a claim about the NEUTRONICS. It is not "the pool has no physics bodies" — that was
+# only the mechanism that enforced it while the pool was static art, and this test used
+# to assert the mechanism, which quietly made it a veto on giving pool pebbles bodies at
+# all. They now need bodies: pebbles must collide under the same rules everywhere in the
+# sim, and a pebble must be re-injectable out of the pool. So check 4 reads the flux
+# solve's real input (main._core_positions()) rather than the body list. Membership in
+# the bed is DECLARED (main._out_of_core), never inferred from whether the engine happens
+# to be holding a body — see the rationale on main._core_positions().
 #
 # FAILURE 2 — the pool perturbs the fuel cycle's arithmetic. Catching a Pebble on its
 # way out must not change what leaving MEANS: discharge is still the only thing that
@@ -84,8 +93,26 @@ func _process(delta: float) -> bool:
 		"pool slots sit in VALID grid cells (%d/%d) — a body here WOULD become fuel"
 			% [in_grid, cap])
 
-	# 4. ...and yet nothing physical is there. No body may sit on a pool slot.
-	var positions: Dictionary = _main._physics.positions()
+	# 4. ...and yet nothing in the pool reaches the NEUTRONICS. Note what this asserts and
+	#    what it deliberately does NOT: it checks the flux solve's actual input
+	#    (_core_positions() — the dictionary handed to grid.homogenize), not the physics
+	#    backend's body list.
+	#
+	#    This check used to read _physics.positions() and assert "no body sits in a pool
+	#    slot". That guarded the right hazard through the wrong mechanism. The invariant
+	#    that matters is "the pool is not fuel" — a NEUTRONICS claim. "No body exists
+	#    there" was merely the way it happened to be enforced, back when the pool was
+	#    static art. Asserting the mechanism instead of the invariant made this test a
+	#    veto on ever giving pool pebbles bodies, which is now a requirement (they must
+	#    collide and be re-injectable). So the check now names the boundary it always
+	#    meant: bodies anywhere are fine; reaching homogenize() is not.
+	#
+	#    This is strictly STRONGER, not a loosening, and the swap was made at the one
+	#    moment that is provable: when it landed, the pool had no bodies at all, so the
+	#    old form and this one were both green — the invariant is a superset of the
+	#    mechanism it replaced. A body in the pool now fails this check if and only if it
+	#    is also fuel, which is the actual bug.
+	var positions: Dictionary = _main._core_positions()
 	var intruders := 0
 	for id in positions:
 		var p: Vector2 = positions[id]
@@ -94,7 +121,39 @@ func _process(delta: float) -> bool:
 				intruders += 1
 				break
 	_ok(intruders == 0,
-		"no physics body sits in the pool (%d intruders) — it cannot reach the flux" % intruders)
+		"nothing in the pool reaches the flux solve (%d intruders in homogenize input)"
+			% intruders)
+
+	# 4b. GUARD THE GUARD. Check 4 above passes right now for a reason that has nothing to
+	#     do with the filter: there are no bodies in the pool AT ALL yet, so an unfiltered
+	#     read would pass it too. Green there proves nothing until pool pebbles are bodied.
+	#     So force the situation the filter exists for — park a real body on a pool slot,
+	#     declared out-of-core — and prove the boundary discriminates rather than trusting
+	#     that it will when it finally matters.
+	#
+	#     This is also the clearest statement of what the swap bought: at this instant the
+	#     OLD assertion ("no body sits in the pool") FAILS and the new one PASSES. A body
+	#     is present; it is simply not fuel. That gap is exactly the freedom Phase 3 needs.
+	var ghost_id := 999001
+	_main._physics.spawn_pebble(ghost_id, FuelLoop.pool_slot(0), FuelLoop.PEBBLE_R)
+	_main._out_of_core[ghost_id] = true
+	var raw: Dictionary = _main._physics.positions()
+	var filtered: Dictionary = _main._core_positions()
+	# The hazard is LIVE: the engine really is holding a body on a pool slot...
+	_ok(raw.has(ghost_id),
+		"a body parked on a pool slot IS visible to the physics — the guard has something to catch")
+	# ...and the coupling boundary refuses it anyway. This is the check that can fail.
+	_ok(not filtered.has(ghost_id),
+		"a bodied, out-of-core pebble is EXCLUDED from the flux solve's input")
+	# And it removes ONLY that one — the filter must not be over-eager and quietly drop
+	# real bed pebbles out of the solve, which would shift k in the opposite direction
+	# and is just as silent. Exactly one body is out-of-core (the ghost), because every
+	# other out-of-core pebble is riding the machine with no body at all.
+	_ok(filtered.size() == raw.size() - 1,
+		"the filter removes ONLY the ghost (%d -> %d) — no bed pebble is dropped"
+			% [raw.size(), filtered.size()])
+	_main._physics.remove_pebble(ghost_id)
+	_main._out_of_core.erase(ghost_id)
 
 	# 5. A settled pebble is out of the inventory entirely: no body, no rider, no slot.
 	var still_held := 0
