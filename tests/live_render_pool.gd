@@ -67,7 +67,11 @@ func _process(delta: float) -> bool:
 			dummy.temperature = 400.0 + 1000.0 * f
 			dummy.xe135 = 6.0e-5 * f
 			# (decay_e is the reservoir ARRAY, not a scalar — left at its default.)
-			_main._spent.push_back(dummy)
+			# Through the real push site, not straight onto `_spent`: it enforces the cap,
+			# so this lands on EXACTLY a full tray (the real arrivals cask out ahead of the
+			# dummies) instead of overflowing it and drawing pebbles past the last row —
+			# which would make the shot judge a layout the game cannot produce.
+			_main._pool_push(dummy)
 		_main._refresh_pool()
 		return false
 

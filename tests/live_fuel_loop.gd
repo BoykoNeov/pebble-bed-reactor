@@ -29,22 +29,22 @@
 #     legitimately outgrows target + buffer by the pool size — and this check failed on a
 #     sim that had lost nothing at all (432 = 428 circulating + 4 pooled).
 #
-#     The accounting claim survives that move intact, because `_mint_pebble` is the only
-#     writer that adds to `_pebbles` and nothing ever erases from it: EVERY pebble ever
-#     made is still in the registry. So assert `_total_injected == _pebbles.size()` —
-#     which keeps the original teeth (a leaked or stuck rider makes the registry smaller
-#     than the mint count; a duplicate makes it larger) and is the literal restatement of
-#     this invariant's own description.
+#     The accounting claim survives that move intact. `_mint_pebble` is the only writer
+#     that ADDS to `_pebbles`, and `_ship_to_cask` the only one that removes, so every
+#     pebble ever made is either still in the registry or provably casked:
+#     `_total_injected == _pebbles.size() + _total_shipped`. That keeps the original teeth
+#     (a leaked or stuck rider makes the left side exceed the right; a duplicate makes it
+#     fall short) and is the literal restatement of this invariant's own description.
 #
 #     Deliberately NOT re-pointed at `_inventory() == target + buffer`: the t=35 block
 #     already checks precisely that, so this would have become a redundant second copy of
 #     invariant 1 wearing invariant 3's name — passing while testing nothing.
 #
-#     PHASE 2b WILL BREAK THIS IDENTITY, LEGITIMATELY. It holds only because nothing is
-#     ever removed from `_pebbles`. The moment the pool cap ships its oldest pebble to a
-#     cask, the registry drops below the mint count by the shipped count and this fails —
-#     expected, not a mystery regression. It becomes `_total_injected == _pebbles.size()
-#     + _total_shipped`.
+#     RE-INJECTION LEAVES THIS UNTOUCHED, which is worth stating because it looks like it
+#     should not. Sending a pooled pebble back is not a mint (`_total_injected` does not
+#     move) and it never leaves the registry (`_pebbles.size()` does not move) — it only
+#     changes which internal list holds it. So this identity is blind to it by design,
+#     and `_inventory()` is the number that reacts. See `main._reinject`.
 #  4. Both legs of the sorter run: pebbles recirculate, and spent ones discharge and
 #     are replaced 1:1 by fresh fuel.
 #  5. Riders stay FROZEN while in transit — a pebble in the pipe is out of the flux,
@@ -168,14 +168,15 @@ func _process(delta: float) -> bool:
 		_check(_main._total_recirculated > 0, "pebbles recirculate for another pass")
 		_check(_min_core_after_fill == _main.TARGET_POPULATION,
 			"bed NEVER ran short while pebbles rode (min core %d)" % _min_core_after_fill)
-		# Nothing erases from `_pebbles` and `_mint_pebble` is its only writer, so the mint
-		# count and the registry must agree exactly — see invariant 3 in the header for why
-		# this is the accounting claim and `_inventory()` is not. The pool is included here
-		# ON PURPOSE: a discharged pebble is still a pebble that was made, and it is still
-		# accounted for. Where it was is invariant 1's business, not this check's.
-		_check(_main._total_injected == _main._pebbles.size(),
-			"every pebble ever made is still accounted for — none leaked or duplicated (made %d, registry %d)"
-				% [_main._total_injected, _main._pebbles.size()])
+		# `_mint_pebble` is the only writer that ADDS to `_pebbles` and `_ship_to_cask` the
+		# only one that removes, so the mint count must equal the registry plus whatever has
+		# left for a cask — see invariant 3 in the header for why this is the accounting
+		# claim and `_inventory()` is not. The pool is included here ON PURPOSE: a
+		# discharged pebble is still a pebble that was made, and it is still accounted for.
+		# Where it sits is invariant 1's business, not this check's.
+		_check(_main._total_injected == _main._pebbles.size() + _main._total_shipped,
+			"every pebble ever made is still accounted for — none leaked or duplicated (made %d, registry %d + casked %d)"
+				% [_main._total_injected, _main._pebbles.size(), _main._total_shipped])
 		# ...and the CIRCULATING side is still on its calibrated sum despite the pool having
 		# filled. This is not the t=35 check moved later: at t=35 nothing had discharged yet,
 		# so the pool was empty and `_inventory()` could not tell a pool-subtracting gate

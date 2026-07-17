@@ -51,32 +51,45 @@ func _process(delta: float) -> bool:
 	_ok(_main._selected_pos().distance_to(bed_at) < 1.0,
 		"the selection ring resolves to the pebble's live position")
 
-	# --- The spent pool: the window-offset trap ---
+	# --- The spent pool: clicking a slot must select the pebble drawn in it ---
 	#
-	# Overfill the pool FIRST. Real discharge runs ~1 per 16 s, so by now only a handful
-	# have settled — fewer than the cap — which makes `from` zero and every check below
-	# vacuous: slot i would map to _spent[i] whether or not the window offset exists at
-	# all. Forcing _spent past capacity is what gives the offset a value to get wrong.
+	# THIS USED TO BE "the window-offset trap", and the rewrite is the point. The pool is
+	# now CAPPED at what the tray draws (main._pool_push), so the window it guarded cannot
+	# arise: `from = maxi(0, _spent.size() - cap)` is identically zero once the cap holds,
+	# and slot i IS _spent[i]. The old test manufactured `from > 0` by pushing dummies
+	# straight onto `_spent`, BYPASSING the cap — so keeping it would mean asserting an
+	# offset that only exists when the test itself breaks the invariant. That is guarding
+	# the MECHANISM instead of the claim, the same trap live_spent_pool and live_fuel_loop
+	# each had to be re-pointed out of.
+	#
+	# The HAZARD is unchanged and still guarded: a click must select the pebble the player
+	# sees at that pixel. Both ends of the tray are checked, because an off-by-one that
+	# happens to work at one end will not work at both.
 	var cap := FuelLoop.pool_capacity()
+	# Fill THROUGH the real push site, and overfill it: the cap is what makes the offset
+	# vanish, so it has to be exercised here rather than assumed. Pushing past the tray is
+	# now a test of the cap, not a way to sneak past it.
 	for i in cap + 4:
 		var dummy := Pebble.new(800000 + i, _main.PEBBLE_RADIUS)
 		dummy.burnup = Depletion.DISCHARGE_BURNUP
-		_main._spent.push_back(dummy)
+		_main._pool_push(dummy)
 	_main._refresh_pool()
+	_ok(_main._spent.size() == cap,
+		"the pool is capped at the tray, so every pooled pebble is on screen (%d == %d)"
+			% [_main._spent.size(), cap])
 	var shown: int = _main._loop._pool_tints.size()
+	_ok(shown == _main._spent.size(),
+		"the tray draws the WHOLE pool — no pebble is retained but unreachable (%d drawn, %d held)"
+			% [shown, _main._spent.size()])
 	if shown > 0:
-		var from: int = maxi(0, _main._spent.size() - cap)
-		_ok(from > 0, "the pool window has a real offset to get wrong (from = %d)" % from)
-		# Newest slot AND oldest shown slot: an off-by-one that happens to work at one
-		# end of the window will not work at both.
 		var newest_slot := shown - 1
 		_main._pick_at(FuelLoop.pool_slot(newest_slot))
-		_ok(_main._selected == _main._spent[from + newest_slot],
+		_ok(_main._selected == _main._spent[newest_slot],
 			"clicking the pool's newest slot selects the newest settled pebble")
 		_ok(_main._selected_where == "spent pool", "...and reports the pool (%s)" % _main._selected_where)
 		_main._pick_at(FuelLoop.pool_slot(0))
-		_ok(_main._selected == _main._spent[from],
-			"clicking the pool's first slot selects the window's first pebble, not _spent[0]")
+		_ok(_main._selected == _main._spent[0],
+			"clicking the pool's first slot selects the oldest settled pebble")
 		_ok(_main._selected_pos().distance_to(FuelLoop.pool_slot(0)) < 1.0,
 			"a settled pebble's ring lands on its slot")
 	else:

@@ -414,6 +414,10 @@ var _last_out_fissile := 0.0
 
 # Readouts
 var _total_injected := 0
+# Pebbles shipped from the full pool to a cask — gone from the sim for good. Counted, not
+# silent: a capped view that quietly drops things reads as a stalled discharge leg, and
+# the player must be able to tell "the tray is full" from "the plant stopped".
+var _total_shipped := 0
 var _total_extracted := 0
 var _readout: RichTextLabel
 
@@ -665,7 +669,7 @@ func _physics_process(delta: float) -> void:
 			# Parking in the pool does not put it back in the bed, and leaving that one flag
 			# alone is what keeps it out of the flux solve, the depletion walk and the
 			# thermal walk with no changes to any of them.
-			_spent.push_back(_pebbles[aid])
+			_pool_push(_pebbles[aid])
 			_total_extracted += 1
 		else:
 			# Recirculated or fresh: stage at the top for the next free bed slot.
@@ -732,6 +736,57 @@ func _core_count() -> int:
 ## that wrong is to keep a hand-maintained counter, which is exactly what this avoids.
 func _inventory() -> int:
 	return _pebbles.size() - _spent.size()
+
+
+## Park a discharged pebble in the pool, shipping the oldest to a cask if the tray is
+## full. THE ONLY place anything is pushed onto `_spent`, which is what makes
+## "`_spent.size()` never exceeds the tray" an INVARIANT rather than a hope — and that
+## invariant is load-bearing well beyond tidiness (see `_refresh_pool`).
+##
+## WHY THE POOL IS CAPPED AT WHAT THE TRAY CAN DRAW, and why that is not an arbitrary
+## number. The pool exists to be REACHED: the player clicks a spent pebble to inspect it,
+## edit it and send it back. Reachable means drawn — a pebble with no slot has no pixels
+## to click. So a cap larger than the tray would manufacture inventory the player cannot
+## touch, which serves nothing and quietly contradicts the feature's whole premise. The
+## cap therefore IS the displayable count, and it reads that count from the tray rather
+## than restating it: a second constant that "must agree" with `pool_capacity()` is the
+## drift bug this project keeps paying for (commit 7b0be70). Shrink the tray and the pool
+## ships sooner — the correct semantics, not a leak, because a smaller tray really can
+## hold fewer.
+##
+## Before this cap, `_spent` grew WITHOUT BOUND: nothing was ever discarded, and the tray
+## silently showed a rolling window of the newest arrivals while everything older became
+## unreachable-but-retained. Phase 2a made that worse by moving the pool inside
+## `_pebbles`, where five per-frame walks would carry it forever. Shipping is the honest
+## end of the fuel cycle and it is the answer to "what happens when the pool fills":
+## the OLDEST goes to a cask, and what remains is exactly what you can see.
+func _pool_push(peb: Pebble) -> void:
+	_spent.push_back(peb)
+	while _spent.size() > FuelLoop.pool_capacity():
+		_ship_to_cask()
+
+
+## Send the oldest pooled pebble away for good — it leaves the plant entirely.
+##
+## The three removals are ONE operation and must stay together. Dropping the
+## `_out_of_core` erase would leave a flag with no pebble behind it, and `_core_count()`
+## (`_pebbles.size() - _out_of_core.size()`) would drift DOWN by one per shipment —
+## a phantom bed shortfall that walks k off calibration with nothing on screen to show
+## it. That is the same pairing discipline the transport bodies will need in Phase 3.
+##
+## Shipping is INVENTORY-NEUTRAL and deliberately so: `_pebbles` and `_spent` each lose
+## the same pebble, so `_inventory()` does not move and the mint gate does not react. It
+## should not — the fresh-fuel slot was already opened when this pebble first discharged
+## into the pool. Freeing it again here would mint a second replacement for one pebble.
+func _ship_to_cask() -> void:
+	var peb: Pebble = _spent.pop_front()
+	# The inspector may be holding the very pebble leaving. Clear it rather than let the
+	# selection dangle on a pebble that no longer exists anywhere in the sim.
+	if _selected == peb:
+		_select(null, "")
+	_pebbles.erase(peb.id)
+	_out_of_core.erase(peb.id)
+	_total_shipped += 1
 
 
 ## The BED's positions — every pebble the neutronics is allowed to see.
@@ -1345,16 +1400,22 @@ func _pebble_tint(peb: Pebble) -> Color:
 ## settled ones drain. That is the "inspect the composition of outflowing pebbles"
 ## goal (CLAUDE.md) finally having something to inspect.
 ##
-## Shows the NEWEST arrivals, because the tray holds fewer than a campaign discharges
-## (see FuelLoop's pool comment) and a frozen pile would read as stalled discharge.
-## The true total goes with them so the cap is stated, not hidden.
+## Shows the WHOLE pool, because `_pool_push` caps it at what the tray can draw. The
+## running totals go with it so the cap is stated, not hidden.
+##
+## THIS USED TO BE A WINDOW — `from = maxi(0, _spent.size() - cap)` — and the window is
+## gone rather than centralized. `_pick_at` and `_selected_pos` each recomputed that
+## offset independently, so three copies of one piece of arithmetic had to agree or a
+## click would select the wrong pebble; the fix looks like "share a helper", but with the
+## cap enforced at the single push site `from` is identically zero at every one of those
+## sites. There is no window to get wrong, so slot i IS `_spent[i]` — the bug class stops
+## existing instead of being supervised. Every pebble in the pool is now on screen and
+## clickable, which is exactly what re-injection needs.
 func _refresh_pool() -> void:
-	var cap := FuelLoop.pool_capacity()
-	var from: int = maxi(0, _spent.size() - cap)
 	var tints := PackedColorArray()
-	for i in range(from, _spent.size()):
-		tints.append(_pebble_tint(_spent[i]))
-	_loop.set_pool(tints, _spent.size())
+	for peb in _spent:
+		tints.append(_pebble_tint(peb))
+	_loop.set_pool(tints, _total_extracted, _total_shipped)
 
 
 ## Select whatever pebble is under `at`, or clear the selection if that is nothing.
@@ -1366,11 +1427,18 @@ func _refresh_pool() -> void:
 func _pick_at(at: Vector2) -> void:
 	var pi := _loop.pool_index_at(at)
 	if pi != -1:
-		# The pool shows a WINDOW of the newest arrivals; map the slot back through the
-		# same offset _refresh_pool draws with, or the click lands on the wrong pebble.
-		var from: int = maxi(0, _spent.size() - FuelLoop.pool_capacity())
-		_select(_spent[from + pi], "spent pool")
-		return
+		# Slot i is `_spent[i]` outright — the tray holds the whole pool, so there is no
+		# window offset to map back through (see `_refresh_pool`).
+		#
+		# Bounds-checked because the tray is a pure CONSUMER of the pool and may lag it:
+		# `pool_index_at` answers from the tint array, which is refreshed on the sim's
+		# clock, while `_spent` can shrink underneath it the moment a pebble ships to a
+		# cask or is re-injected. A stale tint array would index off the end of a pool
+		# that just got shorter — the view lagging is harmless by design (CLAUDE.md), so
+		# it must not be able to crash the picker.
+		if pi < _spent.size():
+			_select(_spent[pi], "spent pool")
+			return
 
 	var rid := _loop.rider_at(at)
 	if rid != -1:
@@ -1411,8 +1479,10 @@ func _selected_pos() -> Vector2:
 		return Vector2.INF
 	var idx := _spent.find(_selected)
 	if idx != -1:
-		var from: int = maxi(0, _spent.size() - FuelLoop.pool_capacity())
-		return FuelLoop.pool_slot(idx - from) if idx >= from else Vector2.INF
+		# Slot i is `_spent[i]`, so the pool index IS the slot index — no window offset,
+		# and no "selected but scrolled out of view" case to return INF for: the cap means
+		# everything in the pool has a slot. See `_refresh_pool`.
+		return FuelLoop.pool_slot(idx)
 	var rp := _loop.rider_position(_selected.id)
 	if rp != Vector2.INF:
 		return rp

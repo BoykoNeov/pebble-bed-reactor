@@ -254,10 +254,26 @@ func _phase_wave() -> void:
 	_ok(wave_share < 0.15,
 		"...and at the floored policy that flips to mostly DISCHARGE (%.0f%% recirculated of %d) — the knob decides, not the clock"
 			% [wave_share * 100.0, wave_total])
-	# Every discharged pebble landed in the pool: the wave must not drop fuel on the floor.
-	_ok(_main._spent.size() == _main._total_extracted,
-		"every pebble the wave discharged is accounted for in the pool (%d == %d)"
-			% [_main._spent.size(), _main._total_extracted])
+	# Every discharged pebble is accounted for: the wave must not drop fuel on the floor.
+	#
+	# The pool is CAPPED at the tray, and this wave discharges far more than a tray holds,
+	# so `_spent.size() == _total_extracted` (what this asserted before the cap) is now
+	# false for an entirely correct reason — the surplus went to a cask, which is where a
+	# full pool is supposed to send it. Add the shipped term rather than weaken the claim:
+	# every discharged pebble is either still in the tray or provably casked, and any that
+	# went missing shows up here as a shortfall exactly as it would have before.
+	_ok(_main._spent.size() + _main._total_shipped == _main._total_extracted,
+		"every pebble the wave discharged is accounted for — held or casked (%d + %d == %d)"
+			% [_main._spent.size(), _main._total_shipped, _main._total_extracted])
+	# ...and the cap really is holding. Without this the check above would still pass if
+	# the tray grew without bound (shipped would just stay 0), which is the state the cap
+	# exists to prevent — and the one that made the pool's older half unreachable.
+	_ok(_main._spent.size() <= FuelLoop.pool_capacity(),
+		"the pool never outgrows its tray (%d <= %d)"
+			% [_main._spent.size(), FuelLoop.pool_capacity()])
+	_ok(_main._total_shipped > 0,
+		"...and this wave really did overflow it, so the cask path is exercised (%d shipped)"
+			% _main._total_shipped)
 	# The bed stays pinned at its calibrated population THROUGH the wave — fresh fuel
 	# replaces the discharged 1:1. A wave that drained the bed would walk k off calibration
 	# for reasons that have nothing to do with the policy (the LOOP_BUFFER hazard).

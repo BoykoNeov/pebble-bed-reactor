@@ -227,33 +227,49 @@ func _process(delta: float) -> bool:
 	#    which makes `_inventory()` under-count by cap+3 (it subtracts the whole pool). That
 	#    is harmless only because the test quits a few lines below, before the mint gate
 	#    reads it again — so any new check that needs a coherent inventory goes ABOVE here.
-	var before := spent.size()
+	# Everything ever pushed at the pool, oldest first — the real arrivals that settled
+	# during the run, then the dummies. `_spent` must end up holding the LAST `cap` of it.
+	var pushed: Array = spent.duplicate()
 	for i in cap + 3:
 		var dummy := Pebble.new(900000 + i, _main.PEBBLE_RADIUS)
 		# Spread across the field's range so neighbours get DISTINGUISHABLE colors — two
-		# pebbles that happen to share a color would make the window check vacuous again.
+		# pebbles that happen to share a color would make the order checks vacuous again.
 		dummy.burnup = Depletion.DISCHARGE_BURNUP * float(i) / float(cap + 3)
 		dummy.temperature = 400.0 + 40.0 * float(i)
 		dummy.xe135 = 1.0e-6 * float(i)
-		spent.push_back(dummy)
+		pushed.append(dummy)
+		# THROUGH the real push site. This block used to push straight onto `_spent` and
+		# assert the tray WINDOWED it down to capacity; the pool is capped now, so the
+		# overflow is dropped at the push instead of hidden at the draw, and bypassing
+		# `_pool_push` would be testing a state the fuel cycle can no longer reach.
+		_main._pool_push(dummy)
 	_main._refresh_pool()
-	_ok(_main._loop._pool_tints.size() == cap,
-		"an overfull pool still shows exactly its capacity (%d)" % _main._loop._pool_tints.size())
-	_ok(_main._loop._pool_total == before + cap + 3,
-		"an overfull pool still reports the true total (%d)" % _main._loop._pool_total)
-	# Guard the guard: if every slot were the same color the two checks below would pass
-	# no matter which window the pool kept. Prove the colors actually discriminate first.
+
+	# The cap holds, and the tray shows the pool WHOLE — no retained-but-unreachable tail.
+	_ok(spent.size() == cap,
+		"an overfull pool trims to exactly its capacity (%d)" % spent.size())
+	_ok(_main._loop._pool_tints.size() == spent.size(),
+		"...and every pebble it kept is drawn (%d shown, %d held)"
+			% [_main._loop._pool_tints.size(), spent.size()])
+	# The overflow is CASKED, not vanished — the count the caption states.
+	_ok(_main._total_shipped == pushed.size() - cap,
+		"the overflow went to a cask rather than the floor (%d shipped of %d pushed, cap %d)"
+			% [_main._total_shipped, pushed.size(), cap])
+
+	# Guard the guard: if every slot were the same color the order checks below would pass
+	# no matter which pebbles the pool kept. Prove the colors actually discriminate first.
 	var distinct := {}
 	for c in _main._loop._pool_tints:
 		distinct[c] = true
 	_ok(distinct.size() > 1,
 		"pool colors discriminate between pebbles (%d distinct) — the checks below can bite"
 			% distinct.size())
-	# The last slot must be the last pebble that arrived — i.e. the window is the NEWEST.
-	_ok(_main._loop._pool_tints[cap - 1] == _main._pebble_tint(spent[spent.size() - 1]),
-		"the pool keeps the NEWEST arrivals, not the oldest")
-	_ok(_main._loop._pool_tints[0] == _main._pebble_tint(spent[spent.size() - cap]),
-		"the pool's window STARTS at the newest-minus-capacity arrival")
+	# It keeps the NEWEST, and it keeps them IN ORDER. Checked at both ends: an off-by-one
+	# that works at one end will not work at both.
+	_ok(_main._loop._pool_tints[cap - 1] == _main._pebble_tint(pushed[pushed.size() - 1]),
+		"the pool keeps the NEWEST arrival in its last slot")
+	_ok(_main._loop._pool_tints[0] == _main._pebble_tint(pushed[pushed.size() - cap]),
+		"...and its first slot is the newest-minus-capacity arrival — the oldest SURVIVOR")
 
 	print("ALL CHECKS PASSED" if _failures == 0 else "%d CHECK(S) FAILED" % _failures)
 	quit(1 if _failures > 0 else 0)

@@ -113,7 +113,8 @@ var _riders: Array = []
 # owner of every Pebble (see the class comment). Keeping only colors here is what
 # lets the pool render without FuelLoop knowing what a Pebble is.
 var _pool_tints := PackedColorArray()
-var _pool_total := 0   # every pebble ever discharged, including those past the cap
+var _pool_total := 0     # every pebble ever discharged, including those since shipped
+var _pool_shipped := 0   # of those, the ones the full pool sent to a cask
 
 
 ## Where the i-th settled pebble sits, filling the tray bottom row first, left to
@@ -128,11 +129,14 @@ static func pool_slot(i: int) -> Vector2:
 		POOL_FLOOR - POOL_PITCH * (float(row) + 0.5))
 
 
-## Hand the pool the colors of the settled pebbles it should show (oldest first,
-## already trimmed to POOL_CAP by main) and the true running total.
-func set_pool(tints: PackedColorArray, total: int) -> void:
+## Hand the pool the colors of the settled pebbles it should show (oldest first — main
+## caps `_spent` at POOL_CAP, so this is the WHOLE pool, not a window), the running
+## count of everything ever discharged, and how many of those have since been shipped
+## to a cask. The last two are what keep a capped tray honest.
+func set_pool(tints: PackedColorArray, total: int, shipped: int) -> void:
 	_pool_tints = tints
 	_pool_total = total
+	_pool_shipped = shipped
 	queue_redraw()
 
 
@@ -387,10 +391,12 @@ func _draw_plant() -> void:
 		draw_circle(at, PEBBLE_R, _pool_tints[i])
 		draw_arc(at, PEBBLE_R, 0.0, TAU, 12, POOL_EDGE, 1.0)
 	# Name the pool and state the true total, so a full tray cannot be misread as a
-	# stalled one. The count is the honest part of a capped view.
+	# stalled one. The count is the honest part of a capped view: the tray stops growing
+	# at POOL_CAP, and without the shipped count on screen that would read as "the
+	# discharge leg died" rather than "the pool is full and casking the oldest".
 	var caption := "SPENT %d" % _pool_total
-	if _pool_total > POOL_CAP:
-		caption += "  (newest %d)" % POOL_CAP
+	if _pool_shipped > 0:
+		caption += "  (%d held, %d to cask)" % [_pool_tints.size(), _pool_shipped]
 	_label(caption, Vector2(POOL_LEFT + 2.0, POOL_FLOOR - POOL_H - 6.0))
 
 	# Fresh-fuel hopper — drawn as a funnel feeding the chute.
