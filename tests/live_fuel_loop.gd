@@ -88,7 +88,14 @@ func _process(delta: float) -> bool:
 	# time to fill (380 pebbles at 3 per 0.12 s ≈ 16 s, plus settling).
 	if _t > 30.0:
 		_min_core_after_fill = mini(_min_core_after_fill, _main._core_count())
-	_max_riders = maxi(_max_riders, _main._loop.count())
+	# EVERY pebble in flight, not every RIDER. These were the same number until Phase 3b-i
+	# put the discharge leg on a belt, and the difference is exactly the trap this suite has
+	# now walked into twice: LOOP_BUFFER exists to cover pebbles that are out of the bed and
+	# on their way back, and HOW they travel — drawn along a polyline or shoved down a pipe
+	# by a belt — is a mechanism, not the invariant. `_loop.count()` alone would quietly stop
+	# counting a whole leg, and the gate below would go on passing while measuring less and
+	# less of what it is guarding. Count what is out of the bed, however it is getting there.
+	_max_riders = maxi(_max_riders, _main._loop.count() + _main._transit.size())
 
 	# Catch a HOT rider mid-ride and remember its state, to prove it is frozen in transit.
 	# WHY the temperature floor is load-bearing: `_out_of_core` covers BOTH riders and the

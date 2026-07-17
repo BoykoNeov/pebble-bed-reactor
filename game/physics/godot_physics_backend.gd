@@ -56,6 +56,19 @@ func positions() -> Dictionary:
 	return out
 
 
+func get_velocity(id: int) -> Vector2:
+	var body: PebbleBody = _bodies.get(id)
+	return body.linear_velocity if body != null else Vector2.ZERO
+
+
+func apply_force(id: int, force: Vector2) -> void:
+	var body: PebbleBody = _bodies.get(id)
+	if body != null:
+		# Central, not at an offset: a belt under a round pebble drives it along, and
+		# torquing it would be inventing a spin the contact does not imply.
+		body.apply_central_force(force)
+
+
 func set_pebble_tint(id: int, color: Color) -> void:
 	var body: PebbleBody = _bodies.get(id)
 	if body != null:

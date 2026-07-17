@@ -60,12 +60,21 @@ extends SceneTree
 # the pool has settled pebbles to inspect by then. Give it margin.
 const ASSERT_AT := 80.0
 const GIVE_UP_AT := 200.0
-# Overfill pacing. DROP_EVERY must leave a pebble time to fall out of the pipe and come
-# to rest before the next lands on it; SETTLE lets the last few stop rolling before the
-# tray is measured. Both were read off the fill measurement that set POOL_CAP — at a
-# shorter settle the pile is still moving and the fit check reads pebbles mid-roll.
+# Overfill pacing. DROP_EVERY spaces the pushes; SETTLE lets the pile stop rolling before
+# the tray is measured — at a shorter settle the fit check reads pebbles mid-roll.
+#
+# DROP_EVERY no longer has to protect anything, and that is worth knowing before someone
+# "optimizes" it. It used to be the thing standing between this test and a pile spawned
+# inside itself, because `_pool_push` materialized a body in the mouth on demand and pushing
+# two in one frame put two bodies in one place. The pebbles now enter a real pipe through
+# `_drop_pending`, and the PLANT meters them (`main._feed_drop` will not open the mouth
+# while a pebble is still in it). So the pacing is legibility, not a guard — the guard moved
+# into the thing being tested, which is where it belongs.
 const DROP_EVERY := 1.1
-const SETTLE := 3.0
+# Generous because a push is no longer an arrival: the last dummy still has a ~2.7 s ride
+# ahead of it. The phase only starts once the pipe is empty (see `_overfill_tick`), so this
+# is settling time on top of the ride rather than a bet on how long the ride takes.
+const SETTLE := 6.0
 
 var _main
 var _t := 0.0
@@ -93,6 +102,11 @@ func _ok(pass_: bool, msg: String) -> void:
 func _process(delta: float) -> bool:
 	_t += delta
 	_peak_spent = maxi(_peak_spent, _main._spent.size())
+	# EVERY FRAME, not once per drip tick. `_pushed` has to be ARRIVAL order (see
+	# `_sync_pushed`), and since Phase 3b-i an arrival is a pebble finishing a ~2.7 s ride
+	# rather than something this test causes — so the only way to observe the order is to
+	# look often enough that nothing can arrive and be casked between two looks.
+	_sync_pushed()
 
 	if _t > GIVE_UP_AT:
 		print("TIMED OUT before the pool filled (phase %d)" % _phase)
@@ -266,19 +280,22 @@ func _process(delta: float) -> bool:
 # in one frame they all spawn at the same pipe mouth, inside one another, and the solver
 # fires the pile across the screen. Dropped one at a time they do what the real plant does
 # — fall, roll, and settle — which is the only way the fit check below means anything.
-## Fold any REAL discharges into the push history.
+## The tray's ARRIVAL history, oldest first — every pebble ever admitted to the pool,
+## including the ones since casked. Read straight off `_spent`, which is FIFO, so this is
+## arrival order by construction.
 ##
-## The reactor does not stop while this test drip-feeds the tray: the overfill takes ~17 s
-## and the plant discharges roughly every 16 s, so about one genuine spent pebble lands in
-## the pool mid-fill. It is a real push and it ships a real pebble, so a history that only
-## knew about the dummies would under-count the casked total and slide the oldest-survivor
-## identity by one — which is exactly how this first failed. Not a flaw in the fill: it is
-## the plant doing its job, and the test has to account for it rather than pretend.
+## It covers real discharges as well as this test's dummies, and it must: the reactor does
+## not stop while the tray is filled, so a genuine spent pebble lands in the pool mid-fill.
+## It ships a real pebble, so a history that knew only the dummies would under-count the
+## casked total and slide the oldest-survivor identity by one — which is exactly how this
+## first failed. Not a flaw in the fill; it is the plant doing its job.
 ##
-## Order is preserved because `_spent` is FIFO and this runs BEFORE each dummy is pushed,
-## so a new arrival is appended ahead of the dummy that follows it. Safe against missing
-## one entirely: a pebble would have to be pushed AND casked out between two calls, which
-## needs 12 pushes (the cap) inside one 1.1 s tick when the plant produces one per 16 s.
+## SINCE PHASE 3b-i THIS IS THE ONLY WAY THE HISTORY IS BUILT, and the dummies are no longer
+## appended when they are pushed. A push is not an arrival any more: a dummy now enters a
+## real pipe and rides a belt for ~2.7 s before it lands, and a real discharge can beat it
+## there. Recording it at push time would assert an order the pool never had — the same
+## push-is-arrival assumption that only held while `_pool_push` put pebbles in the tray
+## instantly. Ask the tray what arrived, in the order it arrived; do not predict it.
 func _sync_pushed() -> void:
 	for peb in _main._spent:
 		if not _pushed.has(peb):
@@ -286,28 +303,54 @@ func _sync_pushed() -> void:
 
 
 func _overfill_tick() -> void:
-	_sync_pushed()
 	if _dummies >= FuelLoop.pool_capacity() + 3:
-		_phase = 2
-		_settle_until = _t + SETTLE
+		# Everything pushed must have LANDED before the tray is measured — the pipe is real
+		# now, so the last dummy is still riding it when the last push happens. Waiting on the
+		# plant's own queues (nothing waiting for the mouth, nothing left on the belt) rather
+		# than on a guessed duration is what stops this being a race that passes on a fast
+		# machine and flakes on a slow one.
+		if _main._drop_pending.is_empty() and _main._transit.is_empty():
+			_phase = 2
+			_settle_until = _t + SETTLE
 		return
 	var i := _dummies
 	_dummies += 1
 	var dummy := Pebble.new(900000 + i, _main.PEBBLE_RADIUS)
 	dummy.burnup = Depletion.DISCHARGE_BURNUP
 	dummy.temperature = 400.0 + 40.0 * float(i)
-	_pushed.append(dummy)
+	# NOT appended to `_pushed` here — see `_sync_pushed`. It is recorded when it ARRIVES,
+	# because that is when the pool has it and that is the order the pool is in.
 	# Registered like a real pebble, because `_pool_push` now gives it a BODY and declares
 	# it out of core. An unregistered dummy would leave `_out_of_core` holding an id with
 	# no pebble behind it and walk `_core_count()` down by one per dummy — the exact drift
 	# `_ship_to_cask`'s comment warns about. (It used to be safe to skip: no body, no flag,
 	# no drift, and the test quit before anything read the count.)
 	_main._pebbles[dummy.id] = dummy
-	# THROUGH the real push site. This block used to push straight onto `_spent` and assert
-	# the tray WINDOWED it down to capacity; the pool is capped now, so the overflow is
-	# dropped at the push instead of hidden at the draw, and bypassing `_pool_push` would
-	# be testing a state the fuel cycle can no longer reach.
-	_main._pool_push(dummy)
+	# THROUGH THE BELT — the pipe the plant actually discharges down (Phase 3b-i), entered at
+	# the same site `main._discharge` uses. The dummy is put in the queue for the pipe's
+	# mouth, `_feed_drop` lets it in when there is room, the belt drags it out to the pool,
+	# and it arrives by falling in like everything else.
+	#
+	# IT USED TO GO THROUGH `_pool_push`, WHICH MATERIALIZED IT IN THE MOUTH AT REST — and
+	# that quietly stopped being how spent fuel arrives. The two feeds do NOT build the same
+	# pile: dropped from a standstill at a fixed x, pebbles heap in a narrow tower directly
+	# under the mouth; delivered by the belt they arrive with ~95-150 px/s of travel and land
+	# spread across the floor. So the tray's capacity is different for the two, and this test
+	# was the one deciding POOL_CAP. Measured: the belt-fed pile of 8 sits with its apex
+	# 5 px clear of the rim, while the same 8 dropped at rest put one pebble UP IN THE
+	# CONVEYOR at y = 952. Left alone, this suite would have forced the cap down to satisfy a
+	# delivery nothing performs.
+	#
+	# That is this project's oldest failure wearing new clothes: a test asserting the
+	# MECHANISM it remembers rather than the INVARIANT it exists for. The invariant is "a
+	# full tray holds its pile"; `pool_drop` was only ever how we got one. Re-point, never
+	# loosen — the fix is to feed it the way the plant feeds it, not to lower the bar.
+	#
+	# The drip pacing below is now belt-limited rather than test-limited, and that is fine:
+	# the mouth guard meters arrivals to ~4.5/s no matter how fast this pushes, so the pile
+	# cannot spawn inside itself. That hazard is now the PLANT's to prevent, not the test's.
+	_main._out_of_core[dummy.id] = true
+	_main._drop_pending.push_back(dummy)
 
 
 func _final_checks() -> void:

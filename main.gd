@@ -188,14 +188,40 @@ const THERMAL_MW_SCALE := 0.035
 
 var _physics: PhysicsBackend
 var _pebbles: Dictionary = {}   # id -> Pebble (the FULL inventory: bed + machine)
-# The fuel-handling machine outside the vessel, and the two places a pebble can be
-# while it has no body. A pebble is in exactly one of three states: in the bed (has a
-# physics body), riding the machine, or staged in `_queue` at the top waiting for a
-# slot. `_out_of_core` is the id set for the latter two — main-side only, so Pebble
-# stays a pure sim struct with no notion of the game's fuel handling.
+# The fuel-handling machine outside the vessel, and the places a pebble can be when it is
+# not fuel in the bed. A pebble is in exactly one of six states: in the BED (a body the
+# neutronics sees); RIDING the machine (no body — the plant draws it along a path); STAGED
+# in `_queue` at the top waiting for a slot (no body, nothing draws it); PENDING at the
+# discharge pipe's mouth waiting for room (no body, likewise); settled in the spent POOL (a
+# body, in a real tray); or in TRANSIT down a pipe (a body, on a belt). `_out_of_core` is
+# the id set for the five that are not the bed — main-side only, so Pebble stays a pure sim
+# struct with no notion of the game's fuel handling.
+#
+# This list has grown twice, and the same line held each time: `_out_of_core` means NOT
+# FUEL, never "has no body". It used to mean both, back when the only way to leave the bed
+# was to stop existing mechanically — the pool (Phase 3a) and now the pipes (3b) break that
+# coincidence, and every reader that had quietly come to depend on it had to be re-pointed.
+# Adding a sixth state is cheap; re-deriving which flag meant what is not.
 var _loop: FuelLoop
 var _queue: Array = []          # [{id, x}] arrived at the top, waiting to enter the bed
-var _out_of_core: Dictionary = {}   # id -> true for every pebble with no body
+var _out_of_core: Dictionary = {}   # id -> true for every pebble outside the bed
+# Pebbles being carried down a pipe as REAL BODIES (Phase 3b-i) — id -> leg. A FIFTH
+# state, and the first one that is out of the core while still holding a body.
+#
+# It exists because a belt-driven pebble has to be told apart from a settled one: both are
+# bodies the engine is stepping, but this one still needs pushing and still needs watching
+# for arrival, and the pooled one is done. Membership here is what the belt drives and
+# nothing else — so a pebble that arrives simply leaves this set, and the physics keeps
+# hold of the same body throughout. Nothing is destroyed or re-created at the hand-off.
+#
+# Note it does NOT replace `_out_of_core`, it rides alongside it: `_out_of_core` answers
+# the NEUTRONICS question ("is this fuel in the bed"), which for a transiting pebble is no.
+# That one flag is the whole reason this leg cannot shift k (see `_core_positions`).
+var _transit: Dictionary = {}
+# Spent pebbles the sorter has taken but the discharge pipe has not accepted yet, oldest
+# first — the pipe's feed queue. A SIXTH state, and bodiless like the riders and the staging
+# queue. See `_feed_drop` for why a physical pipe needs a door.
+var _drop_pending: Array = []
 # Pebbles that finished their last pass and settled in the spent-fuel pool, oldest
 # first. A FOURTH state, and — since the pool became RE-INJECTABLE — one that lives
 # INSIDE `_pebbles`, flagged out-of-core, like every other bodiless state.
@@ -447,6 +473,14 @@ func _ready() -> void:
 	for seg in FuelLoop.pool_walls():
 		_physics.add_static_segment(seg[0], seg[1])
 
+	# The DISCHARGE pipe is solid too (Phase 3b-i): a spent pebble is a real body from the
+	# outlet to the pile, so the pipe it travels down needs faces to travel down. Same
+	# reasoning as the tray's walls above — immovable steel the backend cannot tell from
+	# the silo's — and the same guard keeps it out of the reactor: a body in this pipe is
+	# `_out_of_core`, so the pipe crossing valid grid cells costs nothing.
+	for seg in FuelLoop.discharge_walls():
+		_physics.add_static_segment(seg[0], seg[1])
+
 	# The coarse neutronics mesh over the silo + reflector band.
 	_grid = Grid.for_silo()
 
@@ -667,27 +701,23 @@ func _physics_process(delta: float) -> void:
 	# Native self-steps; kept explicit so an external engine slots in cleanly.
 	_physics.step(delta)
 
-	# The fuel-handling machine: advance every pebble riding between the outlet and
-	# the top, then act on the ones that arrived. Riders carry no body and no flux,
-	# so this is transport bookkeeping only — it touches no physics.
+	# The belts: let the next spent pebble into the pipe if there is room for it, press on
+	# every pebble the pipe is carrying, and pool the ones that have arrived. Real bodies, so
+	# this is the one transport path that IS physics.
+	_feed_drop()
+	_belt_step()
+
+	# The fuel-handling machine: advance every pebble still RIDING between the outlet and
+	# the top, then act on the ones that arrived. Riders carry no body and no flux, so this
+	# is transport bookkeeping only — it touches no physics.
+	#
+	# DISCHARGE is no longer among them (Phase 3b-i put it on a belt), so every arrival here
+	# is a pebble heading back INTO the bed and stages in the queue. The branch that used to
+	# fork on kind is gone rather than left with one live case: `_pool_admit` is now reached
+	# from the belt, which is where the pebble physically arrives.
 	for arrival in _loop.advance(delta):
-		var aid: int = arrival["id"]
-		if arrival["kind"] == FuelLoop.DISCHARGE:
-			# Reached the pool. Still the ONLY thing that opens a fresh-fuel slot, and by
-			# the same arithmetic as before: the pebble now STAYS in `_pebbles` (it has to,
-			# to be re-injectable), but joining `_spent` takes it out of `_inventory()` —
-			# which is the number the mint gate reads. Deleting it from the registry and
-			# subtracting it from the count free exactly the same slot.
-			#
-			# It stays in `_out_of_core` as well — the state it was already in as a rider.
-			# Parking in the pool does not put it back in the bed, and leaving that one flag
-			# alone is what keeps it out of the flux solve, the depletion walk and the
-			# thermal walk with no changes to any of them.
-			_pool_push(_pebbles[aid])
-			_total_extracted += 1
-		else:
-			# Recirculated or fresh: stage at the top for the next free bed slot.
-			_queue.push_back({"id": aid, "x": arrival["x"]})
+		# Recirculated, fresh, or re-injected: stage at the top for the next free bed slot.
+		_queue.push_back({"id": arrival["id"], "x": arrival["x"]})
 
 	_spawn_accum += delta
 	while _spawn_accum >= SPAWN_INTERVAL:
@@ -728,7 +758,8 @@ func _core_count() -> int:
 
 
 ## The fuel CYCLE's population: everything the plant is still circulating — in the bed,
-## riding the machine, or staged at the top — but NOT the spent pool.
+## riding the machine, rolling down a pipe on a belt, waiting at the pipe's mouth for room,
+## or staged at the top — but NOT the spent pool.
 ##
 ## This is the quantity the mint gate and the thermal seed have always measured; it
 ## simply had no name while the pool lived outside the registry and `_pebbles.size()`
@@ -752,10 +783,14 @@ func _inventory() -> int:
 	return _pebbles.size() - _spent.size()
 
 
-## Park a discharged pebble in the pool, shipping the oldest to a cask if the tray is
-## full. THE ONLY place anything is pushed onto `_spent`, which is what makes
-## "`_spent.size()` never exceeds the tray" an INVARIANT rather than a hope — and that
-## invariant is load-bearing well beyond tidiness (see `_refresh_pool`).
+## Materialize a pebble directly into the tray and pool it — for a caller that has a spent
+## pebble but no body for it, which since Phase 3b-i means the drip-feed in
+## tests/live_spent_pool.gd and nothing on the live path. The plant's own discharges arrive
+## as bodies down a real pipe and go through `_pool_admit` below.
+##
+## The cap and the `_spent` invariant live in `_pool_admit`, which is what BOTH paths reach:
+## that is what keeps "`_spent.size()` never exceeds the tray" an INVARIANT rather than a
+## hope — and that invariant is load-bearing well beyond tidiness (see `_refresh_pool`).
 ##
 ## WHY THE POOL IS CAPPED AT WHAT THE TRAY CAN DRAW, and why that is not an arbitrary
 ## number. The pool exists to be REACHED: the player clicks a spent pebble to inspect it,
@@ -774,33 +809,96 @@ func _inventory() -> int:
 ## `_pebbles`, where five per-frame walks would carry it forever. Shipping is the honest
 ## end of the fuel cycle and it is the answer to "what happens when the pool fills":
 ## the OLDEST goes to a cask, and what remains is exactly what you can see.
-## The pebble arrives as a BODY, dropped at the mouth of the discharge pipe to fall into
-## the tray and settle wherever the pile puts it.
-##
-## GIVING IT A BODY AND DECLARING IT OUT OF CORE ARE ONE OPERATION, which is why the flag
-## is set here and not left to the caller. Today's only caller (the DISCHARGE arrival) has
-## it set already — the pebble has been out of core since it left the bed as a rider — so
-## this line is redundant on the live path and is here for what it prevents: the tray
-## overlays VALID grid cells, so a body parked in it without that flag is homogenized as
-## core fuel and shifts k with nothing on screen to say so (see `_core_positions`). A
-## caller that forgot would not crash, it would quietly re-calibrate the reactor. That is
-## exactly the pairing discipline `_ship_to_cask` keeps at the other end of the pool's
-## life, and it belongs on the same side of the boundary: the pool decides what a pooled
-## pebble is.
-##
-## Spawn BEFORE the cap check, not after: shipping erases a body, so the two must run in
-## that order for a pebble that arrives into a full tray (push, body, then ship the oldest
-## away). Reversed, a tray at exactly cap would ship a pebble that has no body yet and
-## leave the arrival unbodied.
 func _pool_push(peb: Pebble) -> void:
-	_spent.push_back(peb)
-	_out_of_core[peb.id] = true
 	# Somewhere across the pipe's bore, not dead-centre — see FuelLoop.pool_drop, where
 	# that randomness is the difference between a pile and a balanced column.
 	_physics.spawn_pebble(peb.id, FuelLoop.pool_drop(_rng.randf_range(-1.0, 1.0)),
 			peb.radius)
+	_pool_admit(peb)
+
+
+## Take ownership of a pebble that has ARRIVED in the tray under its own steam — it already
+## has a body, it rode a belt in, and it is somewhere in the pile. This is the live path
+## since Phase 3b-i; `_pool_push` above is the same thing for a pebble that needs
+## materializing first (the drip-feed in tests/live_spent_pool.gd, which fills the tray far
+## faster than the plant discharges).
+##
+## The split is the belt-body↔pool-body seam, and putting it here rather than inside the
+## belt keeps the pool the thing that decides what a pooled pebble IS. Note what is NOT in
+## this function any more: the spawn. The arriving pebble has held the same body since the
+## outlet, so there is nothing to create — which is precisely what "the two body-worlds
+## join" means, and why nothing here can put a pebble somewhere the physics did not.
+##
+## GIVING IT A BODY AND DECLARING IT OUT OF CORE ARE STILL ONE OPERATION, which is why the
+## flag is set here and not left to the caller. Both of today's callers have it set already
+## (the pebble has been out of core since the sorter took it), so this line is redundant on
+## both live paths and is here for what it prevents: the tray overlays VALID grid cells, so
+## a body parked in it without that flag is homogenized as core fuel and shifts k with
+## nothing on screen to say so (see `_core_positions`). A caller that forgot would not
+## crash, it would quietly re-calibrate the reactor. That is exactly the pairing discipline
+## `_ship_to_cask` keeps at the other end of the pool's life.
+## Joining `_spent` is ALSO what opens a fresh-fuel slot, by the same arithmetic as ever:
+## the pebble STAYS in `_pebbles` (it has to, to be re-injectable), but leaving
+## `_inventory()` is what the mint gate reads.
+##
+## `_total_extracted` is deliberately NOT bumped here, even though this looks like the
+## obvious home for it. It counts DISCHARGES THE PLANT MADE, and this function has a second
+## caller that did not make one: `_pool_push`, the drip-feed that stages dummy pebbles
+## straight into the tray. Counting those would inflate the HUD's spent total with pebbles
+## the sorter never saw and shift the accounting live_fuel_policy checks. The counter
+## therefore stays at the real arrival site, in `_belt_step`, which is reached only by a
+## pebble that actually rode the pipe.
+func _pool_admit(peb: Pebble) -> void:
+	_spent.push_back(peb)
+	_out_of_core[peb.id] = true
+	# Ordering note, now moot but worth keeping straight: the cap check runs last because
+	# shipping ERASES a body, so a tray at exactly cap must push-then-ship. It used to
+	# matter that the spawn came first; today the arriving pebble is bodied before it ever
+	# reaches this function, which removes the hazard rather than relying on the order.
 	while _spent.size() > FuelLoop.pool_capacity():
 		_ship_to_cask()
+
+
+## Drive every belt-carried pebble one step, and pool the ones that have landed.
+##
+## Takes no delta, and that is not an oversight: a belt applies a FORCE, and Godot
+## accumulates forces per physics step and consumes them on the next one. Scaling by delta
+## would be integrating twice. The step it belongs to is the physics step, which is why
+## this is called from `_physics_process` and nowhere else.
+func _belt_step() -> void:
+	if _transit.is_empty():
+		return
+	var landed: Array = []
+	for id in _transit:
+		var at := _physics.get_position(id)
+		if FuelLoop.pool_contains(at):
+			landed.append(id)
+			continue
+		_drive(id, at)
+	# Collected first, mutated after: `_pool_admit` can ship a pebble to a cask, which
+	# erases from `_pebbles` — and erasing anything mid-walk over `_transit` is how a
+	# harmless arrival turns into a corrupted iteration.
+	for id in landed:
+		_transit.erase(id)
+		_pool_admit(_pebbles[id])
+		# THE discharge counter, and it lives here rather than in `_pool_admit` because this
+		# is the site only a real pebble off a real pipe reaches (see there).
+		_total_extracted += 1
+
+
+## Press one pebble along the belt under it, if there is one under it.
+##
+## The velocity test IS the belt (see FuelLoop.BELT_DISCHARGE): push only while the pebble
+## is still slower than the belt, so it is dragged UP TO belt speed and no further. A pebble
+## already at speed is coasting on a surface moving with it, which is what riding a conveyor
+## is, and it leaves the end at belt speed no matter how hard the belt pressed to get it
+## there. Reversed — force with no speed limit — this same function throws pebbles out of
+## the world (measured, 3 in 10).
+func _drive(id: int, at: Vector2) -> void:
+	if not FuelLoop.on_discharge_belt(at):
+		return   # in the drop, or already tipping into the tray: gravity's business
+	if _physics.get_velocity(id).x > -FuelLoop.BELT_DISCHARGE:
+		_physics.apply_force(id, Vector2(-FuelLoop.BELT_FORCE, 0.0))
 
 
 ## Send the oldest pooled pebble away for good — it leaves the plant entirely.
@@ -1133,16 +1231,87 @@ func _recirculate(id: int, peb: Pebble) -> void:
 	_total_recirculated += 1
 
 
-## Retire a spent pebble: it rides out to the spent-fuel bin and is erased from the
-## inventory on arrival (see _physics_process), which is what opens the slot the next
-## mint fills with fresh fuel. The outflow readout is recorded HERE, at the sorter's
-## decision, so its semantics are unchanged by the ride.
+## Retire a spent pebble: it goes down the discharge pipe as a REAL BODY and settles into
+## the pool, and the slot the next mint fills is opened when it gets there (`_pool_admit`).
+## The outflow readout is recorded HERE, at the sorter's decision, so its semantics are
+## unchanged by however long the journey takes.
+##
+## PHASE 3b-i: this used to hand the pebble to `_loop` as a rider — a drawn dot sliding
+## along a polyline, passing through the pipe walls, the tray and anything already in it.
+## Now the pebble is a body for the whole trip and the pipe is solid, so where it ends up
+## is the solver's answer rather than the path's. That is the same move Phase 3a made on
+## the pool itself, applied to the leg that feeds it: the two body-worlds now JOIN, and a
+## discharged pebble is one continuous object from the bed to the pile.
+##
+## The body is DESTROYED AND RE-CREATED at the outlet rather than carried through, and the
+## seam is real — see `FuelLoop.drop_mouth` for why the closed hopper leaves no alternative
+## (a hole in the floor would drain the bed, and TARGET_POPULATION is calibrated). What is
+## NOT re-created is anything after this point: from the drop mouth to the pile it is one
+## body, one continuous trajectory.
 func _discharge(id: int, peb: Pebble) -> void:
 	_record_outflow(peb)
-	var from := _physics.get_position(id)
 	_physics.remove_pebble(id)
+	# Out of the core the instant the sorter takes it, and it stays out for good — through
+	# the pipe, into the tray, and (unless the player re-injects it) forever. This is THE
+	# line that makes the whole leg calibration-safe: the body about to appear in the pipe
+	# crosses valid grid cells, and this flag is what stops the flux solve from seeing it.
 	_out_of_core[id] = true
-	_loop.add(id, FuelLoop.DISCHARGE, from, 0.0, PebbleBody.DEFAULT_TINT, peb.radius)
+	# It does NOT get a body here — it gets in line for one. See `_feed_drop`.
+	_drop_pending.push_back(peb)
+
+
+## Put the next spent pebble into the discharge pipe, IF the pipe's mouth is empty.
+##
+## WHY THIS QUEUE EXISTS, and why "just spawn it" is not an option. The sorter's rate is set
+## by the player (the discharge-burnup knob, G/H) and the pipe's rate is set by the belt;
+## nothing makes those two agree. Lower the knob and a burnup wave floods this leg — the bed
+## is seeded to a spread, so a third of it can come due at once — and the mouth is asked to
+## accept a pebble every few frames while the last one is still sitting in it.
+##
+## Spawning anyway does not queue them, it OVERLAPS them, and the solver's answer to two
+## bodies in one place is to fire them apart. Measured, before this existed: pebbles forced
+## UP through the silo's hopper floor into the bed — where they are `_out_of_core`, so they
+## displace fuel while being invisible to the flux, which is the exact silent-k-shift this
+## whole phase is supposed to avoid — and others thrown clear of the bore to fall out of the
+## world. 38 wedged, 4 escaped, and the bed ran short as the jam ate LOOP_BUFFER.
+##
+## So the pipe gets a door. A pebble waits its turn holding no body, exactly as a RIDER or a
+## `_queue`-staged pebble does, and the accounting does not notice: it is in `_pebbles` and
+## in `_out_of_core`, so it counts as inventory (the mint gate must NOT replace it yet — its
+## slot opens when it reaches the pool) and not as core. This is the same shape as the
+## staging queue at the top of the loop, for the same reason: a physical pipe cannot be fed
+## faster than it accepts, so the feed waits rather than the pipe breaking.
+##
+## The back-pressure is honest and self-limiting: if the belt ever stops, this grows, the
+## mint gate sees no freed slots, and the plant slows down — which is what a blocked
+## discharge line should do. It does not silently drop fuel on the floor.
+func _feed_drop() -> void:
+	if _drop_pending.is_empty() or not _drop_mouth_clear():
+		return
+	var peb: Pebble = _drop_pending.pop_front()
+	# Somewhere across the bore, not dead-centre — the pipe is built with BORE_CLEARANCE of
+	# play and a pebble does not enter one perfectly aligned. Same honest disorder source as
+	# `pool_drop`'s, and it matters for the same reason: symmetric contacts stack.
+	_physics.spawn_pebble(peb.id,
+			FuelLoop.drop_mouth(_rng.randf_range(-1.0, 1.0), peb.radius), peb.radius)
+	# Tint it NOW rather than letting the per-frame walk catch it a frame later in graphite
+	# grey: under a per-pebble field the pebble the player is following must not blink.
+	_physics.set_pebble_tint(peb.id, _pebble_tint(peb))
+	_transit[peb.id] = FuelLoop.DISCHARGE
+
+
+## Is there room at the mouth for one more pebble?
+##
+## Only `_transit` is searched, and that is sufficient rather than lazy: the mouth sits below
+## the hopper floor, inside the discharge bore, and the only bodies that can ever be in there
+## are the ones this leg put there. Bed pebbles are the other side of a wall; pooled ones are
+## 250 px away at the far end of the pipe.
+func _drop_mouth_clear() -> bool:
+	var mouth := FuelLoop.drop_mouth()
+	for id in _transit:
+		if _physics.get_position(id).distance_to(mouth) < FuelLoop.MOUTH_CLEAR:
+			return false
+	return true
 
 
 ## Accumulate the discharged pebble's composition for the outflow readout — the
@@ -1588,7 +1757,22 @@ func _pick_at(at: Vector2) -> void:
 		_select(null, "")
 		return
 	var hit: Pebble = _pebbles[best_id]
-	_select(hit, "spent pool" if _spent.has(hit) else "core bed")
+	# Three kinds of body reach this point now, and WHERE a pebble is is a fact about the
+	# sim, not about which list found it — so ask, rather than infer from the search that
+	# happened to hit. A transiting pebble is a body like the other two but is neither in
+	# the bed nor parked: labelling it "core bed" (which is what a two-way test does) would
+	# tell the player a pebble halfway down the discharge pipe is fuel in the reactor.
+	_select(hit, _where_is(hit))
+
+
+## What to call the place a BODIED pebble is sitting. Riders are not covered — the plant
+## answers for those (`_pick_at` asks it first, because a rider has no body to find).
+func _where_is(peb: Pebble) -> String:
+	if _spent.has(peb):
+		return "spent pool"
+	if _transit.has(peb.id):
+		return "discharge pipe"
+	return "core bed"
 
 
 func _select(peb: Pebble, where: String) -> void:

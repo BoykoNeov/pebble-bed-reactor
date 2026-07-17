@@ -84,15 +84,21 @@ func _process(delta: float) -> bool:
 		_report_scale()
 		return false
 
-	# Wait for a REAL discharge and catch it heading into the spent bin. Discharges are rare
-	# (~5 per 70 s), so this waits for one rather than staging a fake.
+	# Wait for a REAL discharge and catch the pebble on its way down to the pool. Discharges
+	# are rare (~5 per 70 s), so this waits for one rather than staging a fake.
+	#
+	# Since Phase 3b-i a discharged pebble is a BODY on a belt, not a rider on a polyline, so
+	# there is no arc-length to ask "how far along is it". Its position IS the answer: catch
+	# it once it is out of the drop and travelling along the conveyor, which is the shot
+	# worth having — a real pebble inside a real pipe, which is the thing 3b-i claims.
 	if _shot_bin < 3:
-		for r in _main._loop._riders:
-			if r["kind"] == FuelLoop.DISCHARGE and r["d"] / r["len"] > 0.6:
+		for id in _main._transit:
+			var at: Vector2 = _main._physics.get_position(id)
+			if FuelLoop.on_discharge_belt(at):
 				_shot_bin += 1
 				_capture("spent_bin_%d.png" % _shot_bin)
-				print("  DISCHARGE rider #%d at %.0f%% along its leg to the bin"
-					% [r["id"], 100.0 * r["d"] / r["len"]])
+				print("  DISCHARGE body #%d on the belt at (%.0f, %.0f), v=%.0f px/s"
+					% [id, at.x, at.y, _main._physics.get_velocity(id).length()])
 				break
 
 	if _shot_field and _shot_raised and _shot_bin >= 3 and _done_at < 0.0:

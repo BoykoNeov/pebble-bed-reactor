@@ -49,6 +49,25 @@ func positions() -> Dictionary:
 	return {}
 
 
+## Current velocity of one body. Returns Vector2.ZERO if unknown.
+##
+## Exists for the transport BELTS (M5+/Phase 3b), which are speed-limited rather than
+## force-limited: a belt drags what is on it up to its own speed and then stops pushing,
+## so the drive has to be able to ask how fast the thing it is carrying is already going.
+## Without this the only option is a constant force, which accelerates a pebble down the
+## whole run and throws it out of the end of the pipe.
+func get_velocity(_id: int) -> Vector2:
+	_todo()
+	return Vector2.ZERO
+
+
+## Push one body this step (a belt driving a pebble along a pipe). Accumulated by the
+## engine and consumed by the next step, so it must be re-applied every frame it should
+## act — a belt is a continuous drive, not an impulse.
+func apply_force(_id: int, _force: Vector2) -> void:
+	_todo()
+
+
 ## Recolor one body for the per-pebble (Lagrangian) field heatmap (M3+). Pure
 ## visualization — a consumer of sim state, routed through the backend only
 ## because it owns the render bodies. No-op if the backend has no drawable body.

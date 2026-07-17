@@ -115,26 +115,91 @@ const POOL_H := 49.2          # ~3 pebble diameters deep — see the corridor no
 #
 # WHY THE WORST CASE AND NOT THE TYPICAL ONE. A settled pile's capacity is genuinely
 # random — the same drop sequence with different bore play gives a different pack. Over
-# seven fill runs the last count with every pebble resting fully inside the rim was
-# 12, 15, 15, 12, 16, 12, 16. So 12 is not a pessimistic reading of the data, it is the
-# outcome in three of seven runs, and the cap has to hold in the run it gets, not on
+# seven fill runs (Phase 3a) the last count with every pebble resting fully inside the rim
+# was 12, 15, 15, 12, 16, 12, 16. So 12 was not a pessimistic reading of that data, it was
+# the outcome in three of seven runs, and the cap has to hold in the run it gets, not on
 # average.
 #
-# The consequence of overfilling is why it is worth being strict: the tray has no lid,
-# and it CANNOT have taller walls — the discharge conveyor runs across at y = 955, so a
-# wall reaching higher than the rim would stand in the pipe and stop the pebbles it is
-# supposed to be catching. Above the rim there is nothing to hold a pebble in, and one
-# that rolls off falls out of the world while still counted as held. Gated by
-# tests/live_spent_pool.gd, which fills the tray to exactly this number and fails if any
-# pebble comes to rest outside it.
-const POOL_CAP := 12
+# ⚠️ 12 → 8 AT PHASE 3b-i, AND THOSE SEVEN RUNS ARE WHY IT HAD TO MOVE — not evidence that
+# it did not. Every one of them fed the tray through `pool_drop`: a body materialized just
+# above the rim, at rest. The plant does not deliver that way any more. A spent pebble now
+# rides a belt and TIPS OFF THE END of the conveyor, arriving with ~95-150 px/s of leftward
+# travel and landing well left of the mouth. Same tray, different feed — so the old number
+# certified a delivery nothing performs. A cap is a claim about how the pebbles ARRIVE, not
+# only about the box they arrive in.
+#
+# RE-MEASURED AGAINST THE BELT (tests/live_discharge_belt.gd dumps every held pebble's
+# resting place). The pile is NOT a tower — the feed spreads honestly: six across the floor
+# at y≈1009, three at y≈996, one at y≈983. It is a heap that runs out of DEPTH before it
+# runs out of floor, exactly as the paragraph above already said. TEN rest clear, the apex
+# at y≈983 with its crown 9 px below the conveyor. The ELEVENTH comes to rest at y≈967.7 —
+# and that is not merely "outside the tray", it is IN THE MOUTH, the x ∈ [469, 491] gap the
+# pipe pours through. So capacity is ~10, and 8 takes a two-pebble margin under it because
+# the pack is random and this is one fill, not seven.
+#
+# THE MARGIN IS WIDER THAN 3a's BECAUSE THE FAILURE IS WORSE. Overfilling used to mean one
+# pebble rolled off the rim and out of the world: bad, visible, and limited to that pebble.
+# Now the pile's apex plugs the pipe that FEEDS it, and the plug is self-sealing in both
+# directions — nothing can arrive, so nothing is admitted, so the cap never fires, so the
+# oldest is never casked, so the room that would clear the plug is never made. Measured
+# before the cap moved: the tray stuck at 11 held and spent fuel backed up nose-to-tail
+# along the conveyor to the sorter. A cap at or above capacity is not "a bit too full", it
+# is a discharge leg that has stopped for good.
+#
+# The tray still has no lid and still CANNOT have taller walls — the discharge conveyor runs
+# across at y = 955, so a wall reaching above the rim would stand in the pipe and stop the
+# pebbles it is supposed to be catching. Gated by tests/live_discharge_belt.gd, which fills
+# the tray THROUGH THE BELT and fails if any pebble the pool claims to hold is not actually
+# resting in it.
+const POOL_CAP := 8
 const POOL_WALL := Color(0.10, 0.06, 0.06, 0.92)
 const POOL_EDGE := Color(0.55, 0.35, 0.35, 0.8)
 
-# Ride speed (px/s). Purely a legibility knob with ZERO physics cost: main pins the
-# IN-CORE population regardless of how many pebbles are riding (see LOOP_BUFFER),
-# so a slow, watchable ride does not dilute the bed or shift reactivity.
+# Ride speed (px/s) for the pebbles still carried as RIDERS (recirc, fresh, reinject).
+# Purely a legibility knob with ZERO physics cost: main pins the IN-CORE population
+# regardless of how many pebbles are riding (see LOOP_BUFFER), so a slow, watchable ride
+# does not dilute the bed or shift reactivity.
 const SPEED := 380.0
+
+# --- The discharge belt (Phase 3b-i) ---
+#
+# The discharge leg is no longer a ride. A pebble leaving the sorter for the pool is a
+# REAL BODY from the outlet to the pile: it falls down the drop, lands on a real conveyor
+# floor, is dragged along it by a belt, and tips off the end into the tray. Nothing about
+# where it goes is scripted — `discharge_walls` and the belt are the only inputs, and the
+# path is what the solver makes of them.
+#
+# WHY THIS LEG FIRST, and why it is safe: the sorter discharges only ~1 pebble in 10
+# extractions, so this pipe carries ~0.15 pebbles in flight. It CANNOT congest, and a
+# transiting body is flagged `_out_of_core` by main, so it is outside the flux solve for
+# its whole journey. This leg therefore cannot move k no matter how the bodies behave —
+# which is exactly why it goes first (the riser, at 1 per EXTRACT_INTERVAL, can).
+#
+# THE BELT IS A SPEED, NOT A FORCE, and that distinction is measured rather than stylistic.
+# A constant force accelerates over the whole 250 px run and the pebble leaves the end at
+# ~670 px/s — it sails clean over the 49 px-deep tray, clears the far wall and falls out of
+# the world (3 of 10 lost, last seen at y ≈ 78000). A real belt does not do that: it drags
+# what is on it up to ITS OWN speed and then stops adding energy. So the drive only pushes
+# while the pebble is still slower than the belt, and the exit speed is BELT_DISCHARGE by
+# construction, whatever the force.
+#
+# WHY THE SPEED IS THIS LOW: a belt's speed is bounded by what it empties INTO. This one
+# empties into an open, lidless tray (POOL_H is ~3 pebble diameters and the discharge
+# conveyor crossing at HUB_Y forbids taller walls — see the pool notes), so a fast pebble
+# is a lost pebble. Low traffic means slow costs nothing here. The riser will NOT be able
+# to take this speed and must not be given it (see the per-leg note in _pipe_runs).
+const BELT_DISCHARGE := 95.0
+# What the belt presses with. High, and high ON PURPOSE — it is a friction-vs-force
+# problem, not a speed one. At 900 the belt loses to the drop/conveyor elbow: one pebble
+# rests in the corner, a second stacks on top of it, and the belt is asked to overcome
+# roughly two pebbles' weight of friction (~1960) and cannot. 2 of 10 wedged there
+# PERMANENTLY. At 2500 the elbow clears 10 of 10 (2500/5000/9000 all clean, so this sits
+# well inside the working band rather than on its edge).
+#
+# Raising it is safe ONLY because of the velocity cap above: more force means the pebble
+# reaches belt speed sooner, never that it leaves faster. Without the cap this number is
+# precisely how pebbles get thrown out of the world.
+const BELT_FORCE := 2500.0
 
 const PEBBLE_R := 8.0
 
@@ -176,6 +241,116 @@ var _pool_total := 0     # every pebble ever discharged, including those since s
 var _pool_shipped := 0   # of those, the ones the full pool sent to a cask
 
 
+## The bore of the DISCHARGE leg as wall segments — the pipe made solid (Phase 3b-i).
+##
+## Every face here is BORE_W/2 off a centreline in `_pipe_runs`, which is the same
+## centreline `_draw_plant` insets the dark bore into and the same one the old rider slid
+## down. So the wall a pebble rolls on is the wall the player sees: the Silo.wall_segments
+## discipline (the drawn face IS the physics face), extended to the plant. Restating the
+## coordinates instead would let the pipe and its lining drift apart, and the pebble would
+## roll along a surface that is not there.
+##
+## THE GAPS ARE THE POINT — this plant is a set of pipes that MEET, and a wall carried
+## through a junction is a lid over the pipe feeding it. Two are deliberate:
+##   * the top of the drop, where pebbles arrive from the outlet;
+##   * the floor's left end, which IS the pool's mouth — the pebble runs out of floor and
+##     falls, so the drop into the tray is an absence of pipe rather than a special case.
+## The plant is entirely AXIS-ALIGNED (every run is vertical or horizontal), which is why
+## this needs no mitring or offset-polyline machinery: literal segments and honest gaps.
+static func discharge_walls() -> Array:
+	var half := BORE_W * 0.5
+	var inner := Silo.CENTER_X - half        # the drop's left face
+	var outer := Silo.CENTER_X + half        # the drop's right face
+	var roof := HUB_Y - half                 # the conveyor's upper face
+	var floor_y := HUB_Y + half              # the conveyor's lower face — what it rolls on
+	var mouth_l := BIN_X - half              # the pool mouth's far side
+	var mouth_r := BIN_X + half              # where the floor stops and the pebble tips off
+	return [
+		# The drop, outlet → conveyor. Its LEFT face stops at the roof: below that is the
+		# elbow's inside corner, and continuing it would wall the conveyor off from the
+		# pipe feeding it.
+		[Vector2(inner, Silo.OUTLET_Y), Vector2(inner, roof)],
+		# The RIGHT face runs unbroken from the outlet all the way down to the floor,
+		# because the drop's right wall and the conveyor's end cap are the same surface —
+		# the outside of a 90° bend. Nothing is driving a pebble right, but a bounced one
+		# would otherwise leave through the corner.
+		[Vector2(outer, Silo.OUTLET_Y), Vector2(outer, floor_y)],
+		# The conveyor roof, from the mouth back to the elbow's inside corner.
+		[Vector2(mouth_l, roof), Vector2(inner, roof)],
+		# The conveyor floor. It STOPS at the mouth's right edge — the missing span is the
+		# hole the pebble falls through, and it is exactly the stub of pipe `_pipe_runs`
+		# draws heading down to the tray.
+		[Vector2(mouth_r, floor_y), Vector2(outer, floor_y)],
+		# The mouth's far wall: a pebble is travelling left at belt speed when the floor
+		# runs out, so this is what stops it carrying on past the tray.
+		[Vector2(mouth_l, roof), Vector2(mouth_l, floor_y)],
+	]
+
+
+## Where a discharged pebble becomes a body — just inside the drop, below the hopper floor.
+##
+## `across` is its offset across the bore, -1 (left face) to +1 (right face); main passes a
+## random one, for the same reason `pool_drop` takes one (see there).
+##
+## THERE IS AN HONEST SEAM HERE and it is worth naming rather than hiding. The silo is a
+## CLOSED hopper — extraction is metered, the floor has no hole, and it must not get one:
+## a real outlet would let the bed drain and TARGET_POPULATION is calibrated. So the pebble
+## cannot physically fall out of the core; it is removed at the outlet and appears in the
+## pipe it was discharged into, which is what metered discharge means. The old rider glided
+## the same gap, but glided it THROUGH the hopper's steel floor and through its neighbours.
+## Neither is more real than the other; this one at least ends with the pebble contained in
+## pipework for the rest of its journey.
+static func drop_mouth(across := 0.0, radius := PEBBLE_R) -> Vector2:
+	# Kept a clear radius below the hopper floor so the new body cannot be born overlapping
+	# it — a body spawned inside geometry is fired out of it by the solver.
+	return Vector2(Silo.CENTER_X + across * BORE_CLEARANCE, Silo.OUTLET_Y + radius + 2.0)
+
+
+## How much room the drop mouth needs before another pebble may be put into it.
+##
+## THE MOUTH IS A DOOR, NOT A DRAIN, and this is the constant that says so. A body spawned
+## on top of another body is not a queue — it is two objects occupying one space, and the
+## solver resolves that by firing them apart at whatever speed it takes. MEASURED, by
+## flooding this leg with a discharge wave before the guard existed: pebbles were squeezed
+## UP through the silo's own hopper floor and ended up loose in the bed at y ≈ 892 (a body
+## the flux cannot see, displacing fuel it can), while others were thrown sideways out of
+## the bore and fell out of the world past y = 1080. 38 wedged, 4 escaped.
+##
+## That is the same failure Phase 3a hit at the other end of this pipe, where the pool's
+## drop had to be lifted above the tray rim (BIN_Y 986 → 958) because a body spawned inside
+## the pile blew the pile apart. Same lesson, same fix: never materialize a body into space
+## that is already occupied — wait for the door.
+##
+## A bore's width of clearance, so the pebble already in the mouth has fully left it before
+## the next one appears. Sized off BORE_W rather than PEBBLE_R because radius is a player
+## design lever and the pebble in the way may be a big one.
+const MOUTH_CLEAR := BORE_W + 2.0
+
+
+## Is this body on the discharge conveyor, i.e. should the belt be dragging it?
+##
+## The zone is the conveyor's own bore, and it ENDS at the mouth: past that the pebble has
+## left the floor and is falling into the tray, where a belt has nothing to push against
+## and pushing anyway would throw it at the far wall. So the belt lets go exactly where the
+## floor does.
+static func on_discharge_belt(at: Vector2) -> bool:
+	var half := BORE_W * 0.5
+	return at.y > HUB_Y - half and at.y < HUB_Y + half + PEBBLE_R \
+			and at.x > BIN_X + half and at.x < Silo.CENTER_X + half
+
+
+## Has a falling pebble reached the tray? Inside it in BOTH axes, deliberately.
+##
+## A y-line alone ("below the conveyor") is the trap: the pipe walls are what put the
+## pebble over the tray, so if a wall were ever missing the pebble would free-fall straight
+## past the same line and be reported as safely arrived. A pipe with no walls passes a
+## y-line arrival check beautifully — that is not a hypothetical, it is how the spike for
+## this work first FALSELY passed 10/10. Requiring x as well means "arrived" can only be
+## satisfied by geometry that actually exists.
+static func pool_contains(at: Vector2) -> bool:
+	return at.x >= POOL_LEFT and at.x <= POOL_LEFT + POOL_W and at.y >= POOL_FLOOR - POOL_H
+
+
 ## The tray as wall segments for the physics backend: floor, left wall, right wall.
 ## Open at the top — that is where pebbles drop in from the discharge pipe.
 ##
@@ -183,10 +358,13 @@ var _pool_shipped := 0   # of those, the ones the full pool sent to a cask
 ## on is the wall the player sees (the Silo.wall_segments discipline: the drawn face
 ## IS the physics face, and the two cannot drift apart).
 ##
-## No lid, and none is wanted: a pebble is only ever placed in here by `pool_drop`,
-## which starts it inside the tray, and the cap keeps the pile below the rim. If a
-## pebble ever came to rest ON TOP of the rim, that would mean POOL_CAP is too high
-## for the tray — which is a thing to find out, not to hide behind a lid.
+## No lid, and none is wanted. A pebble enters over the rim — off the end of the discharge
+## conveyor since Phase 3b-i — and the CAP is what keeps the pile below it. If a pebble ever
+## comes to rest on top of the rim, that means POOL_CAP is too high for the tray, which is a
+## thing to find out and not to hide behind a lid. It is also, now, a thing that BITES
+## rather than merely looks wrong: the rim is directly under the pipe's mouth, so a pile
+## that reaches it plugs its own feed for good (see POOL_CAP). A lid would convert a visible
+## overfill into a silent deadlock.
 static func pool_walls() -> Array:
 	var right := POOL_LEFT + POOL_W
 	var top := POOL_FLOOR - POOL_H
@@ -197,10 +375,20 @@ static func pool_walls() -> Array:
 	]
 
 
-## Where a discharged pebble enters the tray — the mouth of the discharge pipe, which
-## is where its ride ends and where it was last drawn. Deriving the drop from the end
-## of the DISCHARGE path rather than restating a coordinate is what stops the pebble
-## from appearing to jump at the hand-off from conveyor to body.
+## Materialize a pebble in the pipe's mouth, ready to fall into the tray.
+##
+## THE PLANT NO LONGER USES THIS (Phase 3b-i). A discharged pebble arrives here on a belt,
+## as a body, under its own momentum — nothing needs placing, which is the whole point of
+## the leg being real. What is left is the harnesses that need a full tray in seconds rather
+## than the ~2 minutes the sorter takes to discharge one (tests/live_spent_pool.gd,
+## live_render_pool.gd): they stage pebbles straight into the mouth through `_pool_push`.
+##
+## It is kept rather than deleted because it still describes something TRUE — this really is
+## where the pipe pours, the x ∈ [BIN_X ± BORE_W/2] gap in the conveyor floor — so it is not
+## the kind of stale layout function `pool_slot` became (a claim about where pebbles are
+## that had stopped being the case). But note what it CANNOT certify any more: a tray filled
+## through here is filled by pebbles dropped at rest, and the belt delivers them moving. The
+## cap is measured against the BELT (see POOL_CAP), never against this.
 ##
 ## `across` is where the pebble sits ACROSS the bore, -1 (left wall) to +1 (right wall).
 ## A pebble does not leave a pipe dead-centre — BORE_CLEARANCE of play is exactly what
@@ -328,9 +516,13 @@ static func _path_for(kind: int, from: Vector2, spawn_x: float) -> PackedVector2
 	var hub := Vector2(Silo.CENTER_X, HUB_Y)
 	var mouth := Vector2(Silo.CENTER_X, Silo.OUTLET_Y)
 	match kind:
-		DISCHARGE:
-			# Out of the sorter to the left and down into the bin.
-			return PackedVector2Array([from, mouth, hub, Vector2(BIN_X, HUB_Y), Vector2(BIN_X, BIN_Y)])
+		# There is no DISCHARGE case, and its absence is deliberate rather than an
+		# oversight. Phase 3b-i put spent fuel on a BELT: it is a real body rolling down a
+		# real pipe, so the route it takes is the solver's answer and no longer a polyline
+		# anybody can state. Keeping the old branch "for reference" would leave a function
+		# claiming to know where discharged pebbles go while they demonstrably went
+		# wherever the physics put them — the same two-sources-of-truth drift that made
+		# `pool_slot` a liability once the pile became real (commit 7b0be70).
 		FRESH:
 			# Down out of the hopper, then along the shared feed chute.
 			return PackedVector2Array([HOPPER, Vector2(HOPPER.x, CHUTE_Y),
