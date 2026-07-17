@@ -197,12 +197,28 @@ var _loop: FuelLoop
 var _queue: Array = []          # [{id, x}] arrived at the top, waiting to enter the bed
 var _out_of_core: Dictionary = {}   # id -> true for every pebble with no body
 # Pebbles that finished their last pass and settled in the spent-fuel pool, oldest
-# first. A FOURTH state, and deliberately OUTSIDE `_pebbles`: a spent pebble is out
-# of the inventory for good, so it must not hold a slot against the mint gate
-# (`_pebbles.size() < TARGET_POPULATION + LOOP_BUFFER`) or be walked by any of the
-# per-pebble hot loops. Erasing from `_pebbles`/`_out_of_core` on arrival is exactly
-# what it always was — this only catches the Pebble on its way out instead of
-# dropping it, so the fuel cycle's arithmetic is untouched and calibration-neutral.
+# first. A FOURTH state, and — since the pool became RE-INJECTABLE — one that lives
+# INSIDE `_pebbles`, flagged out-of-core, like every other bodiless state.
+#
+# This inverts what this comment used to say ("deliberately OUTSIDE `_pebbles`"), so
+# here is why that was right then and wrong now. A spent pebble was out of the fuel
+# cycle FOR GOOD, so holding a slot against the mint gate would have starved the bed
+# of fresh fuel forever. Once a pebble can come BACK, "for good" is false: the pool is
+# a reservoir the player draws from, and a pebble in it is inventory that merely is
+# not in the bed — exactly what `_out_of_core` already means for riders and staged
+# pebbles. Keeping it out of `_pebbles` would mean re-injection has to hand-maintain
+# a budget the registry is already keeping.
+#
+# The gate that cared now subtracts the pool explicitly (`_inventory()`), so the pool
+# still holds no slot — the arithmetic is IDENTICAL, just stated instead of implied.
+# See `_inventory()` for the neutrality proof, which is the whole reason this is safe
+# to do without re-calibrating anything.
+#
+# `_spent` holds the Pebble objects (not ids) because it also carries the pool's
+# ORDER — oldest first — which drives both the display window and the drop-oldest cap.
+# It is the ONLY structure the pool needs: `_out_of_core` already answers "is it fuel"
+# and `_spent.size()` already answers "how many are parked", so there is no second
+# membership set to drift out of step with this one.
 #
 # It must ALSO never become FUEL. The spent pool sits at (480, ~1000), and the
 # neutronics grid spans x ∈ [424, 1036], y ∈ [-16, 1072] (Grid.for_silo) — so a pool
@@ -639,13 +655,17 @@ func _physics_process(delta: float) -> void:
 	for arrival in _loop.advance(delta):
 		var aid: int = arrival["id"]
 		if arrival["kind"] == FuelLoop.DISCHARGE:
-			# Reached the pool: out of the fuel cycle for good. This is still the ONLY
-			# thing that shrinks the inventory, and so the only thing that opens a
-			# fresh-fuel slot — the pebble is caught on its way out rather than
-			# dropped, but the arithmetic below is exactly what it always was.
+			# Reached the pool. Still the ONLY thing that opens a fresh-fuel slot, and by
+			# the same arithmetic as before: the pebble now STAYS in `_pebbles` (it has to,
+			# to be re-injectable), but joining `_spent` takes it out of `_inventory()` —
+			# which is the number the mint gate reads. Deleting it from the registry and
+			# subtracting it from the count free exactly the same slot.
+			#
+			# It stays in `_out_of_core` as well — the state it was already in as a rider.
+			# Parking in the pool does not put it back in the bed, and leaving that one flag
+			# alone is what keeps it out of the flux solve, the depletion walk and the
+			# thermal walk with no changes to any of them.
 			_spent.push_back(_pebbles[aid])
-			_pebbles.erase(aid)
-			_out_of_core.erase(aid)
 			_total_extracted += 1
 		else:
 			# Recirculated or fresh: stage at the top for the next free bed slot.
@@ -682,8 +702,36 @@ func _physics_process(delta: float) -> void:
 
 ## Pebbles currently in the BED (i.e. homogenized, fissioning).
 ## Derived rather than counted so it cannot drift out of step with the registry.
+##
+## Needs no pool term: a pooled pebble is in `_pebbles` AND in `_out_of_core`, so it
+## adds one to each side and cancels itself out. The pool is invisible here for free.
 func _core_count() -> int:
 	return _pebbles.size() - _out_of_core.size()
+
+
+## The fuel CYCLE's population: everything the plant is still circulating — in the bed,
+## riding the machine, or staged at the top — but NOT the spent pool.
+##
+## This is the quantity the mint gate and the thermal seed have always measured; it
+## simply had no name while the pool lived outside the registry and `_pebbles.size()`
+## happened to equal it. Now that a pool pebble is a registry member (it must be, to be
+## re-injectable — see `_spent`), the two have diverged and the distinction has to be
+## said out loud. A pebble parked in the pool is NOT being circulated: it must not hold
+## a slot against the mint gate, or the plant would stop making fresh fuel as the pool
+## filled and the bed would starve.
+##
+## NEUTRALITY, and it is exact rather than approximate. `_spent` was disjoint from
+## `_pebbles` before, so the old `_pebbles.size()` counted precisely the non-pool
+## pebbles; now `_pebbles` contains the pool and we subtract it back off. Same set,
+## same number, every frame — the pool moved across the boundary and the arithmetic
+## did not notice. That is what let this land without re-calibrating anything.
+##
+## It also makes re-injection self-accounting: dropping a pebble out of `_spent` and
+## into the queue raises `_inventory()` by one, so the gate mints one fewer fresh
+## pebble on its own. Nothing has to remember to debit a budget — the only way to get
+## that wrong is to keep a hand-maintained counter, which is exactly what this avoids.
+func _inventory() -> int:
+	return _pebbles.size() - _spent.size()
 
 
 ## The BED's positions — every pebble the neutronics is allowed to see.
@@ -733,7 +781,10 @@ func _core_positions() -> Dictionary:
 ## (see LOOP_BUFFER).
 func _inject_batch() -> void:
 	for i in SPAWN_PER_TICK:
-		if _pebbles.size() < TARGET_POPULATION + LOOP_BUFFER:
+		# Gate on the CIRCULATING population, not the raw registry: the pool is inventory
+		# too, and counting it would let a filling pool throttle fresh fuel until the bed
+		# starved. `_inventory()` is exactly what `_pebbles.size()` used to mean here.
+		if _inventory() < TARGET_POPULATION + LOOP_BUFFER:
 			_mint_pebble()
 		if _core_count() < TARGET_POPULATION and not _queue.is_empty():
 			_spawn_from_queue()
@@ -1030,7 +1081,13 @@ func _solve_flux() -> void:
 	# one): a partly-filled bed reads k_cold just above 1, giving a tiny equilibrium
 	# ΔT — under-seeding, and the subsequent climb to the packed operating point IS
 	# the overshoot. Waiting for the full pack lands the seed on the real operating k.
-	if not _thermal_seeded and cold.k_eff > 1.0 and _pebbles.size() >= TARGET_POPULATION:
+	#
+	# `_inventory()`, not `_pebbles.size()`: the pool must not count toward "the plant has
+	# made its load". It cannot at startup — nothing has discharged yet, so the pool is
+	# empty and this reads exactly as it always did — but a raw registry count would let a
+	# stocked pool satisfy the gate with a half-empty bed, which is the under-seeded
+	# cold start this line exists to prevent.
+	if not _thermal_seeded and cold.k_eff > 1.0 and _inventory() >= TARGET_POPULATION:
 		_seed_thermal_equilibrium(positions, cold.flux)
 
 	if _feedback_on:

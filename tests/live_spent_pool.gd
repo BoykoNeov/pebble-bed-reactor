@@ -29,10 +29,20 @@
 #
 # FAILURE 2 — the pool perturbs the fuel cycle's arithmetic. Catching a Pebble on its
 # way out must not change what leaving MEANS: discharge is still the only thing that
-# shrinks the inventory and so the only thing that opens a fresh-fuel slot. If a spent
-# pebble kept its slot in `_pebbles`, it would hold the mint gate closed
-# (`_pebbles.size() < TARGET_POPULATION + LOOP_BUFFER`) and the bed would starve —
-# the exact silent-k-shift class of bug LOOP_BUFFER exists to prevent.
+# shrinks the circulating population, and so the only thing that opens a fresh-fuel slot.
+# A spent pebble that still held a slot would keep the mint gate closed, the plant would
+# stop making fresh fuel as the pool filled, and the bed would starve — the exact
+# silent-k-shift class of bug LOOP_BUFFER exists to prevent.
+#
+# ...AND THE SECOND THING THIS TEST IS CAREFUL NOT TO FORBID. That failure used to be
+# stated as "a spent pebble must not keep its slot in `_pebbles`" — again the MECHANISM,
+# not the claim. A pool pebble is a `_pebbles` member NOW, and must be: re-injection needs
+# it in the registry, and keeping a shadow pool outside would mean hand-maintaining a fuel
+# budget the registry already keeps. What must be true is that it holds no slot in the
+# CIRCULATING population — `main._inventory()`, which subtracts the pool explicitly. So
+# checks 5 and 6 read `_inventory()`, and check 6b proves the distinction is load-bearing
+# rather than a rename: the pool really is in the registry, and the gate really cannot
+# see it.
 extends SceneTree
 
 # The cycle check in live_fuel_loop.gd confirms discharges are flowing by t = 70 s, so
@@ -155,19 +165,41 @@ func _process(delta: float) -> bool:
 	_main._physics.remove_pebble(ghost_id)
 	_main._out_of_core.erase(ghost_id)
 
-	# 5. A settled pebble is out of the inventory entirely: no body, no rider, no slot.
-	var still_held := 0
+	# 5. A settled pebble is out of the CYCLE — but deliberately NOT out of the registry.
+	#    It stays a `_pebbles` member so it can be re-injected, and it stays flagged
+	#    out-of-core so it is not fuel. That single flag is what keeps it out of the flux
+	#    solve, the depletion walk and the thermal walk without any of them knowing the
+	#    pool exists at all, so it is worth asserting directly rather than inferring.
+	var not_registered := 0
+	var not_flagged := 0
 	for peb in spent:
-		if _main._pebbles.has(peb.id):
-			still_held += 1
-	_ok(still_held == 0,
-		"settled pebbles are out of the inventory (%d still held)" % still_held)
+		if not _main._pebbles.has(peb.id):
+			not_registered += 1
+		if not _main._out_of_core.has(peb.id):
+			not_flagged += 1
+	_ok(not_registered == 0,
+		"settled pebbles stay in the registry, ready to re-inject (%d missing)" % not_registered)
+	_ok(not_flagged == 0,
+		"...and every one is flagged OUT OF CORE, so none of them is fuel (%d unflagged)"
+			% not_flagged)
 
 	# 6. The fuel cycle's arithmetic is untouched — the calibration-neutrality claim.
-	_ok(_main._pebbles.size() == _main.TARGET_POPULATION + _main.LOOP_BUFFER,
-		"inventory still target + buffer (%d)" % _main._pebbles.size())
+	_ok(_main._inventory() == _main.TARGET_POPULATION + _main.LOOP_BUFFER,
+		"the circulating population is still target + buffer (%d)" % _main._inventory())
 	_ok(_main._core_count() == _main.TARGET_POPULATION,
 		"bed still pinned at its calibrated population (%d)" % _main._core_count())
+
+	# 6b. ...and that exclusion is REAL, not a rename. Same two-sided shape as check 4b:
+	#     first prove the hazard is live — the pool really is in the registry, so a gate
+	#     reading `_pebbles.size()` really would be throttled as it fills — then prove the
+	#     gate is blind to it anyway. If `_inventory()` ever quietly collapsed back into
+	#     `_pebbles.size()`, check 6 above would still pass; this is what would fail.
+	_ok(_main._pebbles.size() == _main._inventory() + spent.size(),
+		"the pool IS in the registry (%d = %d circulating + %d pooled) — the gate has something to exclude"
+			% [_main._pebbles.size(), _main._inventory(), spent.size()])
+	_ok(_main._pebbles.size() > _main.TARGET_POPULATION + _main.LOOP_BUFFER,
+		"...and the raw registry has outgrown target + buffer (%d) — so the gate CANNOT be reading it"
+			% _main._pebbles.size())
 
 	# 7. The capped VIEW is honest: it shows what fits and reports the true total.
 	var shown: int = _main._loop._pool_tints.size()
@@ -190,6 +222,11 @@ func _process(delta: float) -> bool:
 	#    so the field's own display path runs (the trap live_render_capture.gd documents).
 	while _main._fields[_main._current_field]["desc"].world != FieldDescriptor.PEBBLE:
 		_main._cycle_field()
+	#    KEEP THIS LAST. These dummies are pushed straight into `_spent` without ever being
+	#    registered in `_pebbles`, which is a state the real fuel cycle cannot produce and
+	#    which makes `_inventory()` under-count by cap+3 (it subtracts the whole pool). That
+	#    is harmless only because the test quits a few lines below, before the mint gate
+	#    reads it again — so any new check that needs a coherent inventory goes ABOVE here.
 	var before := spent.size()
 	for i in cap + 3:
 		var dummy := Pebble.new(900000 + i, _main.PEBBLE_RADIUS)
