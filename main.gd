@@ -418,6 +418,10 @@ var _total_injected := 0
 # silent: a capped view that quietly drops things reads as a stalled discharge leg, and
 # the player must be able to tell "the tray is full" from "the plant stopped".
 var _total_shipped := 0
+# Pebbles the player pulled back out of the pool and sent round again. A SEPARATE counter
+# rather than a decrement of `_total_extracted`: the discharge really happened, and
+# un-counting it would falsify the pool's own accounting (held + casked == discharged).
+var _total_reinjected := 0
 var _total_extracted := 0
 var _readout: RichTextLabel
 
@@ -609,6 +613,7 @@ func _build_hud() -> void:
 	keys.add_theme_color_override("default_color", Color(0.75, 0.8, 0.88))
 	keys.text = "[center]%s[/center]" % "   ".join([
 		_key_hint("[ ]", "enrichment"),
+		_key_hint("Z X", "pebble size"),
 		_key_hint(", .", "coolant flow"),
 		_key_hint("K L", "inlet temp"),
 		_key_hint("; '", "fuel loading"),
@@ -618,6 +623,7 @@ func _build_hud() -> void:
 		_key_hint("F", "feedback"),
 		_key_hint("Space", "scram"),
 		_key_hint("V", "field"),
+		_key_hint("T R", "restamp / re-inject"),
 	])
 	help.add_child(keys)
 
@@ -778,6 +784,84 @@ func _pool_push(peb: Pebble) -> void:
 ## the same pebble, so `_inventory()` does not move and the mint gate does not react. It
 ## should not — the fresh-fuel slot was already opened when this pebble first discharged
 ## into the pool. Freeing it again here would mint a second replacement for one pebble.
+## Stamp the CURRENT design onto a pooled pebble — the player's edit before sending it
+## back. Deliberately only what a pebble is BUILT with, never what it has BECOME.
+##
+## WHY ENRICHMENT IS NOT HERE, though it is one of CLAUDE.md's three design knobs and it
+## is editable for FRESH fuel one function away (`_mint_pebble`). There is no stored
+## enrichment field: enrichment IS the isotopic vector (`_stamp_enrichment` writes
+## `u235 = e`, `u238 = 1 - e`). For fresh fuel those are the same statement. For a burned
+## pebble they are not — u235 is now a RESULT, the fissile that survived the last pass,
+## so "re-enriching" would mean writing fresh fissile back into a pebble that has already
+## spent it. That is not an edit, it is un-burning, and it would hand the player a pebble
+## with a spent pebble's burnup and fresh fuel's reactivity — a lie homogenize would then
+## faithfully propagate into k.
+##
+## Radius and fuel_loading carry no such double meaning: they are pure design, read by
+## the geometry (packing → leakage) and the moderation ratio respectively, and nothing in
+## the depletion chain writes them. So they can be re-designed on a spent pebble without
+## contradicting anything the pebble has lived through. Re-enrichment would be
+## reprocessing — a real thing, but a different feature, and one that needs its own answer
+## for what happens to burnup.
+func _restamp_design(peb: Pebble) -> void:
+	peb.radius = _pebble_radius
+	peb.fuel_loading = _fuel_loading
+
+
+## Is the selection a pebble sitting in the pool — i.e. one the player may edit?
+##
+## The pool is the ONLY editable place, and the restriction is physical rather than
+## fussy. A pebble in the bed or riding the machine is mid-cycle: resizing it would
+## resize a live body and shift the packing the flux solve just homogenized. A pooled
+## pebble is parked, bodiless and out of core, so a redesign touches nothing until the
+## player sends it back — at which point it is built fresh from these fields anyway.
+func _pool_selected() -> bool:
+	return _selected != null and _spent.has(_selected)
+
+
+func _restamp_selected() -> void:
+	if _pool_selected():
+		_restamp_design(_selected)
+		_refresh_pool()   # its tint may have moved with the design
+
+
+func _reinject_selected() -> void:
+	if _pool_selected():
+		_reinject(_selected)
+
+
+## Send a pooled pebble back into the fuel cycle — the player's "burn it down, tweak it,
+## put it back" move.
+##
+## SELF-ACCOUNTING, and that is the whole reason Phase 2a put the pool inside `_pebbles`.
+## Leaving `_spent` raises `_inventory()` by one, so the mint gate makes one fewer fresh
+## pebble WITHOUT being told: the returning pebble takes the slot the replacement would
+## have. Nothing decrements a budget by hand, so nothing can forget to.
+##
+## `_total_extracted` is NOT decremented. It counts an event that really happened — this
+## pebble WAS discharged — and rewriting history to keep a HUD tidy would break the
+## accounting live_fuel_policy checks (`_spent + shipped == extracted`). The return is a
+## new event with its own counter.
+##
+## It rides out of its own pool slot rather than materializing at the hopper, so the pebble
+## the player just edited is the one they watch climb back in. `_out_of_core` is already
+## true (it has been since it discharged) and stays true for the ride — the pebble is not
+## fuel again until it lands in the bed, which the RECIRC/FRESH arrival path already
+## handles: a REINJECT arrival is not a DISCHARGE, so it stages in `_queue` like any
+## other returning pebble with no new arrival code at all.
+func _reinject(peb: Pebble) -> void:
+	var idx := _spent.find(peb)
+	if idx == -1:
+		return
+	# Ride from the slot it is SITTING in, captured before the removal re-packs the tray.
+	var from := FuelLoop.pool_slot(idx)
+	_spent.remove_at(idx)
+	_total_reinjected += 1
+	_loop.add(peb.id, FuelLoop.REINJECT, from, Silo.spawn_x(_rng, peb.radius + 2.0),
+			_pebble_tint(peb), peb.radius)
+	_refresh_pool()
+
+
 func _ship_to_cask() -> void:
 	var peb: Pebble = _spent.pop_front()
 	# The inspector may be holding the very pebble leaving. Clear it rather than let the
@@ -1601,6 +1685,22 @@ func _input(event: InputEvent) -> void:
 		match event.keycode:
 			KEY_F:
 				_toggle_feedback()
+			# Design SIZE. Adjacent-pair convention like every other lever here.
+			KEY_X:
+				_set_radius(_pebble_radius + RADIUS_STEP)
+			KEY_Z:
+				_set_radius(_pebble_radius - RADIUS_STEP)
+			# --- The spent pool, on the SELECTED pebble (click one first) ---
+			#
+			# These two deliberately add no design UI of their own. The player already has
+			# levers for all three design knobs (M/N size, [ ] enrichment, ; ' loading) and
+			# they already mean "the design of pebbles from here on"; T just applies that
+			# same design to the pebble in hand. A parallel per-pebble editor would be six
+			# more keys teaching the same three ideas twice.
+			KEY_T:
+				_restamp_selected()
+			KEY_R:
+				_reinject_selected()
 			KEY_BRACKETRIGHT, KEY_EQUAL:
 				_set_enrichment(_enrichment + ENRICH_STEP)
 			KEY_BRACKETLEFT, KEY_MINUS:
@@ -1662,6 +1762,21 @@ func _input(event: InputEvent) -> void:
 ## online-refueling behavior, not an instant core-wide reset.
 func _set_enrichment(e: float) -> void:
 	_enrichment = clampf(e, ENRICH_MIN, ENRICH_MAX)
+
+
+## Change the design SIZE — stamped on fresh fuel at mint, and on a pooled pebble by a
+## restamp. CLAUDE.md's third design knob, and until now the only one with no way for the
+## player to reach it: `RADIUS_STEP`/`RADIUS_MIN`/`RADIUS_MAX` were all sitting here
+## unused and `_pebble_radius` moved only when a test assigned it. Wiring it is what lets
+## "edit the design and send it back" actually include size.
+##
+## Takes effect on the NEXT pebble built — the bed's existing pebbles keep the size they
+## were made at, exactly as with enrichment and loading. Nothing resizes a live body.
+##
+## RADIUS_MAX is the pipe bore, not a taste call: a pebble wider than the bore it rides
+## would be drawn outside the pipe carrying it (see FuelLoop.BORE_W).
+func _set_radius(r: float) -> void:
+	_pebble_radius = clampf(r, RADIUS_MIN, RADIUS_MAX)
 
 
 ## Change the coolant mass flow — the primary M4 operating lever (CLAUDE.md). Lower
@@ -1938,7 +2053,12 @@ func _update_hud() -> void:
 		+ _row("coolant", "%.0f → %.0f K (bed ΔT %.0f)" % [_inlet_temp, _coolant_out, _coolant_out - _inlet_temp]) \
 		+ _section("FUEL CYCLE") \
 		+ _row("in core", "%d / %d   (%d riding the loop)" % [_core_count(), TARGET_POPULATION, _loop.count()]) \
-		+ _row("cycle", "recirculated %d   discharged %d   made %d" % [_total_recirculated, _total_extracted, _total_injected]) \
+		+ _row("cycle", "recirculated %d   discharged %d   made %d%s" % [
+			_total_recirculated, _total_extracted, _total_injected,
+			# Only once it has happened: these two are player-driven, so a permanent
+			# "casked 0  re-injected 0" would be two dead rows on every default run.
+			("   casked %d   re-injected %d" % [_total_shipped, _total_reinjected]) \
+				if _total_shipped + _total_reinjected > 0 else ""]) \
 		+ _row("policy", "discharge at %.0f MWd/kgHM (G/H)   or %d passes (O/P)%s"
 			% [_discharge_burnup, _max_passes, policy_note]) \
 		+ _section("SPENT FUEL OUT") \
@@ -1994,7 +2114,32 @@ func _update_inspector() -> void:
 		+ _row("burnup", "%.1f / %.0f MWd/kgHM" % [p.burnup, _discharge_burnup]) \
 		+ _row("passes", passes) \
 		+ _row("temperature", "%.0f K" % p.temperature) \
-		+ _row("local flux", "%.3f" % p.local_flux)
+		+ _row("local flux", "%.3f" % p.local_flux) \
+		+ _pool_actions(p)
+
+
+## The edit/re-inject offer, shown ONLY for a pebble in the pool — the one place a pebble
+## is parked and bodiless enough to redesign (see `_pool_selected`). Naming the keys on
+## the panel is what makes the pool's whole point discoverable: without this the player
+## has a tray of pebbles they can click and no reason to think they can do anything else.
+##
+## It states what the restamp will DO, in the design the pebble would get, so pressing T
+## is a confirmed action rather than a guess. And it says the pebble stays spent, because
+## that is the surprise otherwise: re-injecting a burned pebble sends it round once and
+## the sorter discharges it right back — correct, and baffling if unannounced. Raising the
+## discharge knob (G/H) is what actually keeps it, which is the Phase 1 lever composing
+## with this one.
+func _pool_actions(p: Pebble) -> String:
+	if not _spent.has(p):
+		return ""
+	var out := _section("SPENT POOL")
+	out += _row("[T] restamp", "r %.2f → %.2f   loading %.2f → %.2f"
+		% [p.radius, _pebble_radius, p.fuel_loading, _fuel_loading])
+	out += _row("[R] re-inject", "send it round again")
+	if _is_spent(p):
+		out += _row("", "[color=#%s]still spent — the sorter will discharge it again\nunless you raise the burnup limit (G/H)[/color]"
+			% HUD_DIM)
+	return out
 
 
 ## One dim section header line of the readout panel.

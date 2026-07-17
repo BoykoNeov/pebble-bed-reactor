@@ -28,6 +28,7 @@ extends Node2D
 const RECIRC := 0     # below discharge burnup → back to the top for another pass
 const DISCHARGE := 1  # spent → out to the bin, gone for good
 const FRESH := 2      # a replacement for a discharged pebble, in from the hopper
+const REINJECT := 3   # the player pulled one back out of the spent pool
 
 # Machine geometry. The vessel is x ∈ [560, 900], y ∈ [120, 900]; the neutronics
 # grid rect (drawn dimmed by FieldDisplay) reaches x ∈ [424, 1036], so the plant
@@ -253,6 +254,16 @@ static func _path_for(kind: int, from: Vector2, spawn_x: float) -> PackedVector2
 		FRESH:
 			# Down out of the hopper, then along the shared feed chute.
 			return PackedVector2Array([HOPPER, Vector2(HOPPER.x, CHUTE_Y),
+					Vector2(spawn_x, CHUTE_Y), Vector2(spawn_x, Silo.spawn_y())])
+		REINJECT:
+			# Out of the pool and back into the bed: up the DISCHARGE leg run backwards,
+			# through the sorter, then onto the RECIRC riser. Every segment is pipework
+			# already drawn by `_pipe_runs` — a re-injected pebble needs no route of its
+			# own because the plant already has one, it just runs it the other way. That
+			# also means no teleport: the player watches the pebble they edited climb out
+			# of the pool and re-enter the core along the same pipes everything else uses.
+			return PackedVector2Array([from, Vector2(BIN_X, BIN_Y), Vector2(BIN_X, HUB_Y), hub,
+					Vector2(RISER_X, HUB_Y), Vector2(RISER_X, CHUTE_Y),
 					Vector2(spawn_x, CHUTE_Y), Vector2(spawn_x, Silo.spawn_y())])
 		_:
 			# RECIRC: down to the sorter, right, up the riser, across the chute,
