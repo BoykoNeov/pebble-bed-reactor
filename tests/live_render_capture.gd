@@ -94,7 +94,7 @@ func _process(delta: float) -> bool:
 	if _shot_bin < 3:
 		for id in _main._transit:
 			var at: Vector2 = _main._physics.get_position(id)
-			if FuelLoop.on_discharge_belt(at):
+			if FuelLoop.in_duct(at):
 				_shot_bin += 1
 				_capture("spent_bin_%d.png" % _shot_bin)
 				print("  DISCHARGE body #%d on the belt at (%.0f, %.0f), v=%.0f px/s"

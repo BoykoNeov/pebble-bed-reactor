@@ -68,6 +68,38 @@ func apply_force(_id: int, _force: Vector2) -> void:
 	_todo()
 
 
+## Ask the engine to test where this body SWEPT, not just where it ended up.
+##
+## Ordinary discrete collision only checks a body's position each step, never the line it
+## travelled along to get there, so a fast body can be clear of a wall at step N and clear of
+## it on the FAR side at step N+1, with the wall never consulted. Crossing takes roughly a
+## body's own DIAMETER of travel in one step — that is the whole rule, and both quantities in
+## it matter.
+##
+## ⚠️ THE HAZARD IS THE SIZE LEVER, NOT THE BELT SPEED — measured, and the opposite of what
+## was assumed. At the riser's 380 px/s a pebble travels ~6.3 px per step, so the NOMINAL 8 px
+## pebble (16 px across, a 2.5x margin) does not tunnel at all: 0 lost in ~1100 pebbles with
+## this off. But radius is a PLAYER DESIGN KNOB, and at main.RADIUS_MIN = 5 the pebble is only
+## 10 px across — a 1.5x margin, which the corner impact closes. Same belt, same geometry,
+## with this off: **12, 26 and 14 recirculating pebbles lost in three runs of ~70** (up to
+## 37%), every one of them punched through the riser's right face at x = 986 and last seen at
+## x ≈ 1057. With it on: 0, 0, 0, and 69 of 69 arriving. So the question "is the pipe solid"
+## has no answer until you ask "solid for WHICH pebble" — the plant must hold the smallest
+## thing the player can build, not the default one.
+##
+## That makes this mandatory rather than cosmetic: a recirculating pebble that leaves through
+## a wall is one the BED never gets back, and TARGET_POPULATION = 380 is calibrated, so the
+## bill arrives as a quiet shift in k with nothing on screen to explain it.
+##
+## Off by default, and worth keeping off for the bed: 380 settling pebbles jostling at walking
+## pace are exactly the case discrete collision handles perfectly, so sweeping them all every
+## step would be paying for a hazard they do not have. The discharge belt's 95 px/s
+## (~1.6 px/step) is likewise never close, which is why nothing needed this before there was a
+## fast leg.
+func set_continuous_cd(_id: int, _on: bool) -> void:
+	pass
+
+
 ## Recolor one body for the per-pebble (Lagrangian) field heatmap (M3+). Pure
 ## visualization — a consumer of sim state, routed through the backend only
 ## because it owns the render bodies. No-op if the backend has no drawable body.

@@ -148,9 +148,23 @@ func _stress() -> void:
 
 
 ## Watch every body on the belt: is it moving, has it arrived, has it left the world.
+##
+## ⚠️ THE DISCHARGE LEG ONLY. `_transit` carries the recirculation leg too since Phase 3b-ii —
+## same drop, same duct, opposite belt — and this suite is about spent fuel reaching the tray.
+## Left unfiltered every check here quietly changes meaning: a recirculating pebble leaves
+## `_transit` at the top of the riser, and the arrival loop below would count that as a pebble
+## admitted to the POOL, inflating `_arrived` with fuel that went back into the reactor. The
+## conservation check at the end (`held + casked == extracted`) would then fail against a
+## plant that had lost nothing.
+##
+## `_peak_transit` is the deliberate exception and stays TOTAL, because the thing it feeds is
+## the LOOP_BUFFER gate — and the buffer covers every pebble out of the bed regardless of
+## which pipe it is in.
 func _track() -> void:
 	_peak_transit = maxi(_peak_transit, _main._transit.size())
 	for id in _main._transit:
+		if _main._transit[id] != FuelLoop.DISCHARGE:
+			continue
 		var at: Vector2 = _main._physics.get_position(id)
 		if not _watch.has(id):
 			_watch[id] = {"t": _t, "at": at, "moved_t": _t}
@@ -170,8 +184,10 @@ func _track() -> void:
 			_escaped.append(id)
 			printerr("  [escaped] #%d is at (%.0f, %.0f) — below the tray floor" % [id, at.x, at.y])
 		# Catch the speed at the moment it leaves the belt — the number that decides whether
-		# it lands in the tray or flies over it.
-		if not FuelLoop.on_discharge_belt(at) and at.y > FuelLoop.HUB_Y:
+		# it lands in the tray or flies over it. `in_duct` is the old `on_discharge_belt` with
+		# its right-hand edge moved out to the riser (the duct is shared now); for a pebble on
+		# THIS leg the meaning is unchanged, since it leaves the duct at the pool's mouth.
+		if not FuelLoop.in_duct(at) and at.y > FuelLoop.HUB_Y:
 			var v: float = _main._physics.get_velocity(id).length()
 			if _exit_speeds.size() < 200:
 				_exit_speeds.append(v)

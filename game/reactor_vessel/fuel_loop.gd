@@ -161,19 +161,25 @@ const POOL_EDGE := Color(0.55, 0.35, 0.35, 0.8)
 # does not dilute the bed or shift reactivity.
 const SPEED := 380.0
 
-# --- The discharge belt (Phase 3b-i) ---
+# --- The belts (Phase 3b) ---
 #
-# The discharge leg is no longer a ride. A pebble leaving the sorter for the pool is a
-# REAL BODY from the outlet to the pile: it falls down the drop, lands on a real conveyor
-# floor, is dragged along it by a belt, and tips off the end into the tray. Nothing about
-# where it goes is scripted — `discharge_walls` and the belt are the only inputs, and the
-# path is what the solver makes of them.
+# NEITHER leg out of the sorter is a ride any more. An extracted pebble is a REAL BODY from
+# the moment it enters the drop: it falls to the duct, and then a belt drags it either LEFT to
+# the pool and off the end into the tray (if it is spent) or RIGHT and 880 px UP the riser (if
+# it is going back around). Nothing about where it goes is scripted — `plant_walls` and the
+# belts are the only inputs, and the path is what the solver makes of them.
 #
-# WHY THIS LEG FIRST, and why it is safe: the sorter discharges only ~1 pebble in 10
-# extractions, so this pipe carries ~0.15 pebbles in flight. It CANNOT congest, and a
-# transiting body is flagged `_out_of_core` by main, so it is outside the flux solve for
-# its whole journey. This leg therefore cannot move k no matter how the bodies behave —
-# which is exactly why it goes first (the riser, at 1 per EXTRACT_INTERVAL, can).
+# THE DISCHARGE LEG WENT FIRST, deliberately, and 3b-i's reasoning is worth keeping because it
+# is what made the order safe: the sorter discharges only ~1 pebble in 10 extractions, so that
+# pipe carries ~0.15 pebbles in flight and CANNOT congest. The riser is the opposite — it takes
+# EVERY extraction, 1 per EXTRACT_INTERVAL — which is exactly why it went second and why it
+# needed measuring rather than assuming.
+#
+# What makes both legs free, whatever the bodies do: a transiting pebble is flagged
+# `_out_of_core` by main, so it is outside the flux solve for its whole journey. The pipes
+# cross valid grid cells and cost nothing. The one thing physics must NOT be handed is
+# admission to the BED — that stays gated by `main._queue`, because TARGET_POPULATION = 380 is
+# calibrated and a count set by solver timing is a count that wanders.
 #
 # THE BELT IS A SPEED, NOT A FORCE, and that distinction is measured rather than stylistic.
 # A constant force accelerates over the whole 250 px run and the pebble leaves the end at
@@ -186,9 +192,34 @@ const SPEED := 380.0
 # WHY THE SPEED IS THIS LOW: a belt's speed is bounded by what it empties INTO. This one
 # empties into an open, lidless tray (POOL_H is ~3 pebble diameters and the discharge
 # conveyor crossing at HUB_Y forbids taller walls — see the pool notes), so a fast pebble
-# is a lost pebble. Low traffic means slow costs nothing here. The riser will NOT be able
-# to take this speed and must not be given it (see the per-leg note in _pipe_runs).
+# is a lost pebble. Low traffic means slow costs nothing here — and the riser, which empties
+# somewhere quite different, gets its own speed rather than this one (see BELT_RISER).
 const BELT_DISCHARGE := 95.0
+# The RECIRCULATION belt: the duct run out to the riser, and the climb itself (Phase 3b-ii).
+#
+# FOUR TIMES the discharge belt, and the two numbers are not a matter of taste — each leg's
+# speed is set by the thing at the far end of it, which is why one constant could never have
+# covered both. The discharge belt tips into an open tray, so it must be slow. This one ends
+# in a CONTROLLED REMOVAL at a fixed point (main lifts the body off the top of the riser and
+# hands it to a chute rider), so there is no open exit to overshoot and nothing to be thrown
+# out of — the escape hazard that pins BELT_DISCHARGE at 95 simply does not exist here.
+#
+# It is not free speed for its own sake. This leg carries EVERY extraction (1 per
+# EXTRACT_INTERVAL = 0.3 s), where the discharge leg carries roughly 1 in 10 of them, so it
+# is the only pipe in the plant that can genuinely congest. At 95 px/s the 880 px riser takes
+# ~9 s and would hold ~28 pebbles nose-to-tail; at 380 it takes ~2.3 s and holds ~8. That
+# matters beyond looking better, because a pebble in the pipe is a pebble not in the bed:
+# TARGET_POPULATION = 380 is calibrated, LOOP_BUFFER is what absorbs the ones in flight, and
+# a slow riser would eat it and starve the staging queue — the bed would run short and shift
+# k with nothing on screen to say so.
+#
+# MEASURED, not reasoned: a velocity-capped belt at 380 carries the riser fed at the real
+# extraction rate with 132 of 132 arriving, nothing stuck, a 3.0 s mean ride and a PEAK OF 11
+# IN FLIGHT against LOOP_BUFFER's 48. (The pre-3b fake riders used this same 380 and peaked
+# near 30 — real bodies are BETTER, because a rider glides the whole path while a body cuts
+# the corners.) The fear that this leg would need ~50 in flight came from assuming the
+# discharge belt's 95; it does not survive contact with the measurement.
+const BELT_RISER := 380.0
 # What the belt presses with. High, and high ON PURPOSE — it is a friction-vs-force
 # problem, not a speed one. At 900 the belt loses to the drop/conveyor elbow: one pebble
 # rests in the corner, a second stacks on top of it, and the belt is asked to overcome
@@ -241,53 +272,97 @@ var _pool_total := 0     # every pebble ever discharged, including those since s
 var _pool_shipped := 0   # of those, the ones the full pool sent to a cask
 
 
-## The bore of the DISCHARGE leg as wall segments — the pipe made solid (Phase 3b-i).
+## The whole transport plant below the vessel as wall segments — the pipes made solid.
 ##
 ## Every face here is BORE_W/2 off a centreline in `_pipe_runs`, which is the same
-## centreline `_draw_plant` insets the dark bore into and the same one the old rider slid
+## centreline `_draw_plant` insets the dark bore into and the same one a rider slides
 ## down. So the wall a pebble rolls on is the wall the player sees: the Silo.wall_segments
 ## discipline (the drawn face IS the physics face), extended to the plant. Restating the
 ## coordinates instead would let the pipe and its lining drift apart, and the pebble would
 ## roll along a surface that is not there.
 ##
+## THE SHAPE, in one sentence: pebbles fall down ONE drop from the outlet into ONE duct,
+## and the duct runs from the pool's mouth on the left to the foot of the riser on the
+## right, with the sorter in the middle of it. That is why this is one function and not a
+## `discharge_walls` plus a `riser_walls` — the two legs do not have separate pipes to
+## describe. They share the drop and they share the duct, and the SORT hub is not a fitting
+## anyone built, it is just the place in the duct where the leftward belt ends and the
+## rightward one begins. Two functions would each own half of a shared thing and would have
+## to agree about the seam between them; one function has no seam to get wrong.
+##
 ## THE GAPS ARE THE POINT — this plant is a set of pipes that MEET, and a wall carried
-## through a junction is a lid over the pipe feeding it. Two are deliberate:
+## through a junction is a lid over the pipe feeding it. Four are deliberate:
 ##   * the top of the drop, where pebbles arrive from the outlet;
+##   * the drop's own mouth: the roof is in TWO spans and the hole between them is where
+##     the shaft pours into the duct;
 ##   * the floor's left end, which IS the pool's mouth — the pebble runs out of floor and
-##     falls, so the drop into the tray is an absence of pipe rather than a special case.
+##     falls, so the drop into the tray is an absence of pipe rather than a special case;
+##   * the roof's right end, where the riser's bore opens upward out of the duct.
 ## The plant is entirely AXIS-ALIGNED (every run is vertical or horizontal), which is why
 ## this needs no mitring or offset-polyline machinery: literal segments and honest gaps.
-static func discharge_walls() -> Array:
+##
+## ⚠️ THE DROP'S RIGHT FACE USED TO BE THE DISCHARGE CONVEYOR'S END CAP, running unbroken
+## from the outlet down to the floor, and Phase 3b-ii had to CUT it back to the roof. That
+## is not tidying — it is the change that makes a recirculation leg possible at all, because
+## that wall stood squarely between the drop and everything to the right of it. It also
+## removes the thing that used to catch a discharge pebble bouncing rightward off the corner.
+## What replaces it is not another wall but the DRIVE: main pushes a body along its OWN leg's
+## belt wherever in the duct it is (`main._drive`), so a discharge pebble that wanders right
+## is simply pushed back left. The containment moved from geometry into the belt, deliberately
+## — the alternative is a wall that recirculating fuel cannot get past either.
+static func plant_walls() -> Array:
 	var half := BORE_W * 0.5
-	var inner := Silo.CENTER_X - half        # the drop's left face
-	var outer := Silo.CENTER_X + half        # the drop's right face
-	var roof := HUB_Y - half                 # the conveyor's upper face
-	var floor_y := HUB_Y + half              # the conveyor's lower face — what it rolls on
+	var drop_l := Silo.CENTER_X - half       # the drop's left face
+	var drop_r := Silo.CENTER_X + half       # the drop's right face
+	var roof := HUB_Y - half                 # the duct's upper face
+	var floor_y := HUB_Y + half              # the duct's lower face — what pebbles roll on
 	var mouth_l := BIN_X - half              # the pool mouth's far side
 	var mouth_r := BIN_X + half              # where the floor stops and the pebble tips off
+	var riser_l := RISER_X - half            # the riser's left face
+	var riser_r := RISER_X + half            # the riser's right face
+	# The climb ends where the chute begins. Carried a bore's half-width past the chute's
+	# centreline because main lifts the body off at CHUTE_Y: the walls have to still be
+	# there at the instant it is removed, and at 380 px/s it travels ~6 px per step, so it
+	# can overshoot the removal line slightly before the next step catches it.
+	var riser_top := CHUTE_Y - half
 	return [
-		# The drop, outlet → conveyor. Its LEFT face stops at the roof: below that is the
-		# elbow's inside corner, and continuing it would wall the conveyor off from the
-		# pipe feeding it.
-		[Vector2(inner, Silo.OUTLET_Y), Vector2(inner, roof)],
-		# The RIGHT face runs unbroken from the outlet all the way down to the floor,
-		# because the drop's right wall and the conveyor's end cap are the same surface —
-		# the outside of a 90° bend. Nothing is driving a pebble right, but a bounced one
-		# would otherwise leave through the corner.
-		[Vector2(outer, Silo.OUTLET_Y), Vector2(outer, floor_y)],
-		# The conveyor roof, from the mouth back to the elbow's inside corner.
-		[Vector2(mouth_l, roof), Vector2(inner, roof)],
-		# The conveyor floor. It STOPS at the mouth's right edge — the missing span is the
-		# hole the pebble falls through, and it is exactly the stub of pipe `_pipe_runs`
-		# draws heading down to the tray.
-		[Vector2(mouth_r, floor_y), Vector2(outer, floor_y)],
-		# The mouth's far wall: a pebble is travelling left at belt speed when the floor
-		# runs out, so this is what stops it carrying on past the tray.
+		# --- The drop: outlet → duct. BOTH faces stop at the roof, and symmetrically:
+		# below that line is the duct, and either face carried further would wall the duct
+		# off from the pipe feeding it. The left face has always stopped here; the right
+		# one now does too (see the note above).
+		[Vector2(drop_l, Silo.OUTLET_Y), Vector2(drop_l, roof)],
+		[Vector2(drop_r, Silo.OUTLET_Y), Vector2(drop_r, roof)],
+		# --- The duct roof, in two spans. The gap between them is the drop's mouth: this
+		# is the one wall in the plant with a hole in the MIDDLE of it rather than at an
+		# end, because it is the one wall a pipe arrives through from above.
+		[Vector2(mouth_l, roof), Vector2(drop_l, roof)],
+		# The right span stops at the riser's left face — past that the roof would be a lid
+		# on the climb.
+		[Vector2(drop_r, roof), Vector2(riser_l, roof)],
+		# --- The duct floor: ONE run, the pool's mouth to the foot of the riser. It is the
+		# surface both belts drag along, and it STOPS at the mouth's right edge — the missing
+		# span is the hole a spent pebble falls through, and it is exactly the stub of pipe
+		# `_pipe_runs` draws heading down to the tray.
+		[Vector2(mouth_r, floor_y), Vector2(riser_r, floor_y)],
+		# --- The pool mouth's far wall: a pebble is travelling left at belt speed when the
+		# floor runs out, so this is what stops it carrying on past the tray.
 		[Vector2(mouth_l, roof), Vector2(mouth_l, floor_y)],
+		# --- The riser: the climb up to the chute. Its LEFT face starts at the roof (the
+		# elbow's inside corner) and its RIGHT face starts at the floor (the elbow's outside
+		# corner) — which is also the wall a pebble arriving at 380 px/s runs into and turns
+		# up against, so it is the one face in the plant that gets hit hard.
+		[Vector2(riser_l, roof), Vector2(riser_l, riser_top)],
+		[Vector2(riser_r, floor_y), Vector2(riser_r, riser_top)],
 	]
 
 
-## Where a discharged pebble becomes a body — just inside the drop, below the hopper floor.
+## Where an EXTRACTED pebble becomes a body — just inside the drop, below the hopper floor.
+##
+## One mouth for both legs, because the vessel has one outlet. Which way the pebble goes when
+## it lands is the belt's business, not this function's: the sorter's decision travels with the
+## pebble (`main._transit`) rather than being expressed as a second hole in the hopper. That is
+## also what the plant has always DRAWN — one pipe out of the vessel, parting left or right only
+## at the SORT hub — so the picture and the machine now say the same thing.
 ##
 ## `across` is its offset across the bore, -1 (left face) to +1 (right face); main passes a
 ## random one, for the same reason `pool_drop` takes one (see there).
@@ -324,19 +399,77 @@ static func drop_mouth(across := 0.0, radius := PEBBLE_R) -> Vector2:
 ## A bore's width of clearance, so the pebble already in the mouth has fully left it before
 ## the next one appears. Sized off BORE_W rather than PEBBLE_R because radius is a player
 ## design lever and the pebble in the way may be a big one.
+##
+## ⚠️ SINCE PHASE 3b-ii THIS DOOR CARRIES EVERY EXTRACTION, not one in ten. The recirculation
+## leg shares the drop, so the load went from ~0.06/s to a steady 1 per EXTRACT_INTERVAL =
+## 3.33/s, against a door that admits ~4.5/s (a pebble clears BORE_W of free fall in ~0.22 s).
+## That ~35% margin is the reason this stayed one shared door instead of being split into two
+## lanes at the outlet, and it is MEASURED rather than computed: fed at the full rate with the
+## legs alternating, `tests/live_riser.gd` sees the pending queue never back up. If the drop is
+## ever asked to carry more (a shorter EXTRACT_INTERVAL, say), this is the number that runs out
+## first — and it fails safely, as back-pressure in `_drop_pending`, not as overlapping bodies.
 const MOUTH_CLEAR := BORE_W + 2.0
 
 
-## Is this body on the discharge conveyor, i.e. should the belt be dragging it?
+## Is this body in the DUCT — the horizontal run under the vessel that both legs share?
 ##
-## The zone is the conveyor's own bore, and it ENDS at the mouth: past that the pebble has
-## left the floor and is falling into the tray, where a belt has nothing to push against
-## and pushing anyway would throw it at the far wall. So the belt lets go exactly where the
-## floor does.
-static func on_discharge_belt(at: Vector2) -> bool:
+## This answers WHERE a pebble is, and deliberately not WHICH WAY it should be pushed. Both
+## belts live in this one duct, running opposite ways from the sorter, so the direction is a
+## property of the PEBBLE'S LEG and not of the place it is standing in: main reads it from
+## `_transit`, never from geometry (see `main._drive`). A zone that tried to answer both —
+## "left of the hub means push left" — would be the same mistake as taking a rider's tangent
+## from the nearest point on a path that doubles back on itself: it would decide a pebble's
+## direction from where it had drifted to, so one nudge past the hub would turn a spent
+## pebble around and send it up the riser.
+##
+## The zone ENDS at the pool's mouth: past that the pebble has left the floor and is falling
+## into the tray, where a belt has nothing to push against and pushing anyway would throw it
+## at the far wall. So the belt lets go exactly where the floor does — and, at the other end,
+## exactly where the riser's own drive takes over.
+static func in_duct(at: Vector2) -> bool:
 	var half := BORE_W * 0.5
 	return at.y > HUB_Y - half and at.y < HUB_Y + half + PEBBLE_R \
-			and at.x > BIN_X + half and at.x < Silo.CENTER_X + half
+			and at.x > BIN_X + half and at.x < RISER_X + half
+
+
+## Is this body in the RISER — the climb from the foot of the duct up to the chute?
+##
+## IT OVERLAPS THE DUCT AT THE BOTTOM CORNER, ON PURPOSE, and that overlap IS the bend. A
+## pebble arriving at the foot of the riser is still on the duct floor being dragged right,
+## and it is also here being lifted, so it gets both pushes at once and rounds the elbow on a
+## diagonal. Exclusive zones — right until x reaches RISER_X, then up — put a hard line at
+## the corner instead, and a pebble that touches the riser's far wall and rebounds back
+## across that line is driven right again, into the wall it just came off. The overlap is
+## what a real transfer between two conveyors looks like anyway: they share the corner.
+##
+## Wider than the bore (BORE_W either side of the centreline, not BORE_W/2) so the lift has
+## already begun while the pebble is still short of the riser proper. It is bounded BELOW by
+## the duct floor and ABOVE by the chute, where main lifts the body off.
+static func in_riser(at: Vector2) -> bool:
+	return absf(at.x - RISER_X) < BORE_W \
+			and at.y > CHUTE_Y and at.y < HUB_Y + BORE_W * 0.5
+
+
+## Has a climbing pebble reached the head of the riser, where main lifts it onto the chute?
+##
+## This is the riser belt's TERMINUS, and having one is what lets that belt run at 380 while
+## the discharge belt must crawl at 95: this leg does not end in an open exit a pebble could
+## overshoot, it ends in a removal at a fixed point. Nothing is thrown anywhere, so nothing
+## has to be slow enough not to be thrown.
+##
+## Both axes, like `pool_contains` and for the same reason: a bare `y <= CHUTE_Y` would be
+## satisfied by a pebble that had punched through the riser wall and sailed up the outside of
+## it, and would report the escape as a delivery. Requiring x as well means only a pebble
+## actually in the bore can arrive.
+static func riser_delivered(at: Vector2) -> bool:
+	return at.y <= CHUTE_Y and absf(at.x - RISER_X) < BORE_W
+
+
+## Where a pebble lifted off the riser starts its ride — the head of the climb, which is also
+## where `_pipe_runs` turns the riser into the chute. The hand-off is drawn at the point it
+## happens, so the body vanishes and the rider appears in the same place.
+static func riser_head() -> Vector2:
+	return Vector2(RISER_X, CHUTE_Y)
 
 
 ## Has a falling pebble reached the tray? Inside it in BOTH axes, deliberately.
@@ -514,7 +647,6 @@ func _process(_delta: float) -> void:
 ## measures the real peak and fails if it ever reaches the buffer).
 static func _path_for(kind: int, from: Vector2, spawn_x: float) -> PackedVector2Array:
 	var hub := Vector2(Silo.CENTER_X, HUB_Y)
-	var mouth := Vector2(Silo.CENTER_X, Silo.OUTLET_Y)
 	match kind:
 		# There is no DISCHARGE case, and its absence is deliberate rather than an
 		# oversight. Phase 3b-i put spent fuel on a BELT: it is a real body rolling down a
@@ -534,14 +666,47 @@ static func _path_for(kind: int, from: Vector2, spawn_x: float) -> PackedVector2
 			# own because the plant already has one, it just runs it the other way. That
 			# also means no teleport: the player watches the pebble they edited climb out
 			# of the pool and re-enter the core along the same pipes everything else uses.
+			#
+			# ⚠️ STILL A RIDER, AND NOW THE ONLY THING IN THE PLANT THAT PHASES. Known, flagged
+			# to the user at 3b-i and knowingly banked; 3b-ii did not fix it and made the
+			# picture slightly worse rather than better, because the pipes it glides through
+			# are now BOTH real and BOTH busy — it passes through the duct's walls, through
+			# spent fuel rolling left, and through recirculating fuel climbing the riser. It is
+			# a picture problem only: `live_reinject` is green because the accounting never
+			# went near the belts, and the R key is rare and player-triggered.
+			#
+			# WHY IT IS NOT SIMPLY PROMOTED TO A BELT: **a belt runs ONE way**, and this route
+			# is the discharge leg BACKWARDS. Giving it real bodies means giving it a real
+			# route of its own, and the plant has no free lane — the obvious one (under
+			# everything at y ≈ 1000, from the tray's right wall rightward to the foot of the
+			# riser) has to merge INTO the riser, and the duct's floor currently runs unbroken
+			# to x = 986 across the exact place it would arrive. Cutting a hole there is not
+			# free either: it is the floor recirculating pebbles are dragged along, and a hole
+			# in it is a hole they fall through. **In 2D two open channels cannot cross — a
+			# tunnel's roof is a lid on the pipe it crosses.** That is the real problem to
+			# solve, and it wants its own slice rather than a half-measure here.
 			return PackedVector2Array([from, Vector2(BIN_X, BIN_Y), Vector2(BIN_X, HUB_Y), hub,
 					Vector2(RISER_X, HUB_Y), Vector2(RISER_X, CHUTE_Y),
 					Vector2(spawn_x, CHUTE_Y), Vector2(spawn_x, Silo.spawn_y())])
 		_:
-			# RECIRC: down to the sorter, right, up the riser, across the chute,
-			# and drop back into the bed.
-			return PackedVector2Array([from, mouth, hub, Vector2(RISER_X, HUB_Y),
-					Vector2(RISER_X, CHUTE_Y), Vector2(spawn_x, CHUTE_Y),
+			# RECIRC — and only the TAIL of it, which is why this is now three points and not
+			# seven. Phase 3b-ii made the climb real: a recirculating pebble is a BODY from the
+			# drop mouth, out along the duct and all the way up the riser, and it becomes a
+			# rider only when main lifts it off the head of the climb (`main._board_chute`). So
+			# `from` here is the top of the riser, not the bed, and all that is left to ride is
+			# the chute and the drop into the spawn band.
+			#
+			# WHY THE CHUTE STAYS A RIDE while everything below it is bodies — two reasons, and
+			# the second is the one that settles it:
+			#   * The chute's exit is each pebble's OWN spawn_x. That is a hole that MOVES from
+			#     pebble to pebble, and a hole that moves cannot be walled.
+			#   * Admission to the bed is GATED — the bed is held at exactly TARGET_POPULATION,
+			#     and `main._queue`/`_spawn_from_queue` is what pins it. A real chute would mean
+			#     bodies physically queued on a running belt whenever the bed is full: a jam
+			#     built on purpose, and one that would put the calibrated count at the mercy of
+			#     the solver. The ride costs nothing to hold and keeps the gate exactly where it
+			#     already is.
+			return PackedVector2Array([from, Vector2(spawn_x, CHUTE_Y),
 					Vector2(spawn_x, Silo.spawn_y())])
 
 

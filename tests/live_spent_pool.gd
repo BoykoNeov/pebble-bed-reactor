@@ -302,6 +302,27 @@ func _sync_pushed() -> void:
 			_pushed.append(peb)
 
 
+## Is any SPENT pebble still between the sorter and the tray?
+##
+## ⚠️ ASKS FOR THE DISCHARGE LEG SPECIFICALLY, and it has to. Both queues carry both legs since
+## Phase 3b-ii put recirculation on a belt of its own, and the recirculation leg is NEVER empty
+## in a running plant — every extraction that is not a discharge (about nine in ten) goes down
+## the same drop and up the riser. So the obvious `_transit.is_empty()` this replaces would
+## not be waiting for the dummies to land, it would be waiting for the reactor to stop
+## refuelling, which never happens: a hang, not a settle.
+##
+## The invariant this test wants is "everything I pushed has arrived". That was only ever
+## spelled `_transit.is_empty()` because the discharge leg was the only thing in there.
+func _spent_fuel_in_flight() -> bool:
+	for entry in _main._drop_pending:
+		if entry["leg"] == FuelLoop.DISCHARGE:
+			return true
+	for id in _main._transit:
+		if _main._transit[id] == FuelLoop.DISCHARGE:
+			return true
+	return false
+
+
 func _overfill_tick() -> void:
 	if _dummies >= FuelLoop.pool_capacity() + 3:
 		# Everything pushed must have LANDED before the tray is measured — the pipe is real
@@ -309,7 +330,7 @@ func _overfill_tick() -> void:
 		# plant's own queues (nothing waiting for the mouth, nothing left on the belt) rather
 		# than on a guessed duration is what stops this being a race that passes on a fast
 		# machine and flakes on a slow one.
-		if _main._drop_pending.is_empty() and _main._transit.is_empty():
+		if not _spent_fuel_in_flight():
 			_phase = 2
 			_settle_until = _t + SETTLE
 		return
@@ -350,7 +371,10 @@ func _overfill_tick() -> void:
 	# the mouth guard meters arrivals to ~4.5/s no matter how fast this pushes, so the pile
 	# cannot spawn inside itself. That hazard is now the PLANT's to prevent, not the test's.
 	_main._out_of_core[dummy.id] = true
-	_main._drop_pending.push_back(dummy)
+	# Tagged DISCHARGE explicitly: the drop is shared with the recirculation leg now, and the
+	# LEG is what tells the belt which way to push at the bottom of it (`main._drive`). An
+	# untagged dummy would be dragged out to the riser and posted back into the bed as fuel.
+	_main._drop_pending.push_back({"peb": dummy, "leg": FuelLoop.DISCHARGE})
 
 
 func _final_checks() -> void:

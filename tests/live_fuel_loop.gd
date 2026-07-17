@@ -19,6 +19,11 @@
 #     teleport is actually gone, not just re-dressed.
 #  3. Every pebble ever made is still ACCOUNTED FOR: riders are neither leaked (stuck
 #     forever on the conveyor) nor duplicated.
+#  4. Every body the BELTS carry sweeps its path (continuous collision on). Since Phase
+#     3b-ii most of the recirculation ride is a real body at 380 px/s, and a pebble built
+#     at RADIUS_MIN can cross a wall between two steps — see the note at the check itself
+#     for why this belongs here and not in tests/live_riser.gd, which measures the hazard
+#     but cannot tell whether the PLANT asked for the fix.
 #
 #     WHAT THIS IS CAREFUL NOT TO FORBID. This used to be stated as "total inventory is
 #     conserved at TARGET_POPULATION + LOOP_BUFFER", and checked `_pebbles.size()`
@@ -66,6 +71,10 @@ var _checked_fill := false
 var _checked_ride := false
 var _checked_cycle := false
 var _max_riders := 0
+# Bodies caught on a belt with continuous collision DISABLED. Any at all is a failure, so this
+# accumulates ids rather than a flag — it names the pebble that would have leaked.
+var _unswept: Array = []
+var _transit_seen := 0
 var _min_core_after_fill := 1 << 30
 # Invariant 5: a rider snapshotted mid-ride, re-checked while still riding.
 var _frozen_id := -1
@@ -96,6 +105,24 @@ func _process(delta: float) -> bool:
 	# counting a whole leg, and the gate below would go on passing while measuring less and
 	# less of what it is guarding. Count what is out of the bed, however it is getting there.
 	_max_riders = maxi(_max_riders, _main._loop.count() + _main._transit.size())
+
+	# Every body the belts carry must SWEEP its path, not just sample where it landed.
+	#
+	# WHY THIS IS CHECKED HERE, in the plant, and not where the hazard was measured: the
+	# tunnelling itself is gated by tests/live_riser.gd, which drives the geometry directly at
+	# RADIUS_MIN and loses up to 37% of the recirculating fuel with sweeping off. But that
+	# harness turns sweeping on ITSELF — so it proves the pipe needs it and would go on passing
+	# happily if `main._feed_drop` ever stopped asking for it. Nothing else would notice either:
+	# the nominal pebble does not tunnel, so the live plant looks perfect until a player winds
+	# the size lever down and the bed starts quietly losing fuel it will never get back.
+	# This is the line that says the PLANT wires it, not just that the physics supports it.
+	for id in _main._transit:
+		var body = _main._physics._bodies.get(id)
+		if body == null:
+			continue
+		_transit_seen += 1
+		if body.continuous_cd == RigidBody2D.CCD_MODE_DISABLED and not _unswept.has(id):
+			_unswept.append(id)
 
 	# Catch a HOT rider mid-ride and remember its state, to prove it is frozen in transit.
 	# WHY the temperature floor is load-bearing: `_out_of_core` covers BOTH riders and the
@@ -165,6 +192,11 @@ func _process(delta: float) -> bool:
 		_check(_max_riders > 0, "pebbles physically RIDE the machine (no teleport)")
 		_check(_max_riders <= _main.LOOP_BUFFER,
 			"riders in flight stay within the buffer (queue cannot starve)")
+		# The `_transit_seen` half is what stops this being vacuous: with no bodies on the
+		# belts, "none of them is unswept" is true of the empty set and says nothing.
+		_check(_transit_seen > 0 and _unswept.is_empty(),
+			"every body the belts carry has continuous collision ON (%d seen, %d unswept) — the plant wires the sweep, not just the physics"
+				% [_transit_seen, _unswept.size()])
 
 	# t=70 s: a full cycle has run. The bed must NEVER have dipped below target.
 	if _t >= 70.0 and not _checked_cycle:

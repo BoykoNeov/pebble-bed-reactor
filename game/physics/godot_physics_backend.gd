@@ -69,6 +69,16 @@ func apply_force(id: int, force: Vector2) -> void:
 		body.apply_central_force(force)
 
 
+func set_continuous_cd(id: int, on: bool) -> void:
+	var body: PebbleBody = _bodies.get(id)
+	if body != null:
+		# CAST_RAY, not CAST_SHAPE: the pebble is a disc and the thing it tunnels through is
+		# a thin segment wall, so sweeping the centre is enough to catch the crossing and is
+		# the cheaper of the two.
+		body.continuous_cd = RigidBody2D.CCD_MODE_CAST_RAY if on \
+				else RigidBody2D.CCD_MODE_DISABLED
+
+
 func set_pebble_tint(id: int, color: Color) -> void:
 	var body: PebbleBody = _bodies.get(id)
 	if body != null:

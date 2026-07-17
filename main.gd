@@ -191,9 +191,9 @@ var _pebbles: Dictionary = {}   # id -> Pebble (the FULL inventory: bed + machin
 # The fuel-handling machine outside the vessel, and the places a pebble can be when it is
 # not fuel in the bed. A pebble is in exactly one of six states: in the BED (a body the
 # neutronics sees); RIDING the machine (no body — the plant draws it along a path); STAGED
-# in `_queue` at the top waiting for a slot (no body, nothing draws it); PENDING at the
-# discharge pipe's mouth waiting for room (no body, likewise); settled in the spent POOL (a
-# body, in a real tray); or in TRANSIT down a pipe (a body, on a belt). `_out_of_core` is
+# in `_queue` at the top waiting for a slot (no body, nothing draws it); PENDING at the drop's
+# mouth waiting for room (no body, likewise); settled in the spent POOL (a body, in a real
+# tray); or in TRANSIT through the pipes (a body, on a belt). `_out_of_core` is
 # the id set for the five that are not the bed — main-side only, so Pebble stays a pure sim
 # struct with no notion of the game's fuel handling.
 #
@@ -205,8 +205,9 @@ var _pebbles: Dictionary = {}   # id -> Pebble (the FULL inventory: bed + machin
 var _loop: FuelLoop
 var _queue: Array = []          # [{id, x}] arrived at the top, waiting to enter the bed
 var _out_of_core: Dictionary = {}   # id -> true for every pebble outside the bed
-# Pebbles being carried down a pipe as REAL BODIES (Phase 3b-i) — id -> leg. A FIFTH
-# state, and the first one that is out of the core while still holding a body.
+# Pebbles being carried through the pipes as REAL BODIES (Phase 3b) — id -> leg. A FIFTH
+# state, and the first one that is out of the core while still holding a body. Not "down": the
+# recirculation leg goes down the drop, out along the duct and then 880 px UP the riser.
 #
 # It exists because a belt-driven pebble has to be told apart from a settled one: both are
 # bodies the engine is stepping, but this one still needs pushing and still needs watching
@@ -217,10 +218,16 @@ var _out_of_core: Dictionary = {}   # id -> true for every pebble outside the be
 # Note it does NOT replace `_out_of_core`, it rides alongside it: `_out_of_core` answers
 # the NEUTRONICS question ("is this fuel in the bed"), which for a transiting pebble is no.
 # That one flag is the whole reason this leg cannot shift k (see `_core_positions`).
+#
+# It carries the pebble's LEG, not just its membership, and that is the whole design of the
+# belts since Phase 3b-ii put recirculation on one too. Both legs share the drop and share the
+# duct, running opposite ways out of the sorter, so where a body IS cannot tell you which way
+# to push it — only its leg can (see `_drive`). The sorter decides once and this remembers.
 var _transit: Dictionary = {}
-# Spent pebbles the sorter has taken but the discharge pipe has not accepted yet, oldest
-# first — the pipe's feed queue. A SIXTH state, and bodiless like the riders and the staging
-# queue. See `_feed_drop` for why a physical pipe needs a door.
+# Pebbles the sorter has taken but the drop has not accepted yet, oldest first — the pipe's
+# feed queue, as [{peb, leg}]. A SIXTH state, and bodiless like the riders and the staging
+# queue. See `_feed_drop` for why a physical pipe needs a door, and why both legs queue in
+# this ONE list: the vessel has one outlet, so they are genuinely waiting for the same hole.
 var _drop_pending: Array = []
 # Pebbles that finished their last pass and settled in the spent-fuel pool, oldest
 # first. A FOURTH state, and — since the pool became RE-INJECTABLE — one that lives
@@ -473,12 +480,13 @@ func _ready() -> void:
 	for seg in FuelLoop.pool_walls():
 		_physics.add_static_segment(seg[0], seg[1])
 
-	# The DISCHARGE pipe is solid too (Phase 3b-i): a spent pebble is a real body from the
-	# outlet to the pile, so the pipe it travels down needs faces to travel down. Same
-	# reasoning as the tray's walls above — immovable steel the backend cannot tell from
-	# the silo's — and the same guard keeps it out of the reactor: a body in this pipe is
-	# `_out_of_core`, so the pipe crossing valid grid cells costs nothing.
-	for seg in FuelLoop.discharge_walls():
+	# The transport pipes are solid too (Phase 3b): an extracted pebble is a real body from
+	# the outlet to wherever it is going — down to the pool if it is spent, out along the duct
+	# and up the riser if it is not. So the pipes it travels need faces to travel down. Same
+	# reasoning as the tray's walls above — immovable steel the backend cannot tell from the
+	# silo's — and the same guard keeps them out of the reactor: a body in this pipework is
+	# `_out_of_core`, so the pipes crossing valid grid cells cost nothing.
+	for seg in FuelLoop.plant_walls():
 		_physics.add_static_segment(seg[0], seg[1])
 
 	# The coarse neutronics mesh over the silo + reflector band.
@@ -701,20 +709,23 @@ func _physics_process(delta: float) -> void:
 	# Native self-steps; kept explicit so an external engine slots in cleanly.
 	_physics.step(delta)
 
-	# The belts: let the next spent pebble into the pipe if there is room for it, press on
-	# every pebble the pipe is carrying, and pool the ones that have arrived. Real bodies, so
+	# The belts: let the next extracted pebble into the drop if there is room for it, press on
+	# every pebble the pipes are carrying, and hand over the ones that have arrived — into the
+	# pool if they were spent, onto the chute if they are going back around. Real bodies, so
 	# this is the one transport path that IS physics.
 	_feed_drop()
 	_belt_step()
 
-	# The fuel-handling machine: advance every pebble still RIDING between the outlet and
-	# the top, then act on the ones that arrived. Riders carry no body and no flux, so this
-	# is transport bookkeeping only — it touches no physics.
+	# The fuel-handling machine: advance every pebble still RIDING, then act on the ones that
+	# arrived. Riders carry no body and no flux, so this is transport bookkeeping only — it
+	# touches no physics.
 	#
-	# DISCHARGE is no longer among them (Phase 3b-i put it on a belt), so every arrival here
-	# is a pebble heading back INTO the bed and stages in the queue. The branch that used to
-	# fork on kind is gone rather than left with one live case: `_pool_admit` is now reached
-	# from the belt, which is where the pebble physically arrives.
+	# What is left up here is the TOP of the loop: the chute and the drop into the spawn band.
+	# Phase 3b-i took DISCHARGE off the machine and 3b-ii took the recirculation leg's climb
+	# off it, so a rider is now either a recirculating pebble that has already made it up the
+	# riser, fresh fuel coming in from the hopper, or a re-injected one. Every arrival here is
+	# therefore a pebble heading INTO the bed, and stages in the queue — which is why there is
+	# no fork on kind at all.
 	for arrival in _loop.advance(delta):
 		# Recirculated, fresh, or re-injected: stage at the top for the next free bed slot.
 		_queue.push_back({"id": arrival["id"], "x": arrival["x"]})
@@ -871,34 +882,100 @@ func _belt_step() -> void:
 	var landed: Array = []
 	for id in _transit:
 		var at := _physics.get_position(id)
-		if FuelLoop.pool_contains(at):
+		if _delivered(at, _transit[id]):
 			landed.append(id)
 			continue
-		_drive(id, at)
+		_drive(id, at, _transit[id])
 	# Collected first, mutated after: `_pool_admit` can ship a pebble to a cask, which
 	# erases from `_pebbles` — and erasing anything mid-walk over `_transit` is how a
 	# harmless arrival turns into a corrupted iteration.
 	for id in landed:
+		var leg: int = _transit[id]
 		_transit.erase(id)
+		if leg == FuelLoop.RECIRC:
+			_board_chute(_pebbles[id])
+			continue
 		_pool_admit(_pebbles[id])
 		# THE discharge counter, and it lives here rather than in `_pool_admit` because this
 		# is the site only a real pebble off a real pipe reaches (see there).
 		_total_extracted += 1
 
 
-## Press one pebble along the belt under it, if there is one under it.
+## Has this pebble reached the end of ITS leg? Each ends somewhere completely different — one
+## tips off a conveyor into an open tray, the other is lifted off the head of a climb — so
+## there is no shared "arrived" line to test and asking by leg is the only honest question.
+func _delivered(at: Vector2, leg: int) -> bool:
+	if leg == FuelLoop.RECIRC:
+		return FuelLoop.riser_delivered(at)
+	return FuelLoop.pool_contains(at)
+
+
+## Press one pebble along whichever belt its leg puts it on.
 ##
-## The velocity test IS the belt (see FuelLoop.BELT_DISCHARGE): push only while the pebble
-## is still slower than the belt, so it is dragged UP TO belt speed and no further. A pebble
-## already at speed is coasting on a surface moving with it, which is what riding a conveyor
-## is, and it leaves the end at belt speed no matter how hard the belt pressed to get it
-## there. Reversed — force with no speed limit — this same function throws pebbles out of
-## the world (measured, 3 in 10).
-func _drive(id: int, at: Vector2) -> void:
-	if not FuelLoop.on_discharge_belt(at):
-		return   # in the drop, or already tipping into the tray: gravity's business
-	if _physics.get_velocity(id).x > -FuelLoop.BELT_DISCHARGE:
-		_physics.apply_force(id, Vector2(-FuelLoop.BELT_FORCE, 0.0))
+## ⚠️ THE DIRECTION COMES FROM THE LEG, NEVER FROM THE POSITION, and that is the load-bearing
+## line in this function. Both belts run in the SAME duct, in opposite directions, so a drive
+## that asked "which side of the hub am I on" instead of "where am I going" would turn a spent
+## pebble around and send it up the riser the first time one drifted past the sorter. Reading
+## it from `_transit` means a pebble's destination is decided once, at the sorter, by policy —
+## which is where the fuel cycle's one decision belongs (see `_extract_lowest`).
+##
+## It is also what replaced the discharge conveyor's end cap. That wall had to be cut to let
+## recirculating fuel out of the drop at all (`FuelLoop.plant_walls`), so a discharge pebble
+## bouncing rightward off the corner is no longer stopped by geometry — it is simply still on
+## the leftward belt wherever it lands, and gets pushed back.
+##
+## The velocity test IS the belt: push only while the pebble is still slower than the belt, so
+## it is dragged UP TO belt speed and no further. A pebble already at speed is coasting on a
+## surface moving with it, which is what riding a conveyor is, and it leaves at belt speed no
+## matter how hard the belt pressed to get it there. Reversed — force with no speed limit —
+## this same drive throws pebbles out of the world (measured, 3 in 10).
+func _drive(id: int, at: Vector2, leg: int) -> void:
+	if leg == FuelLoop.DISCHARGE:
+		# Out along the duct to the pool's mouth. Slow, because it ends by tipping into an
+		# open, lidless tray (see FuelLoop.BELT_DISCHARGE).
+		if FuelLoop.in_duct(at):
+			_belt(id, Vector2.LEFT, FuelLoop.BELT_DISCHARGE)
+		return
+	# RECIRC: out the other way and then up. BOTH pushes are applied, and the zones overlap at
+	# the foot of the riser on purpose — a pebble in the corner is dragged right AND lifted at
+	# once, so it rounds the elbow on a diagonal instead of being driven into the far wall and
+	# then asked to climb from a standstill (see FuelLoop.in_riser).
+	if FuelLoop.in_duct(at):
+		_belt(id, Vector2.RIGHT, FuelLoop.BELT_RISER)
+	if FuelLoop.in_riser(at):
+		_belt(id, Vector2.UP, FuelLoop.BELT_RISER)
+
+
+## The belt itself: drag a body up to `speed` along `dir`, and no further.
+##
+## `dot(dir)` generalizes the old `velocity.x > -BELT_DISCHARGE` to a belt that can run in any
+## direction — including straight up, where the force must also beat gravity all the way (2500
+## against ~980, so the climb is comfortable rather than marginal).
+func _belt(id: int, dir: Vector2, speed: float) -> void:
+	if _physics.get_velocity(id).dot(dir) < speed:
+		_physics.apply_force(id, dir * FuelLoop.BELT_FORCE)
+
+
+## Lift a pebble off the head of the riser and put it on the chute as a rider — the one seam
+## left on the recirculation leg, and a deliberate one.
+##
+## The body must go: a rider is drawn by the plant along its path, so a pebble may be one or
+## the other and never both, or it would be drawn twice and picked twice. It happens exactly
+## where `_pipe_runs` turns the riser into the chute, so nothing jumps on screen.
+##
+## WHY A RIDER AND NOT MORE PIPE: the chute pours into the bed at each pebble's own spawn_x —
+## a hole that moves — and bed admission is GATED at TARGET_POPULATION. See
+## `FuelLoop._path_for`; the short version is that a real chute would need bodies queueing on a
+## live belt against a closed gate, which is a jam by design, and the gate is the thing that
+## pins the calibrated count.
+func _board_chute(peb: Pebble) -> void:
+	_physics.remove_pebble(peb.id)
+	# peb.radius, not the nominal: a recirculating pebble was manufactured at whatever the
+	# design was AT THE TIME, so mid-campaign the machine legitimately carries a mix of sizes.
+	# Using the constant would be silently wrong even for an UNEDITED pebble — it only needs
+	# the design to have moved since that pebble was made.
+	_loop.add(peb.id, FuelLoop.RECIRC, FuelLoop.riser_head(),
+			Silo.spawn_x(_rng, peb.radius + 2.0), _pebble_tint(peb), peb.radius)
 
 
 ## Send the oldest pooled pebble away for good — it leaves the plant entirely.
@@ -1211,23 +1288,35 @@ func _extract_lowest() -> void:
 ## burned state (isotopics, burnup, poison). Population is unchanged, so minting
 ## does not add a fresh pebble for it — only a true discharge opens a slot.
 ##
-## It now RIDES the machine to get there instead of teleporting: the body is
-## destroyed here and rebuilt when the ride ends (_spawn_from_queue). In between the
-## pebble has no body, so it is invisible to homogenization, and main freezes its
-## state — a pebble in the transport pipe is out of the flux, so it neither fissions
-## nor burns. That makes this behavior-identical to the old instant hop apart from
-## the delay, which the LOOP_BUFFER absorbs.
+## PHASE 3b-ii: it CLIMBS OUT as a real body instead of gliding out as a drawing. A
+## recirculating pebble now goes down the same drop a spent one does, is dragged out along the
+## duct by its own belt — the opposite way to the discharge belt sharing that duct, which is
+## the sorter's decision made mechanical — and is lifted 880 px up the riser, colliding with
+## the pipe and with the pebbles ahead of it the whole way. Only at the head of the climb does
+## it become a rider again, for the chute (`_board_chute`).
+##
+## THE STATE IT KEEPS is untouched by any of that: isotopics, burnup and poison all ride
+## along, because a pass ends at the sorter and not at the pipe. What it does NOT do is burn
+## while travelling — it is `_out_of_core` from here until it lands back in the bed, so it is
+## outside the flux solve and main freezes it. That is what makes the whole leg free: however
+## long the journey takes, the reactor cannot tell, and LOOP_BUFFER covers the pebbles it
+## leaves in the pipe meanwhile.
+##
+## Population is unchanged, so minting does not add a fresh pebble for it — only a true
+## discharge opens a slot.
 func _recirculate(id: int, peb: Pebble) -> void:
 	peb.pass_count += 1
-	var from := _physics.get_position(id)
+	# The body goes here and is rebuilt in the drop mouth, exactly as a discharge's is: the
+	# hopper is CLOSED and must stay closed (a real hole would drain the calibrated bed), so a
+	# metered extraction is a removal at the outlet and a reappearance in the pipe it was
+	# metered into. See `FuelLoop.drop_mouth` for the full argument — this is the same seam,
+	# and it is now the ONLY one on this leg: from the mouth to the top of the riser the pebble
+	# is one continuous body.
 	_physics.remove_pebble(id)
 	_out_of_core[id] = true
-	# peb.radius, not the nominal: a recirculating pebble was manufactured at whatever
-	# the design was AT THE TIME, so mid-campaign the machine legitimately carries a mix
-	# of sizes. This is the site where using the constant would be silently wrong even
-	# for an UNEDITED pebble — it only needs the design to have moved since it was made.
-	_loop.add(id, FuelLoop.RECIRC, from, Silo.spawn_x(_rng, peb.radius + 2.0),
-			PebbleBody.DEFAULT_TINT, peb.radius)
+	# It does NOT get a body here — it gets in line for one, in the SAME queue spent fuel uses.
+	# One outlet, one drop, one door (see `_feed_drop`).
+	_drop_pending.push_back({"peb": peb, "leg": FuelLoop.RECIRC})
 	_total_recirculated += 1
 
 
@@ -1257,7 +1346,7 @@ func _discharge(id: int, peb: Pebble) -> void:
 	# crosses valid grid cells, and this flag is what stops the flux solve from seeing it.
 	_out_of_core[id] = true
 	# It does NOT get a body here — it gets in line for one. See `_feed_drop`.
-	_drop_pending.push_back(peb)
+	_drop_pending.push_back({"peb": peb, "leg": FuelLoop.DISCHARGE})
 
 
 ## Put the next spent pebble into the discharge pipe, IF the pipe's mouth is empty.
@@ -1285,27 +1374,54 @@ func _discharge(id: int, peb: Pebble) -> void:
 ## The back-pressure is honest and self-limiting: if the belt ever stops, this grows, the
 ## mint gate sees no freed slots, and the plant slows down — which is what a blocked
 ## discharge line should do. It does not silently drop fuel on the floor.
+## ONE DOOR FOR BOTH LEGS, because there is one outlet. The sorter's choice is recorded on the
+## pebble (`leg`) and settled by the BELT that picks it up at the bottom of the drop, not by
+## giving each destination its own hole in the hopper. That is what the plant has always drawn
+## — the pipe leaves the vessel, falls to the SORT hub, and only there parts left or right —
+## and it is now what the physics does.
+##
+## THE HEAD-ON THIS COULD HAVE BEEN, and why it is not: two pebbles driven at each other with
+## BELT_FORCE apiece would stand there forever. It cannot arise, and not by luck. Every pebble
+## enters at the drop's x and is driven AWAY from it — discharge left, recirc right — so
+## `discharge_x <= drop_x <= recirc_x` holds structurally and the two legs can only ever be
+## pushed apart. MEASURED anyway, because that argument is exactly the kind that is right until
+## it is not: a spike fed this drop 150 pebbles ALTERNATING leg every single one (the worst
+## case there is — real traffic is ~90% recirc, and the middle of a discharge wave is ~all
+## discharge, both of which are one-directional) and saw 0 stuck, 0 lost, and the mouth queue
+## never back up at the full 1-per-EXTRACT_INTERVAL feed.
 func _feed_drop() -> void:
 	if _drop_pending.is_empty() or not _drop_mouth_clear():
 		return
-	var peb: Pebble = _drop_pending.pop_front()
+	var next: Dictionary = _drop_pending.pop_front()
+	var peb: Pebble = next["peb"]
 	# Somewhere across the bore, not dead-centre — the pipe is built with BORE_CLEARANCE of
 	# play and a pebble does not enter one perfectly aligned. Same honest disorder source as
 	# `pool_drop`'s, and it matters for the same reason: symmetric contacts stack.
 	_physics.spawn_pebble(peb.id,
 			FuelLoop.drop_mouth(_rng.randf_range(-1.0, 1.0), peb.radius), peb.radius)
+	# Sweep this body's path, don't just sample where it lands. The riser belt runs at 380 px/s
+	# and radius is a PLAYER LEVER: a pebble designed at RADIUS_MIN is only 10 px across while
+	# a step at belt speed carries it ~6.3 px, and that margin is thin enough that the corner
+	# impact punches it clean through the riser's wall. Measured with this line removed: 12, 26
+	# and 14 recirculating pebbles lost in three runs of ~70, every one of them a pebble the
+	# calibrated bed never gets back. See `PhysicsBackend.set_continuous_cd`.
+	_physics.set_continuous_cd(peb.id, true)
 	# Tint it NOW rather than letting the per-frame walk catch it a frame later in graphite
 	# grey: under a per-pebble field the pebble the player is following must not blink.
 	_physics.set_pebble_tint(peb.id, _pebble_tint(peb))
-	_transit[peb.id] = FuelLoop.DISCHARGE
+	_transit[peb.id] = next["leg"]
 
 
 ## Is there room at the mouth for one more pebble?
 ##
-## Only `_transit` is searched, and that is sufficient rather than lazy: the mouth sits below
-## the hopper floor, inside the discharge bore, and the only bodies that can ever be in there
-## are the ones this leg put there. Bed pebbles are the other side of a wall; pooled ones are
-## 250 px away at the far end of the pipe.
+## Searches `_transit` WITHOUT asking which leg, and that is the point rather than an oversight:
+## the mouth is shared, so what matters is whether anything is standing in it, not what that
+## thing is going to do next. A per-leg check would happily drop a recirculating pebble onto a
+## spent one still clearing the drop.
+##
+## And `_transit` alone is sufficient: the mouth sits below the hopper floor, inside the drop's
+## bore, and the only bodies that can ever be in there are the ones the drop put there. Bed
+## pebbles are the other side of a closed floor; pooled ones are at the far end of the duct.
 func _drop_mouth_clear() -> bool:
 	var mouth := FuelLoop.drop_mouth()
 	for id in _transit:
@@ -1767,11 +1883,16 @@ func _pick_at(at: Vector2) -> void:
 
 ## What to call the place a BODIED pebble is sitting. Riders are not covered — the plant
 ## answers for those (`_pick_at` asks it first, because a rider has no body to find).
+## Naming the LEG, not just the pipe: `_transit` carries both since Phase 3b-ii, and the two
+## mean opposite things to the player — one pebble is on its way out of the reactor for good,
+## the other is going back around for another pass. Answering "discharge pipe" for both (which
+## is what a bare membership test does, and did) would tell someone watching a pebble climb the
+## riser that it had been thrown away.
 func _where_is(peb: Pebble) -> String:
 	if _spent.has(peb):
 		return "spent pool"
 	if _transit.has(peb.id):
-		return "discharge pipe"
+		return "recirc riser" if _transit[peb.id] == FuelLoop.RECIRC else "discharge pipe"
 	return "core bed"
 
 
