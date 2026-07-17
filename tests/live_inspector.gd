@@ -5,10 +5,11 @@
 #
 # WHY: picking lives in main.gd + game/, so the pure suites cannot see it. The failure
 # it guards is quiet rather than loud — a click that selects the WRONG pebble still
-# fills the panel with a plausible-looking pebble, and nothing crashes. The pool is
-# the sharp edge: it draws a WINDOW of the newest arrivals, so its slot index is not
-# an index into main._spent, and an off-by-one there reads as "the inspector works"
-# while reporting a neighbour's composition.
+# fills the panel with a plausible-looking pebble, and nothing crashes. The pool used to
+# be the sharp edge (it drew a WINDOW of the newest arrivals into fixed slots, so an
+# off-by-one in the index read as "the inspector works" while reporting a neighbour's
+# composition); settled pebbles are bodies now and are picked at their own positions, so
+# that edge is gone and what is left to check is that the click reaches them at all.
 #
 # Also guards the property the inspector's whole design rests on: it is a pure
 # CONSUMER (CLAUDE.md — visualization never writes back). Selecting a pebble must not
@@ -40,7 +41,11 @@ func _process(delta: float) -> bool:
 		return false
 
 	# --- A bed pebble ---
-	var positions: Dictionary = _main._physics.positions()
+	# Picked out of `_core_positions()`, not the raw body list. Every body used to be a bed
+	# pebble, so the raw list was the same thing; the spent pool is bodied now, so reaching
+	# into the middle of the raw list can hand back a pebble sitting in the TRAY and this
+	# would fail on "core bed" while the inspector was working perfectly.
+	var positions: Dictionary = _main._core_positions()
 	var bed_id: int = positions.keys()[positions.size() / 2]
 	var bed_at: Vector2 = positions[bed_id]
 	_main._pick_at(bed_at)
@@ -51,49 +56,49 @@ func _process(delta: float) -> bool:
 	_ok(_main._selected_pos().distance_to(bed_at) < 1.0,
 		"the selection ring resolves to the pebble's live position")
 
-	# --- The spent pool: clicking a slot must select the pebble drawn in it ---
+	# --- The spent pool: clicking a settled pebble must select THAT pebble ---
 	#
-	# THIS USED TO BE "the window-offset trap", and the rewrite is the point. The pool is
-	# now CAPPED at what the tray draws (main._pool_push), so the window it guarded cannot
-	# arise: `from = maxi(0, _spent.size() - cap)` is identically zero once the cap holds,
-	# and slot i IS _spent[i]. The old test manufactured `from > 0` by pushing dummies
-	# straight onto `_spent`, BYPASSING the cap — so keeping it would mean asserting an
-	# offset that only exists when the test itself breaks the invariant. That is guarding
-	# the MECHANISM instead of the claim, the same trap live_spent_pool and live_fuel_loop
-	# each had to be re-pointed out of.
+	# THIS USED TO BE "the window-offset trap", then "the slot-index trap", and now it is
+	# neither — which is the point. A settled pebble is a BODY: the picker finds it at its
+	# own position, by the same nearest-hit search that finds a bed pebble, so there is no
+	# index to be off by and no second layout to disagree with the renderer. The bug class
+	# this section was written to guard stopped existing rather than being supervised.
+	#
+	# It also stopped needing to manufacture the situation. The old form pushed cap+4 dummy
+	# pebbles in one frame to force a full tray; done now, all of them would spawn inside
+	# one another at the pipe mouth and the solver would scatter the pile, so clicking "the
+	# newest" would be clicking into a heap of overlapping bodies. The real pool the
+	# reactor has produced by 80 s is a better subject than any dummy — those pebbles fell
+	# down a real pipe and settled where physics put them. The cap itself is gated where it
+	# belongs, in live_spent_pool.gd, which fills the tray on the clock and measures the fit.
 	#
 	# The HAZARD is unchanged and still guarded: a click must select the pebble the player
-	# sees at that pixel. Both ends of the tray are checked, because an off-by-one that
-	# happens to work at one end will not work at both.
-	var cap := FuelLoop.pool_capacity()
-	# Fill THROUGH the real push site, and overfill it: the cap is what makes the offset
-	# vanish, so it has to be exercised here rather than assumed. Pushing past the tray is
-	# now a test of the cap, not a way to sneak past it.
-	for i in cap + 4:
-		var dummy := Pebble.new(800000 + i, _main.PEBBLE_RADIUS)
-		dummy.burnup = Depletion.DISCHARGE_BURNUP
-		_main._pool_push(dummy)
-	_main._refresh_pool()
-	_ok(_main._spent.size() == cap,
-		"the pool is capped at the tray, so every pooled pebble is on screen (%d == %d)"
-			% [_main._spent.size(), cap])
-	var shown: int = _main._loop._pool_tints.size()
-	_ok(shown == _main._spent.size(),
-		"the tray draws the WHOLE pool — no pebble is retained but unreachable (%d drawn, %d held)"
-			% [shown, _main._spent.size()])
-	if shown > 0:
-		var newest_slot := shown - 1
-		_main._pick_at(FuelLoop.pool_slot(newest_slot))
-		_ok(_main._selected == _main._spent[newest_slot],
-			"clicking the pool's newest slot selects the newest settled pebble")
-		_ok(_main._selected_where == "spent pool", "...and reports the pool (%s)" % _main._selected_where)
-		_main._pick_at(FuelLoop.pool_slot(0))
-		_ok(_main._selected == _main._spent[0],
-			"clicking the pool's first slot selects the oldest settled pebble")
-		_ok(_main._selected_pos().distance_to(FuelLoop.pool_slot(0)) < 1.0,
-			"a settled pebble's ring lands on its slot")
+	# sees at that pixel. Both ends of the pile are checked, because a mis-pick that happens
+	# to work for one pebble will not work for both.
+	var pool: Array = _main._spent
+	if pool.size() < 2:
+		_ok(false, "the pool had settled pebbles to click (%d by %.0f s)" % [pool.size(), _t])
 	else:
-		_ok(false, "the pool had settled pebbles to click (none by %.0f s)" % _t)
+		var oldest: Pebble = pool[0]
+		var newest: Pebble = pool[pool.size() - 1]
+		var at_old: Vector2 = _main._physics.get_position(oldest.id)
+		var at_new: Vector2 = _main._physics.get_position(newest.id)
+		# Guard the guard: two pebbles resting in the same place would make "clicked the
+		# right one" unfalsifiable. They are solid bodies, so they cannot — but if the pile
+		# were ever spawned overlapping (see above) this is what would say so.
+		_ok(at_old.distance_to(at_new) > FuelLoop.PEBBLE_R,
+			"the pile's oldest and newest rest apart (%.0f px) — a click can tell them apart"
+				% at_old.distance_to(at_new))
+		_main._pick_at(at_old)
+		_ok(_main._selected == oldest,
+			"clicking the oldest settled pebble selects it (#%d)" % oldest.id)
+		_ok(_main._selected_where == "spent pool", "...and reports the pool (%s)" % _main._selected_where)
+		_ok(_main._selected_pos().distance_to(at_old) < 1.0,
+			"a settled pebble's ring lands on the pebble itself")
+		_main._pick_at(at_new)
+		_ok(_main._selected == newest,
+			"clicking the newest settled pebble selects it (#%d)" % newest.id)
+		_ok(_main._selected_where == "spent pool", "...and reports the pool too (%s)" % _main._selected_where)
 
 	# --- A rider ---
 	if _main._loop.count() > 0:

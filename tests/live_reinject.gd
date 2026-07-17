@@ -79,13 +79,18 @@ func _act() -> bool:
 		_ok(false, "the pool had a settled pebble to re-inject (none by %.0f s)" % _t)
 		return _report()
 
-	# Select it the way a player does — through the picker, at the slot it is drawn in —
-	# rather than reaching into `_spent`. The action keys operate on the SELECTION, so
-	# selecting by hand here would leave the click path untested and could pass while the
-	# feature is unreachable in the actual game.
-	_main._pick_at(FuelLoop.pool_slot(0))
+	# Select it the way a player does — through the picker, at the pixel the pebble is
+	# lying on — rather than reaching into `_spent`. The action keys operate on the
+	# SELECTION, so selecting by hand here would leave the click path untested and could
+	# pass while the feature is unreachable in the actual game.
+	#
+	# Read off the BODY, because that is where the pebble is. This used to click
+	# `pool_slot(0)`, the lattice's idea of where the oldest arrival belonged; a settled
+	# pebble now lies wherever the pile put it, and clicking the old slot would generally
+	# select nothing at all.
+	_main._pick_at(_main._physics.get_position(spent[0].id))
 	_ok(_main._selected == spent[0] and _main._selected_where == "spent pool",
-		"clicking a pool slot selects that pebble (%s)" % _main._selected_where)
+		"clicking a settled pebble selects it (%s)" % _main._selected_where)
 
 	var peb: Pebble = _main._selected
 	_id = peb.id

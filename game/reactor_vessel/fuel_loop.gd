@@ -38,7 +38,18 @@ const HUB_Y := 955.0                  # the sorter: where recirc/discharge part 
 const RISER_X := 975.0                # the riser, in the right-hand reflector margin
 const CHUTE_Y := 75.0                 # the feed chute, above the vessel top (120)
 const BIN_X := 480.0                  # spent-fuel bin, left-hand margin
-const BIN_Y := 986.0                  # clear of the key-hints bar at y ≈ 1026
+# The discharge pipe's MOUTH — where a spent pebble leaves the plant and falls into the
+# pool. It sits just ABOVE the tray rim (POOL_FLOOR - POOL_H ≈ 968), and that clearance
+# is load-bearing rather than cosmetic: the arriving pebble is a real body now, so if the
+# mouth were inside the tray it would spawn INSIDE whatever is already piled there and
+# the solver would fire the two apart. It used to be 986 — a third of the way down the
+# tray — which was unremarkable while the pool was slots and paint.
+#
+# That leaves only a stub of vertical pipe below the conveyor at HUB_Y = 955, because
+# there is barely 60 px between the sorter and the key-hints bar (y ≈ 1026) and the tray
+# needs ~50 of it. Reads correctly anyway: the discharge conveyor runs out to the left
+# and dumps into the pool directly below it, which is what a transfer pool looks like.
+const BIN_Y := 958.0
 const HOPPER := Vector2(480.0, 44.0)  # fresh-fuel hopper, top-left
 
 # --- Spent-fuel pool ---
@@ -55,21 +66,68 @@ const HOPPER := Vector2(480.0, 44.0)  # fresh-fuel hopper, top-left
 # channel runs down it at x ≈ 526 from y = 120. A column there would bury the rod
 # the vessel shell was deliberately kept thin enough (WALL_T = 14) to leave visible.
 # So the pool takes the space that is genuinely dead: below the vessel floor, where
-# the grid cells are void and no rod reaches. That caps it at POOL_COLS × POOL_ROWS.
+# the grid cells are void and no rod reaches. That is what caps it: the tray is as big
+# as the dead space allows, and POOL_CAP is however many pebbles fit in it.
 #
 # The cap is honest rather than hidden: the pool holds the most RECENT arrivals and
 # main reports the true total discharged alongside it. A pile that silently stopped
 # growing would read as "discharge stopped" — the exact misreading this replaces.
 # Physically it is a transfer pool being emptied to casks, which is what a real
 # plant does with spent pebbles anyway.
+#
+# THE PEBBLES IN IT ARE REAL BODIES. They used to be tints painted into a fixed
+# lattice: `pool_slot(i)` put arrival i at column i%7, row i/7, and the tray was a
+# PICTURE of a pool rather than a pool. It read as a lattice because it WAS one — a
+# square grid of touching disks is not something gravity ever produces (disks roll
+# into the hex gaps of the row below), so the one place the player goes to inspect
+# the outflow was the one place the pebbles were arranged by an array index instead
+# of by physics.
+#
+# Now the tray has a real floor and real side walls (`pool_walls`, handed to the
+# physics backend exactly like Silo's shell), a discharged pebble drops in at
+# `pool_drop` and settles into the pile, and where it lands is EMERGENT. Nothing in
+# this file knows where a pooled pebble is any more: main reads it off the body, the
+# same way it reads the bed. That is also why `pool_slot`/`pool_index_at` are gone
+# rather than kept "for reference" — a layout function that no longer describes where
+# anything is is precisely the two-sources-of-truth drift this project has already
+# paid for once (commit 7b0be70).
+#
+# Safe because a pooled pebble is flagged `_out_of_core`: the coupling reads
+# `main._core_positions()`, which filters on that flag, so a body parked here is
+# visible to the physics and invisible to the neutronics. The tray sits over VALID
+# grid cells, so without that filter this pile would homogenize as if it were fuel in
+# the core and silently shift k. That guard was built and gated ahead of this change
+# (tests/live_spent_pool.gd parks a ghost body on the tray and proves the boundary
+# discriminates) — this is the change it was built for.
 const POOL_LEFT := 418.0
-const POOL_FLOOR := 1017.0    # tray floor; pebbles stack UPWARD from here
-const POOL_PITCH := 16.4      # a hair over a pebble diameter (2·PEBBLE_R = 16)
-const POOL_COLS := 7
-const POOL_ROWS := 3
-const POOL_CAP := POOL_COLS * POOL_ROWS
-const POOL_W := POOL_COLS * POOL_PITCH
-const POOL_H := POOL_ROWS * POOL_PITCH
+const POOL_FLOOR := 1017.0    # tray floor; pebbles pile UPWARD from here
+const POOL_W := 114.8         # ~7 pebble diameters wide
+const POOL_H := 49.2          # ~3 pebble diameters deep — see the corridor note above
+# How many settled pebbles the tray holds. MEASURED, not counted.
+#
+# The old value was COLS x ROWS = 21 — the number of slots the fake lattice had, which
+# was a statement about an array rather than about a tray. A real pile does not reach
+# it: dropped in through one pipe, pebbles heap up under the mouth and roll outward
+# rather than filling row by row, so the tray runs out of DEPTH before it runs out of
+# floor. (The disks themselves are not the limit — 2D disks pack to ~0.82 random-close,
+# far above the ~0.61 figure CLAUDE.md quotes for 3D spheres. The tray is ~3 diameters
+# deep and fed from a single point; that is the limit.)
+#
+# WHY THE WORST CASE AND NOT THE TYPICAL ONE. A settled pile's capacity is genuinely
+# random — the same drop sequence with different bore play gives a different pack. Over
+# seven fill runs the last count with every pebble resting fully inside the rim was
+# 12, 15, 15, 12, 16, 12, 16. So 12 is not a pessimistic reading of the data, it is the
+# outcome in three of seven runs, and the cap has to hold in the run it gets, not on
+# average.
+#
+# The consequence of overfilling is why it is worth being strict: the tray has no lid,
+# and it CANNOT have taller walls — the discharge conveyor runs across at y = 955, so a
+# wall reaching higher than the rim would stand in the pipe and stop the pebbles it is
+# supposed to be catching. Above the rim there is nothing to hold a pebble in, and one
+# that rolls off falls out of the world while still counted as held. Gated by
+# tests/live_spent_pool.gd, which fills the tray to exactly this number and fails if any
+# pebble comes to rest outside it.
+const POOL_CAP := 12
 const POOL_WALL := Color(0.10, 0.06, 0.06, 0.92)
 const POOL_EDGE := Color(0.55, 0.35, 0.35, 0.8)
 
@@ -109,33 +167,65 @@ const GRAPHITE := Color(0.62, 0.64, 0.68)
 # len (total), x (the spawn-band x it is bound for), tint.
 var _riders: Array = []
 
-# What the pool DISPLAYS: one tint per settled pebble, oldest first, at most
-# POOL_CAP. View state only — main owns the Pebbles themselves and stays the sole
-# owner of every Pebble (see the class comment). Keeping only colors here is what
-# lets the pool render without FuelLoop knowing what a Pebble is.
-var _pool_tints := PackedColorArray()
+# What the pool's CAPTION says. Counts only: the settled pebbles are real bodies that
+# draw themselves, so the tray holds no view state about them at all — it is a vessel,
+# and what is in it is the physics engine's business. (It used to hold a tint per
+# pebble, because it drew them.)
+var _pool_held := 0      # currently in the tray
 var _pool_total := 0     # every pebble ever discharged, including those since shipped
 var _pool_shipped := 0   # of those, the ones the full pool sent to a cask
 
 
-## Where the i-th settled pebble sits, filling the tray bottom row first, left to
-## right. Static because the inspector (and any hit-test) must derive the same
-## position from the same index as the renderer — two copies of this layout would
-## be a click that lands on the wrong pebble.
-static func pool_slot(i: int) -> Vector2:
-	var col := i % POOL_COLS
-	var row := i / POOL_COLS   # 0 = bottom row
-	return Vector2(
-		POOL_LEFT + POOL_PITCH * (float(col) + 0.5),
-		POOL_FLOOR - POOL_PITCH * (float(row) + 0.5))
+## The tray as wall segments for the physics backend: floor, left wall, right wall.
+## Open at the top — that is where pebbles drop in from the discharge pipe.
+##
+## Traced from the SAME constants the tray is drawn from, so the wall a pebble rests
+## on is the wall the player sees (the Silo.wall_segments discipline: the drawn face
+## IS the physics face, and the two cannot drift apart).
+##
+## No lid, and none is wanted: a pebble is only ever placed in here by `pool_drop`,
+## which starts it inside the tray, and the cap keeps the pile below the rim. If a
+## pebble ever came to rest ON TOP of the rim, that would mean POOL_CAP is too high
+## for the tray — which is a thing to find out, not to hide behind a lid.
+static func pool_walls() -> Array:
+	var right := POOL_LEFT + POOL_W
+	var top := POOL_FLOOR - POOL_H
+	return [
+		[Vector2(POOL_LEFT, POOL_FLOOR), Vector2(right, POOL_FLOOR)],   # floor
+		[Vector2(POOL_LEFT, POOL_FLOOR), Vector2(POOL_LEFT, top)],      # left wall
+		[Vector2(right, POOL_FLOOR), Vector2(right, top)],              # right wall
+	]
 
 
-## Hand the pool the colors of the settled pebbles it should show (oldest first — main
-## caps `_spent` at POOL_CAP, so this is the WHOLE pool, not a window), the running
-## count of everything ever discharged, and how many of those have since been shipped
-## to a cask. The last two are what keep a capped tray honest.
-func set_pool(tints: PackedColorArray, total: int, shipped: int) -> void:
-	_pool_tints = tints
+## Where a discharged pebble enters the tray — the mouth of the discharge pipe, which
+## is where its ride ends and where it was last drawn. Deriving the drop from the end
+## of the DISCHARGE path rather than restating a coordinate is what stops the pebble
+## from appearing to jump at the hand-off from conveyor to body.
+##
+## `across` is where the pebble sits ACROSS the bore, -1 (left wall) to +1 (right wall).
+## A pebble does not leave a pipe dead-centre — BORE_CLEARANCE of play is exactly what
+## the bore is built with — so the caller passes a random one and the pile gets a
+## realistically ragged feed.
+##
+## THIS IS NOT DECORATION, it is what makes the pile a pile. Dropped at a fixed x, every
+## pebble lands on the precise centre of the disc below it, and a contact that symmetric
+## has no tangential component to roll it off: the solver balances them into a single
+## perfectly-stacked COLUMN and holds it there. Measured, before this argument existed:
+## 26 pebbles standing in a 26-high tower out of the top of a 3-deep tray. Real granular
+## flow is disordered because real arrivals are, and the bore's own play is the honest
+## source of that disorder — it is a physical fact of the pipe, not a nudge added to make
+## the picture nicer.
+static func pool_drop(across := 0.0) -> Vector2:
+	return Vector2(BIN_X + across * BORE_CLEARANCE, BIN_Y)
+
+
+## Tell the tray how many pebbles it is holding, how many have EVER been discharged,
+## and how many of those have since gone to a cask. Counts only — the pebbles
+## themselves are bodies now and draw themselves, so the tray no longer renders them
+## and no longer needs their colors. What is left is the caption, which is the part
+## that keeps a capped tray honest.
+func set_pool(held: int, total: int, shipped: int) -> void:
+	_pool_held = held
 	_pool_total = total
 	_pool_shipped = shipped
 	queue_redraw()
@@ -217,16 +307,6 @@ func rider_position(id: int) -> Vector2:
 	return Vector2.INF
 
 
-## Index into the pool's DISPLAYED window under `at`, or -1. The index is into what
-## is shown, not into main's full spent list — main maps it back, since main is what
-## knows where the window starts.
-func pool_index_at(at: Vector2) -> int:
-	for i in _pool_tints.size():
-		if pool_slot(i).distance_to(at) <= PEBBLE_R:
-			return i
-	return -1
-
-
 # Riders move every frame, so the machine repaints on the RENDER clock. Like the
 # rest of visualization it is a pure consumer — it may lag the sim harmlessly.
 func _process(_delta: float) -> void:
@@ -291,8 +371,10 @@ static func _pipe_runs() -> Array:
 		# unconnected with fresh pebbles gliding over a gap.
 		PackedVector2Array([hub, Vector2(RISER_X, HUB_Y), Vector2(RISER_X, CHUTE_Y),
 				Vector2(HOPPER.x, CHUTE_Y)]),
-		# Sorter → spent bin (the discharge leg).
-		PackedVector2Array([hub, Vector2(BIN_X, HUB_Y), Vector2(BIN_X, BIN_Y - 10.0)]),
+		# Sorter → spent pool (the discharge leg), ending at the mouth it pours from.
+		# No fudge factor between the pipe's end and the ride's end any more: they are the
+		# same point, so the pebble becomes a body exactly where it was last drawn.
+		PackedVector2Array([hub, Vector2(BIN_X, HUB_Y), Vector2(BIN_X, BIN_Y)]),
 		# Hopper → chute (the fresh-fuel leg).
 		PackedVector2Array([Vector2(HOPPER.x, HOPPER.y), Vector2(HOPPER.x, CHUTE_Y)]),
 	]
@@ -390,24 +472,28 @@ func _draw_plant() -> void:
 	draw_circle(hub, BORE_W * 0.5, PIPE_BORE)
 	_label("SORT", hub + Vector2(-14.0, 32.0))
 
-	# Spent-fuel pool — where the discharge leg actually ends.
-	var pool := Rect2(POOL_LEFT, POOL_FLOOR - POOL_H, POOL_W, POOL_H)
-	draw_rect(pool, POOL_WALL)
-	draw_rect(pool, POOL_EDGE, false, 1.5)
-	# The settled pebbles, each in its own field color — this is the whole point of
-	# the pool: a spent pebble arrives carrying whatever the selected field says
-	# about it (burnup, xenon, temperature) and keeps saying it.
-	for i in _pool_tints.size():
-		var at := pool_slot(i)
-		draw_circle(at, PEBBLE_R, _pool_tints[i])
-		draw_arc(at, PEBBLE_R, 0.0, TAU, 12, POOL_EDGE, 1.0)
+	# Spent-fuel pool — where the discharge leg actually ends. Just the vessel: the
+	# pebbles in it are bodies and paint themselves on top of this, in whatever color
+	# the selected field gives them. A spent pebble arrives carrying what the field
+	# says about it (burnup, xenon, temperature) and keeps saying it while it sits.
+	#
+	# Drawn as walls rather than a filled box, because it now HAS walls — these three
+	# faces are the ones `pool_walls` hands the physics engine, so the pile is resting
+	# on what it appears to be resting on.
+	var right := POOL_LEFT + POOL_W
+	var top := POOL_FLOOR - POOL_H
+	draw_rect(Rect2(POOL_LEFT, top, POOL_W, POOL_H), POOL_WALL)
+	var rim := PackedVector2Array([
+		Vector2(POOL_LEFT, top), Vector2(POOL_LEFT, POOL_FLOOR),
+		Vector2(right, POOL_FLOOR), Vector2(right, top)])
+	draw_polyline(rim, POOL_EDGE, 1.5)
 	# Name the pool and state the true total, so a full tray cannot be misread as a
 	# stalled one. The count is the honest part of a capped view: the tray stops growing
 	# at POOL_CAP, and without the shipped count on screen that would read as "the
 	# discharge leg died" rather than "the pool is full and casking the oldest".
 	var caption := "SPENT %d" % _pool_total
 	if _pool_shipped > 0:
-		caption += "  (%d held, %d to cask)" % [_pool_tints.size(), _pool_shipped]
+		caption += "  (%d held, %d to cask)" % [_pool_held, _pool_shipped]
 	_label(caption, Vector2(POOL_LEFT + 2.0, POOL_FLOOR - POOL_H - 6.0))
 
 	# Fresh-fuel hopper — drawn as a funnel feeding the chute.

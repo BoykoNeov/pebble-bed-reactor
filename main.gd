@@ -439,6 +439,14 @@ func _ready() -> void:
 	for seg in Silo.wall_segments():
 		_physics.add_static_segment(seg[0], seg[1])
 
+	# The spent-fuel tray is a real vessel too: discharged pebbles are bodies that fall
+	# into it and pile up. Its walls go in beside the silo's because they are the same
+	# kind of thing — immovable steel the pebbles rest on — and the backend cannot tell
+	# them apart. What keeps this pile out of the reactor physics is not the geometry
+	# but `_out_of_core` (see `_core_positions`): the tray sits over valid grid cells.
+	for seg in FuelLoop.pool_walls():
+		_physics.add_static_segment(seg[0], seg[1])
+
 	# The coarse neutronics mesh over the silo + reflector band.
 	_grid = Grid.for_silo()
 
@@ -766,8 +774,31 @@ func _inventory() -> int:
 ## `_pebbles`, where five per-frame walks would carry it forever. Shipping is the honest
 ## end of the fuel cycle and it is the answer to "what happens when the pool fills":
 ## the OLDEST goes to a cask, and what remains is exactly what you can see.
+## The pebble arrives as a BODY, dropped at the mouth of the discharge pipe to fall into
+## the tray and settle wherever the pile puts it.
+##
+## GIVING IT A BODY AND DECLARING IT OUT OF CORE ARE ONE OPERATION, which is why the flag
+## is set here and not left to the caller. Today's only caller (the DISCHARGE arrival) has
+## it set already — the pebble has been out of core since it left the bed as a rider — so
+## this line is redundant on the live path and is here for what it prevents: the tray
+## overlays VALID grid cells, so a body parked in it without that flag is homogenized as
+## core fuel and shifts k with nothing on screen to say so (see `_core_positions`). A
+## caller that forgot would not crash, it would quietly re-calibrate the reactor. That is
+## exactly the pairing discipline `_ship_to_cask` keeps at the other end of the pool's
+## life, and it belongs on the same side of the boundary: the pool decides what a pooled
+## pebble is.
+##
+## Spawn BEFORE the cap check, not after: shipping erases a body, so the two must run in
+## that order for a pebble that arrives into a full tray (push, body, then ship the oldest
+## away). Reversed, a tray at exactly cap would ship a pebble that has no body yet and
+## leave the arrival unbodied.
 func _pool_push(peb: Pebble) -> void:
 	_spent.push_back(peb)
+	_out_of_core[peb.id] = true
+	# Somewhere across the pipe's bore, not dead-centre — see FuelLoop.pool_drop, where
+	# that randomness is the difference between a pile and a balanced column.
+	_physics.spawn_pebble(peb.id, FuelLoop.pool_drop(_rng.randf_range(-1.0, 1.0)),
+			peb.radius)
 	while _spent.size() > FuelLoop.pool_capacity():
 		_ship_to_cask()
 
@@ -853,8 +884,19 @@ func _reinject(peb: Pebble) -> void:
 	var idx := _spent.find(peb)
 	if idx == -1:
 		return
-	# Ride from the slot it is SITTING in, captured before the removal re-packs the tray.
-	var from := FuelLoop.pool_slot(idx)
+	# Ride from where it is actually LYING, read off the body before that body is
+	# destroyed. This used to be `pool_slot(idx)` — the fake lattice's idea of where
+	# arrival number `idx` belonged. Now the pebble is a settled body somewhere in a
+	# pile, so its position is a physics fact and there is exactly one place to get it.
+	#
+	# The body must go: the pebble is leaving the tray to ride the machine, and a rider
+	# has no body (it is drawn by the plant, along its path). Erasing it here is the
+	# same pairing discipline `_ship_to_cask` keeps — a pebble may hold a body in the
+	# pool or be a rider, never both, or it would be drawn twice and picked twice.
+	# `_out_of_core` deliberately does NOT move: it was true as a pooled body and stays
+	# true for the ride, because neither is fuel in the core.
+	var from := _physics.get_position(peb.id)
+	_physics.remove_pebble(peb.id)
 	_spent.remove_at(idx)
 	_total_reinjected += 1
 	_loop.add(peb.id, FuelLoop.REINJECT, from, Silo.spawn_x(_rng, peb.radius + 2.0),
@@ -868,6 +910,11 @@ func _ship_to_cask() -> void:
 	# selection dangle on a pebble that no longer exists anywhere in the sim.
 	if _selected == peb:
 		_select(null, "")
+	# The body goes with it — a fourth removal joining the three the comment above pairs.
+	# The oldest pebble is generally NOT on top of the pile, so this pulls a body out from
+	# under the others and the pile resettles into the gap. That is the correct picture:
+	# emptying a transfer pool to a cask really does disturb what is left.
+	_physics.remove_pebble(peb.id)
 	_pebbles.erase(peb.id)
 	_out_of_core.erase(peb.id)
 	_total_shipped += 1
@@ -1444,13 +1491,20 @@ func _update_pebble_colors() -> void:
 		# desc.color = the field's own colormap through the same normalization as
 		# the colorbar, so pebble tints and legend can never disagree.
 		var c := desc.color(getter.call(_pebbles[id]))
-		# The Lagrangian view should not stop at the vessel wall: a pebble riding the
-		# machine keeps its field color, so you can follow one spent (or hot) pebble
-		# all the way out to the bin. set_pebble_tint no-ops for a body-less pebble.
-		if _out_of_core.has(id):
-			_loop.set_rider_tint(id, c)
-		else:
-			_physics.set_pebble_tint(id, c)
+		# The Lagrangian view should not stop at the vessel wall: a pebble keeps its field
+		# color in the bed, riding the machine, and settled in the pool, so you can follow
+		# one spent (or hot) pebble all the way to the end of its life.
+		#
+		# Both setters, unconditionally, because BOTH are no-op-safe (set_pebble_tint skips
+		# a pebble with no body; set_rider_tint skips one that is not on the machine) and a
+		# pebble is only ever one of the two. This used to branch on `_out_of_core` — which
+		# was right only while "out of core" implied "has no body". A settled pool pebble is
+		# now out-of-core AND bodied, so that branch would have sent its color to the plant,
+		# which does not draw it, and the whole pool would have sat there in graphite grey
+		# with the field view silently stopping at the tray. Asking each owner "is this
+		# yours?" cannot rot the way a guess about who owns it does.
+		_physics.set_pebble_tint(id, c)
+		_loop.set_rider_tint(id, c)
 
 
 ## Restore graphite grey (used when switching from a PEBBLE field back to a GRID one).
@@ -1463,8 +1517,10 @@ func _reset_pebble_tints() -> void:
 ## The selected PEBBLE field's color for one pebble, or graphite grey when the
 ## selected field is a GRID one (then the heatmap carries it, not the pebbles).
 ##
-## Split out of _update_pebble_colors because the pool needs the same color for a
-## pebble that no longer has a body OR a rider — the two paths that function knows.
+## Split out of _update_pebble_colors so a pebble can be colored at the moment it
+## changes hands, before the per-frame walk gets to it: `_reinject` needs the tint for
+## the rider it is creating right now, and the plant wants it at `add` time rather than
+## a frame later in graphite grey.
 func _pebble_tint(peb: Pebble) -> Color:
 	if _fields.is_empty():
 		return PebbleBody.DEFAULT_TINT
@@ -1475,62 +1531,48 @@ func _pebble_tint(peb: Pebble) -> Color:
 	return desc.color(entry["get_peb"].call(peb))
 
 
-## Push the spent pool's DISPLAY state to the machine (render clock, pure consumer).
+## Push the spent pool's CAPTION state to the machine (render clock, pure consumer).
 ##
-## The Lagrangian view follows a pebble all the way to the END of its life: it keeps
-## its field color in the bed, keeps it riding the machine, and keeps it settled in
-## the pool. So the pool is a readable slice of the outflow — switch to Burnup and
-## every pebble in it is at discharge burnup; switch to Xenon and you watch the
-## settled ones drain. That is the "inspect the composition of outflowing pebbles"
-## goal (CLAUDE.md) finally having something to inspect.
+## Only counts cross this seam now. The tray used to be handed a color per settled
+## pebble because it drew them; they are bodies that draw themselves, so what is left
+## is the caption — and the caption is the part that keeps a capped tray honest.
 ##
-## Shows the WHOLE pool, because `_pool_push` caps it at what the tray can draw. The
-## running totals go with it so the cap is stated, not hidden.
-##
-## THIS USED TO BE A WINDOW — `from = maxi(0, _spent.size() - cap)` — and the window is
-## gone rather than centralized. `_pick_at` and `_selected_pos` each recomputed that
-## offset independently, so three copies of one piece of arithmetic had to agree or a
-## click would select the wrong pebble; the fix looks like "share a helper", but with the
-## cap enforced at the single push site `from` is identically zero at every one of those
-## sites. There is no window to get wrong, so slot i IS `_spent[i]` — the bug class stops
-## existing instead of being supervised. Every pebble in the pool is now on screen and
-## clickable, which is exactly what re-injection needs.
+## The Lagrangian view still follows a pebble all the way to the END of its life: it
+## keeps its field color in the bed, keeps it riding the machine, and keeps it settled
+## in the pool (`_update_pebble_colors` tints the pool's bodies like any other). So the
+## pool is a readable slice of the outflow — switch to Burnup and every pebble in it is
+## at discharge burnup; switch to Xenon and you watch the settled ones drain. That is
+## the "inspect the composition of outflowing pebbles" goal (CLAUDE.md) finally having
+## something to inspect.
 func _refresh_pool() -> void:
-	var tints := PackedColorArray()
-	for peb in _spent:
-		tints.append(_pebble_tint(peb))
-	_loop.set_pool(tints, _total_extracted, _total_shipped)
+	_loop.set_pool(_spent.size(), _total_extracted, _total_shipped)
 
 
 ## Select whatever pebble is under `at`, or clear the selection if that is nothing.
 ##
-## Searched in DRAW ORDER, nearest layer first (pool, then the machine, then the bed),
-## so a click resolves to the pebble the player can actually see at that pixel — the
-## pool and the pipework are drawn over the bed's grid region, and picking the bed
-## first would select a pebble hidden behind the plant.
+## The pool no longer needs a branch of its own. It used to have one — a hit-test
+## against the lattice slots, ordered ahead of the bed so a click landed on the layer
+## drawn on top — but a settled pebble is a body now, so it falls out of the SAME
+## nearest-body search the bed uses, and the two searches were the same search all
+## along. What distinguishes a pool hit is not where it was found, it is what the
+## pebble IS (`_spent.has`), which is a fact about the sim rather than about draw order.
+##
+## Riders still need their branch: they have no body (the plant draws them along their
+## path), so the physics knows nothing about them. Phase 3b changes that.
 func _pick_at(at: Vector2) -> void:
-	var pi := _loop.pool_index_at(at)
-	if pi != -1:
-		# Slot i is `_spent[i]` outright — the tray holds the whole pool, so there is no
-		# window offset to map back through (see `_refresh_pool`).
-		#
-		# Bounds-checked because the tray is a pure CONSUMER of the pool and may lag it:
-		# `pool_index_at` answers from the tint array, which is refreshed on the sim's
-		# clock, while `_spent` can shrink underneath it the moment a pebble ships to a
-		# cask or is re-injected. A stale tint array would index off the end of a pool
-		# that just got shorter — the view lagging is harmless by design (CLAUDE.md), so
-		# it must not be able to crash the picker.
-		if pi < _spent.size():
-			_select(_spent[pi], "spent pool")
-			return
-
 	var rid := _loop.rider_at(at)
 	if rid != -1:
 		_select(_pebbles.get(rid), "fuel machine")
 		return
 
-	# The bed. Nearest hit wins rather than first: pebbles overlap slightly in a packed
-	# bed, so "first within radius" would depend on dictionary order and feel arbitrary.
+	# Every body: the bed AND the settled pool. Nearest hit wins rather than first —
+	# pebbles overlap slightly in a packed bed (and in a pile), so "first within radius"
+	# would depend on dictionary order and feel arbitrary.
+	#
+	# Reads `positions()` raw, NOT `_core_positions()`, and that is deliberate: picking is
+	# an INTERACTION concern and must reach every pebble that is drawn. `_core_positions`
+	# answers a neutronics question ("what is fuel") and would filter the whole pool out
+	# of the inspector — the one part of the plant the inspector most needs to reach.
 	var positions: Dictionary = _physics.positions()
 	var best_id := -1
 	var best_d := INF
@@ -1542,8 +1584,11 @@ func _pick_at(at: Vector2) -> void:
 		if d <= peb.radius and d < best_d:
 			best_d = d
 			best_id = id
-	_select(_pebbles.get(best_id) if best_id != -1 else null,
-		"core bed" if best_id != -1 else "")
+	if best_id == -1:
+		_select(null, "")
+		return
+	var hit: Pebble = _pebbles[best_id]
+	_select(hit, "spent pool" if _spent.has(hit) else "core bed")
 
 
 func _select(peb: Pebble, where: String) -> void:
@@ -1558,15 +1603,12 @@ func _select(peb: Pebble, where: String) -> void:
 ## bed slot, holding no body and no rider, so nothing draws it. That is a real gap in
 ## the fuel cycle's visibility (the "pebbles going in" have nowhere to be seen) and it
 ## is why the inspector can reach a staged pebble only indirectly today.
+## The pool needs no case of its own: a settled pebble is a body, so the physics lookup
+## at the bottom already answers for it. (It used to be a `pool_slot(_spent.find(...))`
+## branch — the lattice's idea of where arrival number i belonged.)
 func _selected_pos() -> Vector2:
 	if _selected == null:
 		return Vector2.INF
-	var idx := _spent.find(_selected)
-	if idx != -1:
-		# Slot i is `_spent[i]`, so the pool index IS the slot index — no window offset,
-		# and no "selected but scrolled out of view" case to return INF for: the cap means
-		# everything in the pool has a slot. See `_refresh_pool`.
-		return FuelLoop.pool_slot(idx)
 	var rp := _loop.rider_position(_selected.id)
 	if rp != Vector2.INF:
 		return rp
