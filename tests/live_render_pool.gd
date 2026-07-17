@@ -30,6 +30,7 @@ var _shot_full := false
 var _filling := false
 var _dropped := 0
 var _next_drop := 0.0
+var _settle_until := 0.0
 var _done_at := -1.0
 
 
@@ -43,6 +44,14 @@ func _initialize() -> void:
 
 func _process(delta: float) -> bool:
 	_t += delta
+	# Checked FIRST, ahead of every phase's early return. It used to live at the bottom,
+	# where a phase that never completes returns before ever reaching it — so the one
+	# situation the give-up exists for was the one situation it could not fire in.
+	if _t > GIVE_UP_AT:
+		print("[pool capture timed out] shot_real=%s filling=%s dropped=%d"
+			% [_shot_real, _filling, _dropped])
+		quit(1)
+		return true
 	if _t < START_AT:
 		return false
 
@@ -70,38 +79,43 @@ func _process(delta: float) -> bool:
 		return false
 
 	if _filling:
+		if _dropped >= FuelLoop.pool_capacity():
+			# Let the last few stop rolling before the shutter opens. The deadline is stamped
+			# ONCE, when the final pebble lands — recomputing it from `_t` each tick pushes it
+			# away forever and the fill never ends (it did, and the give-up below could not
+			# save it: that check sits past this early return, so the script simply hung).
+			if _t < _settle_until:
+				return false
+			_filling = false
+			_main._refresh_pool()
+			return false
 		if _t < _next_drop:
 			return false
 		_next_drop = _t + DROP_EVERY
-		if _dropped < FuelLoop.pool_capacity():
-			# Spread EVERY per-pebble field, not just burnup: the shot is judged under
-			# whichever field is selected, and a dummy that only sets burnup renders as a
-			# black socket under Pebble temperature — which looks like a bug in the pool
-			# rather than a bug in this script. (It did, the first time.)
-			var f := float(_dropped) / float(FuelLoop.pool_capacity())
-			var dummy := Pebble.new(900000 + _dropped, _main.PEBBLE_RADIUS)
-			dummy.burnup = Depletion.DISCHARGE_BURNUP * f
-			dummy.temperature = 400.0 + 1000.0 * f
-			dummy.xe135 = 6.0e-5 * f
-			# (decay_e is the reservoir ARRAY, not a scalar — left at its default.)
-			# Registered like a real pebble: `_pool_push` gives it a body and declares it
-			# out of core, and an unregistered id in `_out_of_core` walks `_core_count()`
-			# down by one per dummy. It also has to be in `_pebbles` for the per-pebble
-			# field walk to tint it — an unregistered dummy renders graphite grey and the
-			# shot judges the pool's colors on pebbles the field never colored.
-			_main._pebbles[dummy.id] = dummy
-			# Through the real push site, not straight onto `_spent`: it enforces the cap,
-			# so this lands on EXACTLY a full tray (the real arrivals cask out ahead of the
-			# dummies) instead of overfilling it and piling pebbles over the rim — which
-			# would make the shot judge a layout the game cannot produce.
-			_main._pool_push(dummy)
-			_dropped += 1
-			return false
-		# Let the last few stop rolling before the shutter opens.
-		if _t < _next_drop + SETTLE:
-			return false
-		_filling = false
-		_main._refresh_pool()
+		# Spread EVERY per-pebble field, not just burnup: the shot is judged under whichever
+		# field is selected, and a dummy that only sets burnup renders as a black socket under
+		# Pebble temperature — which looks like a bug in the pool rather than a bug in this
+		# script. (It did, the first time.)
+		var f := float(_dropped) / float(FuelLoop.pool_capacity())
+		var dummy := Pebble.new(900000 + _dropped, _main.PEBBLE_RADIUS)
+		dummy.burnup = Depletion.DISCHARGE_BURNUP * f
+		dummy.temperature = 400.0 + 1000.0 * f
+		dummy.xe135 = 6.0e-5 * f
+		# (decay_e is the reservoir ARRAY, not a scalar — left at its default.)
+		# Registered like a real pebble: `_pool_push` gives it a body and declares it out of
+		# core, and an unregistered id in `_out_of_core` walks `_core_count()` down by one per
+		# dummy. It also has to be in `_pebbles` for the per-pebble field walk to tint it — an
+		# unregistered dummy renders graphite grey and the shot would judge the pool's colors
+		# on pebbles the field never colored.
+		_main._pebbles[dummy.id] = dummy
+		# Through the real push site, not straight onto `_spent`: it enforces the cap, so this
+		# lands on EXACTLY a full tray (the real arrivals cask out ahead of the dummies)
+		# instead of overfilling it and piling pebbles over the rim — which would make the
+		# shot judge a layout the game cannot produce.
+		_main._pool_push(dummy)
+		_dropped += 1
+		if _dropped >= FuelLoop.pool_capacity():
+			_settle_until = _t + SETTLE
 		return false
 
 	if _done_at < 0.0:
@@ -117,9 +131,6 @@ func _process(delta: float) -> bool:
 	if _t > _done_at + 0.5:
 		print("[pool capture complete] %s" % _out)
 		quit(0)
-	if _t > GIVE_UP_AT:
-		print("[pool capture timed out]")
-		quit(1)
 	return false
 
 
