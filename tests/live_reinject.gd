@@ -26,14 +26,16 @@
 # not become an un-burn button.
 #
 # FAILURE 3 — THE PEBBLE VANISHES OR TELEPORTS. It must leave the pool, physically ride
-# the pipework, and arrive — not blink into the bed and not disappear en route.
+# its OWN riser (Phase 3b-iii — a real body, not the old fake-rider glide through the
+# discharge leg backwards), and arrive — not blink into the bed and not disappear en route.
 extends SceneTree
 
 # Let the plant fill and settle, and give the discharge leg time to put real pebbles in
 # the pool. Discharge runs ~1 per 16 s, so this is a handful of arrivals.
 const ACT_AT := 80.0
-# A REINJECT ride is the discharge leg backwards plus the whole recirc leg — the longest
-# route on the machine. Comfortably longer than it takes.
+# Queue for REINJECT's own mouth (near-instant, nothing else competes for it), climb ~920 px
+# of riser at BELT_RISER (measured ~2.5 s in tests/live_reinject_riser.gd), then the same
+# short chute tail RECIRC rides. Comfortably longer than any of that takes.
 const ARRIVE_BY := 22.0
 
 var _main
@@ -144,8 +146,12 @@ func _act() -> bool:
 	_ok(_main._pebbles.has(_id), "...but is STILL in the registry — it was never destroyed")
 	_ok(_main._out_of_core.has(_id),
 		"...and is still flagged out of core: riding is not being in the bed")
-	_ok(_main._loop.rider_position(_id) != Vector2.INF,
-		"it is physically ON the machine — a ride, not a teleport into the bed")
+	# Phase 3b-iii: it is neither a rider nor a bed body the instant `_reinject_selected`
+	# returns — it is queued for its OWN riser's mouth, the same bodiless wait a discharge
+	# or recirculating pebble takes at the shared drop's. Checking `rider_position` here
+	# would test the OLD mechanism (immediate glide); this checks the new one's first step.
+	_ok(_main._reinject_pending.has(peb),
+		"it is queued at REINJECT's own mouth — not yet a body, not a rider, not in the bed")
 	_ok(_main._total_reinjected == 1, "the re-injection is counted (%d)" % _main._total_reinjected)
 
 	# FAILURE 1, the calibration claim. Leaving the pool puts it back in the circulating
@@ -161,9 +167,16 @@ func _act() -> bool:
 
 
 func _assert_arrived() -> bool:
-	# FAILURE 3: it must have completed the ride.
+	# FAILURE 3: it must have completed the ride. `rider_position == INF` alone is ambiguous
+	# now (Phase 3b-iii) — it is also true while the pebble is still CLIMBING its own riser as
+	# a real body, not yet a rider at all. The specific claim is that it landed: no longer
+	# `_out_of_core`, which only happens on a genuine bed arrival (`_spawn_from_queue`).
 	_ok(_main._loop.rider_position(_id) == Vector2.INF,
 		"the re-injected pebble finished its ride (it is off the machine)")
+	_ok(not _main._out_of_core.has(_id),
+		"...and actually LANDED — it is fuel in the bed again, not still climbing or queued")
+	_ok(not _main._transit.has(_id) and not _main._reinject_pending.has(_main._pebbles.get(_id)),
+		"...off REINJECT's riser and its mouth queue for good")
 	_ok(_main._pebbles.has(_id), "...and still exists (%d)" % _id)
 
 	var peb: Pebble = _main._pebbles[_id]

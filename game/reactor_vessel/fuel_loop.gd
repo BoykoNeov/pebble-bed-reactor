@@ -38,6 +38,19 @@ const HUB_Y := 955.0                  # the sorter: where recirc/discharge part 
 const RISER_X := 975.0                # the riser, in the right-hand reflector margin
 const CHUTE_Y := 75.0                 # the feed chute, above the vessel top (120)
 const BIN_X := 480.0                  # spent-fuel bin, left-hand margin
+# REINJECT's own riser (Phase 3b-iii). A belt runs ONE way, and re-injection is the discharge
+# leg backwards, so it needs a route the discharge leg is not already using. Both routes the
+# earlier notes here considered — tunnelling under the shared duct, or merging into the main
+# riser from underneath — have to breach the duct floor that recirculating fuel is dragged
+# along. This one does not: it climbs from beside the pool, in the dead corridor LEFT of the
+# duct's own mouth wall (`mouth_l` in `plant_walls`, at BIN_X - half), which nothing else in
+# the plant ever occupies. Placed 380 rather than nearer the pool for casing clearance from the
+# pool's own left wall (POOL_LEFT), and far enough from the M5d rod channel (~526) that the two
+# never compete on screen — surfaced to and confirmed by the user before building, since the
+# pool's shallow-tray design deliberately kept this corridor clear for the rod visual.
+const REINJECT_X := 380.0
+const REINJECT_MOUTH_Y := 995.0       # roughly the pool's mid-height — departs beside the
+                                       # tray, not from inside it
 # The discharge pipe's MOUTH — where a spent pebble leaves the plant and falls into the
 # pool. It sits just ABOVE the tray rim (POOL_FLOOR - POOL_H ≈ 968), and that clearance
 # is load-bearing rather than cosmetic: the arriving pebble is a real body now, so if the
@@ -325,6 +338,8 @@ static func plant_walls() -> Array:
 	# there at the instant it is removed, and at 380 px/s it travels ~6 px per step, so it
 	# can overshoot the removal line slightly before the next step catches it.
 	var riser_top := CHUTE_Y - half
+	var rx_l := REINJECT_X - half            # reinject riser's left face
+	var rx_r := REINJECT_X + half            # reinject riser's right face
 	return [
 		# --- The drop: outlet → duct. BOTH faces stop at the roof, and symmetrically:
 		# below that line is the duct, and either face carried further would wall the duct
@@ -353,6 +368,13 @@ static func plant_walls() -> Array:
 		# up against, so it is the one face in the plant that gets hit hard.
 		[Vector2(riser_l, roof), Vector2(riser_l, riser_top)],
 		[Vector2(riser_r, floor_y), Vector2(riser_r, riser_top)],
+		# --- Reinject's own riser (Phase 3b-iii): a dedicated climb beside the pool, sharing
+		# no wall and no belt with anything above. It has no floor and needs none — like the
+		# main riser, a pebble arrives with the belt already pushing UP, not resting on
+		# anything — so this is just the two side faces of the bore, full height from beside
+		# the pool floor to the chute.
+		[Vector2(rx_l, POOL_FLOOR), Vector2(rx_l, riser_top)],
+		[Vector2(rx_r, POOL_FLOOR), Vector2(rx_r, riser_top)],
 	]
 
 
@@ -470,6 +492,35 @@ static func riser_delivered(at: Vector2) -> bool:
 ## happens, so the body vanishes and the rider appears in the same place.
 static func riser_head() -> Vector2:
 	return Vector2(RISER_X, CHUTE_Y)
+
+
+## Where a re-injected pebble becomes a body — beside the pool, at the foot of its OWN riser
+## (Phase 3b-iii). Mirrors `drop_mouth`: the pebble is respawned here regardless of exactly
+## where it was resting in the pile, the same seam the shared drop already uses for a
+## discharge/recirc pebble re-materializing at a fixed point rather than its exact bed
+## position. `across` takes the same bore play as the other mouths, for the same reason.
+static func reinject_mouth(across := 0.0, radius := PEBBLE_R) -> Vector2:
+	return Vector2(REINJECT_X + across * BORE_CLEARANCE, REINJECT_MOUTH_Y)
+
+
+## Is this body in the REINJECT riser? Wider than the bore (BORE_W either side, matching
+## `in_riser`) so the belt catches it the instant it is spawned, not after it drifts to the
+## centreline first.
+static func in_reinject_riser(at: Vector2) -> bool:
+	return absf(at.x - REINJECT_X) < BORE_W and at.y > CHUTE_Y and at.y < POOL_FLOOR
+
+
+## Has a climbing re-injected pebble reached the head of ITS riser? Both axes, for the same
+## reason `riser_delivered` checks both: a pebble that punched through the bore wall must not
+## be read as a safe arrival just because it cleared the y line.
+static func reinject_delivered(at: Vector2) -> bool:
+	return at.y <= CHUTE_Y and absf(at.x - REINJECT_X) < BORE_W
+
+
+## Where a pebble lifted off the reinject riser starts its ride — merges onto the SAME chute
+## `_pipe_runs` already draws for recirc/fresh fuel, just further along it.
+static func reinject_riser_head() -> Vector2:
+	return Vector2(REINJECT_X, CHUTE_Y)
 
 
 ## Has a falling pebble reached the tray? Inside it in BOTH axes, deliberately.
@@ -660,34 +711,11 @@ static func _path_for(kind: int, from: Vector2, spawn_x: float) -> PackedVector2
 			return PackedVector2Array([HOPPER, Vector2(HOPPER.x, CHUTE_Y),
 					Vector2(spawn_x, CHUTE_Y), Vector2(spawn_x, Silo.spawn_y())])
 		REINJECT:
-			# Out of the pool and back into the bed: up the DISCHARGE leg run backwards,
-			# through the sorter, then onto the RECIRC riser. Every segment is pipework
-			# already drawn by `_pipe_runs` — a re-injected pebble needs no route of its
-			# own because the plant already has one, it just runs it the other way. That
-			# also means no teleport: the player watches the pebble they edited climb out
-			# of the pool and re-enter the core along the same pipes everything else uses.
-			#
-			# ⚠️ STILL A RIDER, AND NOW THE ONLY THING IN THE PLANT THAT PHASES. Known, flagged
-			# to the user at 3b-i and knowingly banked; 3b-ii did not fix it and made the
-			# picture slightly worse rather than better, because the pipes it glides through
-			# are now BOTH real and BOTH busy — it passes through the duct's walls, through
-			# spent fuel rolling left, and through recirculating fuel climbing the riser. It is
-			# a picture problem only: `live_reinject` is green because the accounting never
-			# went near the belts, and the R key is rare and player-triggered.
-			#
-			# WHY IT IS NOT SIMPLY PROMOTED TO A BELT: **a belt runs ONE way**, and this route
-			# is the discharge leg BACKWARDS. Giving it real bodies means giving it a real
-			# route of its own, and the plant has no free lane — the obvious one (under
-			# everything at y ≈ 1000, from the tray's right wall rightward to the foot of the
-			# riser) has to merge INTO the riser, and the duct's floor currently runs unbroken
-			# to x = 986 across the exact place it would arrive. Cutting a hole there is not
-			# free either: it is the floor recirculating pebbles are dragged along, and a hole
-			# in it is a hole they fall through. **In 2D two open channels cannot cross — a
-			# tunnel's roof is a lid on the pipe it crosses.** That is the real problem to
-			# solve, and it wants its own slice rather than a half-measure here.
-			return PackedVector2Array([from, Vector2(BIN_X, BIN_Y), Vector2(BIN_X, HUB_Y), hub,
-					Vector2(RISER_X, HUB_Y), Vector2(RISER_X, CHUTE_Y),
-					Vector2(spawn_x, CHUTE_Y), Vector2(spawn_x, Silo.spawn_y())])
+			# Only the TAIL, now (Phase 3b-iii) — same shape as RECIRC's below, because the
+			# climb itself is real bodies on its OWN riser (`reinject_riser_head`), not a glide
+			# through the discharge leg backwards any more. `from` is the head of that climb.
+			return PackedVector2Array([from, Vector2(spawn_x, CHUTE_Y),
+					Vector2(spawn_x, Silo.spawn_y())])
 		_:
 			# RECIRC — and only the TAIL of it, which is why this is now three points and not
 			# seven. Phase 3b-ii made the climb real: a recirculating pebble is a BODY from the
@@ -721,19 +749,25 @@ static func _pipe_runs() -> Array:
 		# Outlet → sorter. Starts flush with the hopper's inner floor face and pierces the
 		# vessel wall, so the discharge pipe is visibly socketed into the bottom of the core.
 		PackedVector2Array([Vector2(Silo.CENTER_X, Silo.OUTLET_Y), hub]),
-		# Sorter → riser → chute → over the bed (the recirculation leg). The chute runs all
-		# the way to the hopper: recirculated fuel comes in along it from the right and fresh
-		# fuel joins it from the left, so the two legs visibly MERGE onto one feed — which is
-		# exactly what they do. Stopping it at the vessel wall left the hopper floating
-		# unconnected with fresh pebbles gliding over a gap.
+		# Sorter → riser → chute → past the hopper → reinject's own riser (the recirculation
+		# leg). Three legs visibly MERGE onto this one feed now, not two: recirculated fuel
+		# comes in from the right, fresh fuel joins from the hopper partway along, and
+		# re-injected fuel joins at the far left end where its own riser meets the chute
+		# (Phase 3b-iii). Extending this run's endpoint from the hopper to REINJECT_X is the
+		# only change reinject's climb needed here — the hopper's merge point stays exactly
+		# where it was, just no longer the run's own end.
 		PackedVector2Array([hub, Vector2(RISER_X, HUB_Y), Vector2(RISER_X, CHUTE_Y),
-				Vector2(HOPPER.x, CHUTE_Y)]),
+				Vector2(REINJECT_X, CHUTE_Y)]),
 		# Sorter → spent pool (the discharge leg), ending at the mouth it pours from.
 		# No fudge factor between the pipe's end and the ride's end any more: they are the
 		# same point, so the pebble becomes a body exactly where it was last drawn.
 		PackedVector2Array([hub, Vector2(BIN_X, HUB_Y), Vector2(BIN_X, BIN_Y)]),
 		# Hopper → chute (the fresh-fuel leg).
 		PackedVector2Array([Vector2(HOPPER.x, HOPPER.y), Vector2(HOPPER.x, CHUTE_Y)]),
+		# Reinject's own riser (Phase 3b-iii): beside the pool, up to where it joins the chute
+		# above. This is the one run in the plant with no matching entry in `_pipe_runs` above
+		# it that it shares a mouth with — it has its own, `reinject_mouth`.
+		PackedVector2Array([Vector2(REINJECT_X, POOL_FLOOR), Vector2(REINJECT_X, CHUTE_Y)]),
 	]
 
 
