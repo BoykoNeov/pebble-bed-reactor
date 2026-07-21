@@ -115,8 +115,10 @@ func _feed(delta: float) -> void:
 	var id := _next_id
 	_next_id += 1
 	_physics.spawn_pebble(id, FuelLoop.reinject_mouth(randf_range(-1.0, 1.0), _radius), _radius)
-	if _ccd:
-		_physics.set_continuous_cd(id, true)
+	# GodotPhysicsBackend.spawn_pebble defaults CCD on now — this harness exists partly to
+	# prove CCD is load-bearing (FAILURE 1 above), so --no-ccd must still be able to turn
+	# it back OFF rather than the new default silently making the flag a no-op.
+	_physics.set_continuous_cd(id, _ccd)
 	_transit[id] = {"t": _t, "at": FuelLoop.reinject_mouth(), "moved_t": _t}
 	_fed += 1
 

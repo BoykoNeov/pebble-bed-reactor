@@ -36,8 +36,26 @@ const REINJECT := 3   # the player pulled one back out of the spent pool
 # vessel", which is exactly what it is. The bottom key-hints bar starts at y ≈ 1026.
 const HUB_Y := 955.0                  # the sorter: where recirc/discharge part ways
 const RISER_X := 975.0                # the riser, in the right-hand reflector margin
-const CHUTE_Y := 75.0                 # the feed chute, above the vessel top (120)
+const CHUTE_Y := 75.0                 # RECIRC/REINJECT's own line, above the vessel top (120)
 const BIN_X := 480.0                  # spent-fuel bin, left-hand margin
+
+# FRESH gets its OWN line, ABOVE the recirc/reinject chute rather than merging onto it
+# (Phase 3b-iv). Before this, every rider bound for the bed funnelled through the exact same
+# Vector2(spawn_x, CHUTE_Y) regardless of kind — recirculating fuel is ~90% of all traffic
+# (every extraction not discharged), fresh fuel is whatever the mint gate needs to hold
+# TARGET_POPULATION — and since a rider has no body and riders never test against each other
+# (see the class doc), a fresh pebble and a recirculating one could occupy the identical point
+# on screen at the identical instant and neither would notice. That is the "new pebbles...
+# without coliding" report. Splitting the lines removes the coincidence rather than papering
+# over it: the two belts share no y except where FRESH's own drop crosses down through
+# CHUTE_Y, and THAT crossing gets its own gate (see `_gate_clear`) rather than being ignored.
+#
+# 55, not lower: it has to clear the hopper's own spout (the hop polygon's bottom two points
+# sit at HOPPER.y + 8 = 52) with room to spare, and it has to stay clearly above CHUTE_Y (75)
+# so the two lines read as two belts and not one blurred band — 20 px of separation is enough
+# that FRESH_BORE_W and BORE_W's hollow bores never touch even though their outer casings
+# graze (see FRESH_BORE_W below).
+const FRESH_CHUTE_Y := 55.0
 # REINJECT's own riser (Phase 3b-iii). A belt runs ONE way, and re-injection is the discharge
 # leg backwards, so it needs a route the discharge leg is not already using. Both routes the
 # earlier notes here considered — tunnelling under the shared duct, or merging into the main
@@ -265,6 +283,16 @@ const BORE_W := 2.0 * (PEBBLE_R + BORE_CLEARANCE)
 const PIPE_WALL := 6.0
 const CASING_W := BORE_W + 2.0 * PIPE_WALL
 
+# FRESH's own line is drawn thinner than the main recirc/reinject duct, not sized off the
+# same BORE_W — and that is load-bearing for the layout, not decoration. There are only
+# ~20 px between the hopper's spout and CHUTE_Y (see FRESH_CHUTE_Y), nowhere near enough
+# for two full CASING_W (34 px) pipes stacked without their bores touching. A thinner feed
+# also reads correctly on its own terms: this line carries whatever trickle keeps
+# TARGET_POPULATION topped up, the recirc/reinject line below it carries ~90% of all
+# traffic, and a real plant would not build them to the same bore either.
+const FRESH_BORE_W := BORE_W * 0.55
+const FRESH_CASING_W := FRESH_BORE_W + 2.0 * PIPE_WALL
+
 # Plant livery — dim structural greys, so the machine frames the core without
 # competing with the field heatmap it sits on top of.
 const PIPE_CASING := Color(0.24, 0.27, 0.34, 1.0)  # the pipe wall
@@ -272,8 +300,22 @@ const PIPE_BORE := Color(0.05, 0.06, 0.08, 1.0)    # the hollow interior
 const PIPE_EDGE := Color(0.42, 0.47, 0.57, 0.85)
 const GRAPHITE := Color(0.62, 0.64, 0.68)
 
+# How close a RECIRC/REINJECT rider may be to FRESH's own spawn_x, on the CHUTE_Y line,
+# before FRESH holds its drop rather than releasing through it (Phase 3b-iv). Sized off two
+# riders at max radius (main.RADIUS_MAX = BORE_W / 2, a player lever) touching, plus a full
+# bore of room on top — not a bare touching-distance margin, because this is a PREDICTIVE
+# gate checked one step ahead of a crossing that is still closing, not a contact test on
+# something already there.
+const FRESH_CLEAR_X := BORE_W * 2.0
+# How far above/below CHUTE_Y a RECIRC/REINJECT rider counts as "at the crossing" for that
+# same gate. A rider approaching the line is exactly as much a hazard as one sitting on it —
+# holding the gate only at the instant some other rider's y is EXACTLY CHUTE_Y would let two
+# riders converge on the same point a physics step apart and call it clear the whole time.
+const FRESH_GATE_Y := BORE_W * 2.0
+
 # Riders in flight. Each: id, kind, pts (polyline), d (distance travelled),
-# len (total), x (the spawn-band x it is bound for), tint.
+# len (total), x (the spawn-band x it is bound for), tint, and — FRESH only — gate_len (see
+# `_gate_clear`).
 var _riders: Array = []
 
 # What the pool's CAPTION says. Counts only: the settled pebbles are real bodies that
@@ -622,26 +664,62 @@ static func pool_capacity() -> int:
 func add(id: int, kind: int, from: Vector2, spawn_x: float, tint: Color,
 		radius: float = PEBBLE_R) -> void:
 	var pts := _path_for(kind, from, spawn_x)
-	_riders.append({
+	var rider := {
 		"id": id, "kind": kind, "pts": pts, "d": 0.0,
 		"len": _length_of(pts), "x": spawn_x, "tint": tint, "r": radius,
-	})
+	}
+	if kind == FRESH:
+		# Arc-length to the vertex at (spawn_x, FRESH_CHUTE_Y) — pts[0..2] — everything up
+		# to and including it is FRESH's own belt; everything past it is the drop that
+		# crosses the recirc/reinject line. `advance` holds a rider at this length rather
+		# than letting it cross until `_gate_clear` says the crossing is empty.
+		rider["gate_len"] = _length_of(pts.slice(0, 3))
+	_riders.append(rider)
 
 
 ## Advance every rider on the RENDER/physics clock and return those that reached
 ## the end: [{id, kind, x}, ...]. Main decides what an arrival means (a RECIRC or
 ## FRESH arrival joins the staging queue; a DISCHARGE arrival leaves the inventory).
+##
+## A FRESH rider carries `gate_len` (Phase 3b-iv): the arc-length just before its own drop
+## crosses the recirc/reinject line at CHUTE_Y. It is only let past that point once
+## `_gate_clear` says the crossing is empty right now — otherwise it is held EXACTLY at the
+## gate, not stopped short of it or bounced back, so it reads as a belt waiting for a clear
+## signal rather than a rider that got stuck. Checked fresh every frame it sits there, so it
+## releases the instant the crossing opens rather than on some fixed retry timer.
 func advance(delta: float) -> Array:
 	var arrived: Array = []
 	var still: Array = []
 	for r in _riders:
-		r["d"] += SPEED * delta
+		var gate: float = r.get("gate_len", -1.0)
+		var next_d: float = r["d"] + SPEED * delta
+		if gate >= 0.0 and r["d"] <= gate and next_d > gate and not _gate_clear(r):
+			next_d = gate
+		r["d"] = next_d
 		if r["d"] >= r["len"]:
 			arrived.append({"id": r["id"], "kind": r["kind"], "x": r["x"]})
 		else:
 			still.append(r)
 	_riders = still
 	return arrived
+
+
+## Is it safe for FRESH rider `r` to drop through the recirc/reinject line right now?
+##
+## Checked against every OTHER rider's CURRENT position, not against their spawn_x alone —
+## a recirc/reinject rider still approaching the crossing is exactly as much a hazard as one
+## already on top of it, which is why this is a predictive gate and not a contact test.
+func _gate_clear(r: Dictionary) -> bool:
+	var spawn_x: float = r["x"]
+	for other in _riders:
+		if other["id"] == r["id"]:
+			continue
+		if other["kind"] != RECIRC and other["kind"] != REINJECT:
+			continue
+		var pos: Vector2 = _point_at(other["pts"], other["d"])
+		if absf(pos.y - CHUTE_Y) < FRESH_GATE_Y and absf(pos.x - spawn_x) < FRESH_CLEAR_X:
+			return false
+	return true
 
 
 ## Recolor one rider for the per-pebble field heatmap — the Lagrangian view should
@@ -707,9 +785,11 @@ static func _path_for(kind: int, from: Vector2, spawn_x: float) -> PackedVector2
 		# wherever the physics put them — the same two-sources-of-truth drift that made
 		# `pool_slot` a liability once the pile became real (commit 7b0be70).
 		FRESH:
-			# Down out of the hopper, then along the shared feed chute.
-			return PackedVector2Array([HOPPER, Vector2(HOPPER.x, CHUTE_Y),
-					Vector2(spawn_x, CHUTE_Y), Vector2(spawn_x, Silo.spawn_y())])
+			# Down out of the hopper onto FRESH's OWN belt (Phase 3b-iv), then the drop that
+			# crosses the recirc/reinject line and continues into the silo. `add()` marks the
+			# vertex just before that crossing as this rider's gate — see `_gate_clear`.
+			return PackedVector2Array([HOPPER, Vector2(HOPPER.x, FRESH_CHUTE_Y),
+					Vector2(spawn_x, FRESH_CHUTE_Y), Vector2(spawn_x, Silo.spawn_y())])
 		REINJECT:
 			# Only the TAIL, now (Phase 3b-iii) — same shape as RECIRC's below, because the
 			# climb itself is real bodies on its OWN riser (`reinject_riser_head`), not a glide
@@ -749,25 +829,36 @@ static func _pipe_runs() -> Array:
 		# Outlet → sorter. Starts flush with the hopper's inner floor face and pierces the
 		# vessel wall, so the discharge pipe is visibly socketed into the bottom of the core.
 		PackedVector2Array([Vector2(Silo.CENTER_X, Silo.OUTLET_Y), hub]),
-		# Sorter → riser → chute → past the hopper → reinject's own riser (the recirculation
-		# leg). Three legs visibly MERGE onto this one feed now, not two: recirculated fuel
-		# comes in from the right, fresh fuel joins from the hopper partway along, and
-		# re-injected fuel joins at the far left end where its own riser meets the chute
-		# (Phase 3b-iii). Extending this run's endpoint from the hopper to REINJECT_X is the
-		# only change reinject's climb needed here — the hopper's merge point stays exactly
-		# where it was, just no longer the run's own end.
+		# Sorter → riser → chute → reinject's own riser: the RECIRC/REINJECT belt. Two legs
+		# merge onto this feed — recirculated fuel from the right, re-injected fuel from the
+		# far left where its own riser meets the chute (Phase 3b-iii). FRESH no longer joins
+		# here (Phase 3b-iv: it has its own line, above — see `_fresh_pipe_runs`), so this run
+		# is back to exactly the two legs its name says.
 		PackedVector2Array([hub, Vector2(RISER_X, HUB_Y), Vector2(RISER_X, CHUTE_Y),
 				Vector2(REINJECT_X, CHUTE_Y)]),
 		# Sorter → spent pool (the discharge leg), ending at the mouth it pours from.
 		# No fudge factor between the pipe's end and the ride's end any more: they are the
 		# same point, so the pebble becomes a body exactly where it was last drawn.
 		PackedVector2Array([hub, Vector2(BIN_X, HUB_Y), Vector2(BIN_X, BIN_Y)]),
-		# Hopper → chute (the fresh-fuel leg).
-		PackedVector2Array([Vector2(HOPPER.x, HOPPER.y), Vector2(HOPPER.x, CHUTE_Y)]),
-		# Reinject's own riser (Phase 3b-iii): beside the pool, up to where it joins the chute
-		# above. This is the one run in the plant with no matching entry in `_pipe_runs` above
-		# it that it shares a mouth with — it has its own, `reinject_mouth`.
+		# Reinject's own riser (Phase 3b-iii): beside the pool, up to where it joins the
+		# recirc/reinject line above. This is the one run in the plant with no matching entry
+		# above it that it shares a mouth with — it has its own, `reinject_mouth`.
 		PackedVector2Array([Vector2(REINJECT_X, POOL_FLOOR), Vector2(REINJECT_X, CHUTE_Y)]),
+	]
+
+
+## FRESH's own line (Phase 3b-iv) — drawn and driven separately from `_pipe_runs` above, a
+## thinner feed sitting ABOVE the recirc/reinject chute rather than sharing it. See
+## FRESH_CHUTE_Y / FRESH_BORE_W for why the two lines needed separating at all.
+static func _fresh_pipe_runs() -> Array:
+	return [
+		# Hopper → FRESH's own belt.
+		PackedVector2Array([Vector2(HOPPER.x, HOPPER.y), Vector2(HOPPER.x, FRESH_CHUTE_Y)]),
+		# FRESH's own horizontal run. Only needs to reach right of the hopper — every
+		# spawn_x it is ever handed lands inside the vessel, which is entirely to the
+		# hopper's right — so, unlike the recirc/reinject line, it does not need to reach
+		# REINJECT_X on the left.
+		PackedVector2Array([Vector2(HOPPER.x, FRESH_CHUTE_Y), Vector2(RISER_X, FRESH_CHUTE_Y)]),
 	]
 
 
@@ -784,6 +875,24 @@ func _pipe_pass(runs: Array, w: float, col: Color) -> void:
 			draw_line(pts[i - 1], pts[i], col, w)
 		for p in pts:
 			draw_circle(p, w * 0.5, col)
+
+
+## The bore's outline for a set of runs, as one mitred ring per run.
+##
+## WHY offset_polyline and not two offset lines per segment: drawing each segment's two edges
+## full-length to its end vertex makes them overshoot past each other at every bend, stamping
+## a small cross on the elbow. Covering it with a disc at the vertex does NOT work — the
+## overshoot lands on the INNER side of the corner, outside any disc centred on the vertex.
+## offset_polyline solves the actual problem: it terminates each edge at the join, mitring the
+## inside of the bend and rounding the outside to exactly the same radius as the bore disc
+## already drawn there.
+func _pipe_outline(runs: Array, half_w: float) -> void:
+	for run in runs:
+		var pts: PackedVector2Array = run
+		for outline in Geometry2D.offset_polyline(pts, half_w,
+				Geometry2D.JOIN_ROUND, Geometry2D.END_BUTT):
+			var ring: PackedVector2Array = outline
+			draw_polyline(ring + PackedVector2Array([ring[0]]), PIPE_EDGE, 1.0)
 
 
 static func _length_of(pts: PackedVector2Array) -> float:
@@ -819,6 +928,7 @@ func _draw() -> void:
 func _draw_plant() -> void:
 	var hub := Vector2(Silo.CENTER_X, HUB_Y)
 	var runs := _pipe_runs()
+	var fresh_runs := _fresh_pipe_runs()
 
 	# The pipe is built from outside in: the casing wall, then the hollow bore inset into
 	# it, then (below) the bore's outline. Drawing whole PASSES — every run's casing before
@@ -827,31 +937,24 @@ func _draw_plant() -> void:
 	# over an earlier run's bore and plug it.
 	_pipe_pass(runs, CASING_W, PIPE_CASING)
 	_pipe_pass(runs, BORE_W, PIPE_BORE)
+	# FRESH's own line, thinner (FRESH_BORE_W < BORE_W — see the constant), drawn as its own
+	# pass rather than folded into `runs`: the two lines sit close enough (Phase 3b-iv put
+	# only ~20 px between them, see FRESH_CHUTE_Y) that mixing them into one pass-per-width
+	# loop would paint one line's casing over the other's bore wherever they graze.
+	_pipe_pass(fresh_runs, FRESH_CASING_W, PIPE_CASING)
+	_pipe_pass(fresh_runs, FRESH_BORE_W, PIPE_BORE)
 
-	# The bore's outline, as one mitred ring per run.
-	#
-	# WHY offset_polyline and not two offset lines per segment: drawing each segment's two
-	# edges full-length to its end vertex makes them overshoot past each other at every
-	# bend, stamping a small cross on the elbow. Covering it with a disc at the vertex does
-	# NOT work — the overshoot lands on the INNER side of the corner, outside any disc
-	# centred on the vertex. offset_polyline solves the actual problem: it terminates each
-	# edge at the join, mitring the inside of the bend and rounding the outside to exactly
-	# the same radius as the bore disc already drawn there.
-	for run in runs:
-		var pts: PackedVector2Array = run
-		for outline in Geometry2D.offset_polyline(pts, BORE_W * 0.5,
-				Geometry2D.JOIN_ROUND, Geometry2D.END_BUTT):
-			var ring: PackedVector2Array = outline
-			draw_polyline(ring + PackedVector2Array([ring[0]]), PIPE_EDGE, 1.0)
+	_pipe_outline(runs, BORE_W * 0.5)
+	_pipe_outline(fresh_runs, FRESH_BORE_W * 0.5)
 
-	# Where the fresh-fuel leg MEETS the chute: both runs butt-cap here, and two
-	# perpendicular caps read as a cross. A merge fitting is what is physically there
-	# anyway — this is the junction where hopper fuel joins recirculated fuel on the one
-	# feed — so drawing it both states the mechanism and covers the seam.
-	var merge := Vector2(HOPPER.x, CHUTE_Y)
-	draw_circle(merge, CASING_W * 0.5, PIPE_CASING)
-	draw_circle(merge, BORE_W * 0.5, PIPE_BORE)
-	draw_arc(merge, CASING_W * 0.5, 0.0, TAU, 24, PIPE_EDGE, 1.0)
+	# Where hopper's own drop MEETS FRESH's belt (Phase 3b-iv): a T-fitting, the same
+	# treatment the old hopper/chute merge used before FRESH got its own line — this really
+	# is where fuel from the hopper joins the belt that carries it into the vessel, so
+	# drawing it both states the mechanism and covers the seam.
+	var merge := Vector2(HOPPER.x, FRESH_CHUTE_Y)
+	draw_circle(merge, FRESH_CASING_W * 0.5, PIPE_CASING)
+	draw_circle(merge, FRESH_BORE_W * 0.5, PIPE_BORE)
+	draw_arc(merge, FRESH_CASING_W * 0.5, 0.0, TAU, 24, PIPE_EDGE, 1.0)
 
 	# The sorter — this is the recirculate-vs-discharge DECISION made visible
 	# (main._extract_lowest): a pebble under discharge burnup turns right and goes
@@ -887,7 +990,7 @@ func _draw_plant() -> void:
 		caption += "  (%d held, %d to cask)" % [_pool_held, _pool_shipped]
 	_label(caption, Vector2(POOL_LEFT + 2.0, POOL_FLOOR - POOL_H - 6.0))
 
-	# Fresh-fuel hopper — drawn as a funnel feeding the chute.
+	# Fresh-fuel hopper — drawn as a funnel feeding FRESH's own belt.
 	var hop := PackedVector2Array([
 		Vector2(HOPPER.x - 30.0, HOPPER.y - 26.0), Vector2(HOPPER.x + 30.0, HOPPER.y - 26.0),
 		Vector2(HOPPER.x + 9.0, HOPPER.y + 8.0), Vector2(HOPPER.x - 9.0, HOPPER.y + 8.0),

@@ -156,8 +156,10 @@ func _feed(delta: float) -> void:
 	var id := _next_id
 	_next_id += 1
 	_physics.spawn_pebble(id, FuelLoop.drop_mouth(randf_range(-1.0, 1.0), _radius), _radius)
-	if _ccd:
-		_physics.set_continuous_cd(id, true)
+	# GodotPhysicsBackend.spawn_pebble defaults CCD on now — this harness exists partly to
+	# prove CCD is load-bearing (FAILURE 2 below), so --no-ccd must still be able to turn
+	# it back OFF rather than the new default silently making the flag a no-op.
+	_physics.set_continuous_cd(id, _ccd)
 	_transit[id] = leg
 	_fed[leg] += 1
 
@@ -291,7 +293,7 @@ func _report() -> void:
 		"nothing wedged or stood off head-on, with the legs ALTERNATING every pebble (%d stuck)"
 			% _stuck.size())
 
-	# FAILURE 2. THE gate under `main._feed_drop`'s set_continuous_cd call.
+	# FAILURE 2. THE gate under CCD defaulting on at spawn (`GodotPhysicsBackend.spawn_pebble`).
 	_check(_escaped.is_empty(),
 		"nothing tunnelled out of the plant at radius %.1f — the pipe is solid for the SMALLEST pebble the player can design (%d escaped)"
 			% [_radius, _escaped.size()])

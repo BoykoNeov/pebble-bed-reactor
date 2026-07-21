@@ -32,6 +32,17 @@ func add_static_segment(a: Vector2, b: Vector2) -> void:
 func spawn_pebble(id: int, pos: Vector2, radius: float) -> void:
 	var body := PebbleBody.new()
 	body.configure(radius)
+	# CCD ON by construction, not opt-in per call site. It used to be: main.gd had three
+	# spawn sites that each remembered to call `set_continuous_cd(id, true)` right after
+	# spawning, and a fourth (`_pool_push`) that simply never got the memo because nothing
+	# cued it to. That is a bug class, not a one-off miss — every NEW spawn site starts
+	# vulnerable to the same tunnelling (see the project's own ccd-is-per-spawn-site
+	# history) until someone remembers to add the same three words again. Defaulting it
+	# here instead means a body is safe from the instant it exists, and nobody has to
+	# remember anything. CAST_RAY, not CAST_SHAPE: the pebble is a disc and the thing it
+	# tunnels through is a thin segment wall, so sweeping the centre is enough to catch the
+	# crossing and is the cheaper of the two.
+	body.continuous_cd = RigidBody2D.CCD_MODE_CAST_RAY
 	body.position = pos
 	_root.add_child(body)
 	_bodies[id] = body

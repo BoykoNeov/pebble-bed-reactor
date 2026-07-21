@@ -1214,20 +1214,19 @@ func _spawn_from_queue() -> void:
 	var peb: Pebble = _pebbles[id]
 	_out_of_core.erase(id)
 	_physics.spawn_pebble(id, Vector2(slot["x"], Silo.spawn_y()), peb.radius)
-	# Same CCD reasoning as `_feed_drop`/`_feed_reinject`: this is the one drop with no
-	# pile underneath to shorten it. Every OTHER spawn into the bed lands on top of an
-	# already-settled core (a few px of fall), but the INITIAL fill drops straight from
-	# Silo.spawn_y() (140) to the closed hopper floor (900) with nothing in the way —
-	# ~760 px of free fall reaching ~1220 px/s, well over a diameter per physics step,
-	# which is enough to tunnel clean through the floor's zero-thickness SegmentShape2D.
-	# MEASURED with this line absent: 16 of the first 150 pebbles breached the closed
-	# floor in the first ~8 s of a fill, came to rest above the duct with the sorter gated
-	# off (bed not yet at TARGET_POPULATION), then — once the sorter opened — read as the
-	# "lowest" pebble in the core and got extracted from wherever they were resting,
-	# reappearing at the fixed drop mouth (CENTER_X) instead of wherever they actually
-	# fell. That is the escape AND the "different vertical axis" reappearance both, from
-	# one cause (see tests/live_fill_escape.gd).
-	_physics.set_continuous_cd(id, true)
+	# This is the one drop with no pile underneath to shorten it. Every OTHER spawn into
+	# the bed lands on top of an already-settled core (a few px of fall), but the INITIAL
+	# fill drops straight from Silo.spawn_y() (140) to the closed hopper floor (900) with
+	# nothing in the way — ~760 px of free fall reaching ~1220 px/s, well over a diameter
+	# per physics step, which is enough to tunnel clean through the floor's zero-thickness
+	# SegmentShape2D. MEASURED before CCD defaulted on at spawn (`GodotPhysicsBackend.
+	# spawn_pebble`): 16 of the first 150 pebbles breached the closed floor in the first
+	# ~8 s of a fill, came to rest above the duct with the sorter gated off (bed not yet at
+	# TARGET_POPULATION), then — once the sorter opened — read as the "lowest" pebble in
+	# the core and got extracted from wherever they were resting, reappearing at the fixed
+	# drop mouth (CENTER_X) instead of wherever they actually fell. That is the escape AND
+	# the "different vertical axis" reappearance both, from one cause
+	# (see tests/live_fill_escape.gd).
 
 
 ## Pre-burn a seed pebble to a random point in its life so the INITIAL core starts
@@ -1431,13 +1430,12 @@ func _feed_drop() -> void:
 	# `pool_drop`'s, and it matters for the same reason: symmetric contacts stack.
 	_physics.spawn_pebble(peb.id,
 			FuelLoop.drop_mouth(_rng.randf_range(-1.0, 1.0), peb.radius), peb.radius)
-	# Sweep this body's path, don't just sample where it lands. The riser belt runs at 380 px/s
-	# and radius is a PLAYER LEVER: a pebble designed at RADIUS_MIN is only 10 px across while
-	# a step at belt speed carries it ~6.3 px, and that margin is thin enough that the corner
-	# impact punches it clean through the riser's wall. Measured with this line removed: 12, 26
-	# and 14 recirculating pebbles lost in three runs of ~70, every one of them a pebble the
-	# calibrated bed never gets back. See `PhysicsBackend.set_continuous_cd`.
-	_physics.set_continuous_cd(peb.id, true)
+	# The riser belt runs at 380 px/s and radius is a PLAYER LEVER: a pebble designed at
+	# RADIUS_MIN is only 10 px across while a step at belt speed carries it ~6.3 px, and
+	# that margin is thin enough that the corner impact punches it clean through the
+	# riser's wall. Measured before CCD defaulted on at spawn (`GodotPhysicsBackend.
+	# spawn_pebble`): 12, 26 and 14 recirculating pebbles lost in three runs of ~70, every
+	# one of them a pebble the calibrated bed never gets back.
 	# Tint it NOW rather than letting the per-frame walk catch it a frame later in graphite
 	# grey: under a per-pebble field the pebble the player is following must not blink.
 	_physics.set_pebble_tint(peb.id, _pebble_tint(peb))
@@ -1475,10 +1473,10 @@ func _feed_reinject() -> void:
 	var peb: Pebble = _reinject_pending.pop_front()
 	_physics.spawn_pebble(peb.id,
 			FuelLoop.reinject_mouth(_rng.randf_range(-1.0, 1.0), peb.radius), peb.radius)
-	# Same CCD reasoning as `_feed_drop`: radius is a player lever, and a pebble built at
-	# RADIUS_MIN moves nearly a diameter per physics step at belt speed — enough to tunnel
-	# through the riser's own wall without this.
-	_physics.set_continuous_cd(peb.id, true)
+	# Same CCD reasoning as `_feed_drop`, now handled the same way: radius is a player
+	# lever, and a pebble built at RADIUS_MIN moves nearly a diameter per physics step at
+	# belt speed — enough to tunnel through the riser's own wall on a backend that did not
+	# default it on.
 	_physics.set_pebble_tint(peb.id, _pebble_tint(peb))
 	_transit[peb.id] = FuelLoop.REINJECT
 

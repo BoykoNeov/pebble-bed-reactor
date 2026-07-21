@@ -91,11 +91,19 @@ func apply_force(_id: int, _force: Vector2) -> void:
 ## a wall is one the BED never gets back, and TARGET_POPULATION = 380 is calibrated, so the
 ## bill arrives as a quiet shift in k with nothing on screen to explain it.
 ##
-## Off by default, and worth keeping off for the bed: 380 settling pebbles jostling at walking
-## pace are exactly the case discrete collision handles perfectly, so sweeping them all every
-## step would be paying for a hazard they do not have. The discharge belt's 95 px/s
-## (~1.6 px/step) is likewise never close, which is why nothing needed this before there was a
-## fast leg.
+## ⚠️ ON BY DEFAULT AT SPAWN NOW (`GodotPhysicsBackend.spawn_pebble`), not opt-in per call
+## site — this function exists to override that default, not to establish it. It used to be
+## off by default on the theory that 380 settling bed pebbles jostling at walking pace would
+## pay for a hazard they do not have; that theory was never wrong about the settled bed's own
+## motion, but it left a bug CLASS open — every spawn site had to remember to turn CCD on for
+## itself, and one (`_pool_push`) simply never did. MEASURED before defaulting it on for every
+## body: `live_riser.gd` (45 s, alternating belt traffic) held 2701/2700 physics ticks — no
+## lag — and `live_fill_escape.gd` (25 s) still filled the full 380-pebble bed with 0
+## breaches. CAST_RAY's cost turned out negligible at this population, so correctness-by-
+## construction won over the theoretical saving. The two `--no-ccd` test harnesses
+## (`live_riser.gd`, `live_reinject_riser.gd`) are the reason this function still exists: they
+## call it explicitly to turn CCD back OFF and reproduce the original tunnelling failure as a
+## regression guard.
 func set_continuous_cd(_id: int, _on: bool) -> void:
 	pass
 
