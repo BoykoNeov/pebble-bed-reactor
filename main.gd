@@ -1214,6 +1214,20 @@ func _spawn_from_queue() -> void:
 	var peb: Pebble = _pebbles[id]
 	_out_of_core.erase(id)
 	_physics.spawn_pebble(id, Vector2(slot["x"], Silo.spawn_y()), peb.radius)
+	# Same CCD reasoning as `_feed_drop`/`_feed_reinject`: this is the one drop with no
+	# pile underneath to shorten it. Every OTHER spawn into the bed lands on top of an
+	# already-settled core (a few px of fall), but the INITIAL fill drops straight from
+	# Silo.spawn_y() (140) to the closed hopper floor (900) with nothing in the way —
+	# ~760 px of free fall reaching ~1220 px/s, well over a diameter per physics step,
+	# which is enough to tunnel clean through the floor's zero-thickness SegmentShape2D.
+	# MEASURED with this line absent: 16 of the first 150 pebbles breached the closed
+	# floor in the first ~8 s of a fill, came to rest above the duct with the sorter gated
+	# off (bed not yet at TARGET_POPULATION), then — once the sorter opened — read as the
+	# "lowest" pebble in the core and got extracted from wherever they were resting,
+	# reappearing at the fixed drop mouth (CENTER_X) instead of wherever they actually
+	# fell. That is the escape AND the "different vertical axis" reappearance both, from
+	# one cause (see tests/live_fill_escape.gd).
+	_physics.set_continuous_cd(id, true)
 
 
 ## Pre-burn a seed pebble to a random point in its life so the INITIAL core starts
