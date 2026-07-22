@@ -195,7 +195,8 @@ func _step() -> void:
 			_watch.erase(id)
 		_transit.erase(id)
 		# Both legs end in a REMOVAL — the pool would admit (and eventually cask), the riser
-		# head hands off to a chute rider. Removing here keeps the tray from filling and
+		# head hands off to the merge run toward the shared inlet (out of scope for this
+		# harness, which stops at the bend). Removing here keeps the tray from filling and
 		# plugging its own mouth: a real failure, but a different one, and POOL_CAP already
 		# gates it (live_discharge_belt).
 		_physics.remove_pebble(id)
@@ -205,7 +206,7 @@ func _step() -> void:
 ## beautifully; that is exactly how the first spike for this work falsely passed 10/10.
 func _delivered(at: Vector2, leg: int) -> bool:
 	if leg == FuelLoop.RECIRC:
-		return FuelLoop.riser_delivered(at)
+		return FuelLoop.riser_at_bend(at)
 	return FuelLoop.pool_contains(at)
 
 

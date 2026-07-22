@@ -92,6 +92,7 @@ func _process(delta: float) -> bool:
 func _dump_leg() -> void:
 	var climbing := 0
 	var ducting := 0
+	var merging := 0
 	for id in _main._transit:
 		var at: Vector2 = _main._physics.get_position(id)
 		var leg: int = _main._transit[id]
@@ -100,11 +101,13 @@ func _dump_leg() -> void:
 			climbing += 1
 		elif FuelLoop.in_duct(at):
 			ducting += 1
+		elif leg == FuelLoop.RECIRC and FuelLoop.in_recirc_merge(at):
+			merging += 1
 		print("    #%-4d %-9s (%6.1f, %6.1f)  v=%4.0f px/s"
 			% [id, tag, at.x, at.y, _main._physics.get_velocity(id).length()])
-	print("  t=%.0f  climbing the riser %d   in the duct %d   riding the chute %d   bed %d/%d"
-		% [_t, climbing, ducting, _main._loop.count(), _main._core_count(),
-			_main.TARGET_POPULATION])
+	print("  t=%.0f  climbing the riser %d   in the duct %d   on the merge run %d   bed %d/%d"
+		% [_t, climbing, ducting, merging, _main._core_count(),
+			_main._population_setpoint])
 
 
 func _capture(name: String) -> void:

@@ -139,7 +139,7 @@ func _step() -> void:
 		_sagged = maxf(_sagged, at.y)
 		if at.y < FuelLoop.HUB_Y:
 			_climbed += 1
-		if FuelLoop.reinject_delivered(at):
+		if FuelLoop.reinject_at_bend(at):
 			done.append(id)
 			continue
 		_track(id, at)

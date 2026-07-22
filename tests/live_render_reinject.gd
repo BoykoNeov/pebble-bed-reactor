@@ -90,15 +90,17 @@ func _act() -> void:
 
 
 func _dump() -> void:
+	var riding := 0
 	for id in _main._transit:
 		if _main._transit[id] != FuelLoop.REINJECT:
 			continue
+		riding += 1
 		var at: Vector2 = _main._physics.get_position(id)
 		print("    #%-4d reinject (%6.1f, %6.1f)  v=%4.0f px/s"
 			% [id, at.x, at.y, _main._physics.get_velocity(id).length()])
-	print("  t=%.0f  reinject_pending %d   riding the chute %d   bed %d/%d"
-		% [_t, _main._reinject_pending.size(), _main._loop.count(), _main._core_count(),
-			_main.TARGET_POPULATION])
+	print("  t=%.0f  reinject_pending %d   in transit %d   bed %d/%d"
+		% [_t, _main._reinject_pending.size(), riding, _main._core_count(),
+			_main._population_setpoint])
 
 
 func _capture(name: String) -> void:

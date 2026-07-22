@@ -7,14 +7,15 @@
 # main.gd + game/, so the fast pure suites (which drive sim/ directly) cannot see
 # it AT ALL — they would stay green even if this mechanic silently drained the bed.
 # That matters because the one thing this feature must not do is perturb the
-# physics: TARGET_POPULATION is a CALIBRATED quantity that the whole M4/M5
-# operating point was tuned against.
+# physics: RECOMMENDED_POPULATION is the CALIBRATED quantity the whole M4/M5
+# operating point was tuned against, and it is also the default `_population_setpoint`
+# the fuel machine chases (Phase 3c made the target a player lever, not a hard pin).
 #
 # Guards the invariants that make a real (non-teleport) recirculation ride free:
-#  1. The BED stays pinned at TARGET_POPULATION once filled — the staging queue
-#     never starves. If LOOP_BUFFER were too small for the ride time, the bed would
-#     silently run short (fewer pebbles → less fuel → k shifts, headline power reads
-#     low) and NOTHING else in the test suite would notice.
+#  1. The BED stays at its setpoint once filled — the staging queue never starves.
+#     If LOOP_BUFFER were too small for the ride time, the bed would silently run
+#     short (fewer pebbles → less fuel → k shifts, headline power reads low) and
+#     NOTHING else in the test suite would notice.
 #  2. Pebbles genuinely RIDE (the machine is populated in steady state) — i.e. the
 #     teleport is actually gone, not just re-dressed.
 #  3. Every pebble ever made is still ACCOUNTED FOR: riders are neither leaked (stuck
@@ -97,14 +98,16 @@ func _process(delta: float) -> bool:
 	# time to fill (380 pebbles at 3 per 0.12 s ≈ 16 s, plus settling).
 	if _t > 30.0:
 		_min_core_after_fill = mini(_min_core_after_fill, _main._core_count())
-	# EVERY pebble in flight, not every RIDER. These were the same number until Phase 3b-i
-	# put the discharge leg on a belt, and the difference is exactly the trap this suite has
-	# now walked into twice: LOOP_BUFFER exists to cover pebbles that are out of the bed and
-	# on their way back, and HOW they travel — drawn along a polyline or shoved down a pipe
-	# by a belt — is a mechanism, not the invariant. `_loop.count()` alone would quietly stop
-	# counting a whole leg, and the gate below would go on passing while measuring less and
-	# less of what it is guarding. Count what is out of the bed, however it is getting there.
-	_max_riders = maxi(_max_riders, _main._loop.count() + _main._transit.size())
+	# Pebbles out of the bed but not yet pooled, measured against the SETPOINT, not against the
+	# live core count — riders don't exist any more (Phase 3c: every leg is a real body), and
+	# `main._mint_pebble`'s own gate (`_inventory() < _population_setpoint + LOOP_BUFFER`) bounds
+	# exactly this quantity. Measuring against `_core_count()` instead looked equivalent but is
+	# NOT: real physical admission means the bed's own count now legitimately dips by ~1 for the
+	# gap between an extraction and its replacement landing (there is no more instant, same-frame
+	# rider materialization), which briefly and harmlessly makes `inventory - core_count` read
+	# one over the buffer even though the mint gate itself was never violated. Against the
+	# setpoint, this is structurally bounded by the gate's own arithmetic and cannot false-fail.
+	_max_riders = maxi(_max_riders, _main._inventory() - _main._population_setpoint)
 
 	# Every body the belts carry must SWEEP its path, not just sample where it landed.
 	#
@@ -139,10 +142,10 @@ func _process(delta: float) -> bool:
 	# elapses, the re-arm below picks the new oldest, and the check can never accumulate
 	# its window at all. A pebble genuinely in transit has its remaining ride PLUS the
 	# whole queue wait ahead of it, so it comfortably outlives FREEZE_WINDOW.
-	if _t > 32.0 and _frozen_id == -1 and _main._loop.count() > 0:
+	if _t > 32.0 and _frozen_id == -1 and (_main._inventory() - _main._core_count()) > 0:
 		var staged := {}
-		for slot in _main._queue:
-			staged[slot["id"]] = true
+		for id in _main._mint_pending:
+			staged[id] = true
 		for id in _main._out_of_core:
 			if staged.has(id):
 				continue
@@ -157,13 +160,14 @@ func _process(delta: float) -> bool:
 	# t=35 s: the bed has filled and the machine is turning.
 	if _t >= 35.0 and not _checked_fill:
 		_checked_fill = true
-		print("  t=35 s: core=%d/%d  riding=%d  queued=%d  inventory=%d" % [
-			_main._core_count(), _main.TARGET_POPULATION, _main._loop.count(),
-			_main._queue.size(), _main._pebbles.size()])
-		_check(_main._core_count() == _main.TARGET_POPULATION,
+		print("  t=35 s: core=%d/%d  in_flight=%d  mint_pending=%d  inventory=%d" % [
+			_main._core_count(), _main._population_setpoint,
+			_main._inventory() - _main._core_count(),
+			_main._mint_pending.size(), _main._inventory()])
+		_check(_main._core_count() == _main._population_setpoint,
 			"bed is FULL at its calibrated population (%d)" % _main._core_count())
-		_check(_main._pebbles.size() == _main.TARGET_POPULATION + _main.LOOP_BUFFER,
-			"inventory = target + buffer (%d)" % _main._pebbles.size())
+		_check(_main._inventory() == _main._population_setpoint + _main.LOOP_BUFFER,
+			"inventory = setpoint + buffer (%d)" % _main._inventory())
 
 	# The freeze check: same pebble, still out of the core, must not have burned or cooled.
 	# Re-arm instead of giving up if it re-entered the bed before the window elapsed — the
@@ -205,8 +209,14 @@ func _process(delta: float) -> bool:
 			_main._total_recirculated, _main._total_extracted, _main._total_injected,
 			_min_core_after_fill])
 		_check(_main._total_recirculated > 0, "pebbles recirculate for another pass")
-		_check(_min_core_after_fill == _main.TARGET_POPULATION,
-			"bed NEVER ran short while pebbles rode (min core %d)" % _min_core_after_fill)
+		# Not exact equality: under Phase 3c an extracted pebble is a real body that has to
+		# physically travel back through the inlet before it lands, so the bed legitimately
+		# dips by ~1 for the gap between an extraction and its replacement — that is admission
+		# lag, not the bed running short. What this still forbids is the bed draining for real
+		# (the buffer starving), which would show as a dip far larger than one admission cycle.
+		_check(_min_core_after_fill >= _main._population_setpoint - 3,
+			"bed NEVER ran meaningfully short while pebbles rode (min core %d/%d)"
+				% [_min_core_after_fill, _main._population_setpoint])
 		# `_mint_pebble` is the only writer that ADDS to `_pebbles` and `_ship_to_cask` the
 		# only one that removes, so the mint count must equal the registry plus whatever has
 		# left for a cask — see invariant 3 in the header for why this is the accounting
@@ -226,7 +236,7 @@ func _process(delta: float) -> bool:
 		#
 		# Stated against target + buffer, NOT against `_pebbles.size() - _spent.size()`:
 		# that is the DEFINITION of `_inventory()` and would be a tautology.
-		_check(_main._inventory() == _main.TARGET_POPULATION + _main.LOOP_BUFFER,
+		_check(_main._inventory() == _main._population_setpoint + _main.LOOP_BUFFER,
 			"...and the circulating population held its calibrated sum with %d in the pool (%d)"
 				% [_main._spent.size(), _main._inventory()])
 		# Invariant 5 is only proven if it actually ran on a hot rider. A skipped check is

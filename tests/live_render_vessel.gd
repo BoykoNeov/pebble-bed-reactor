@@ -67,16 +67,22 @@ func _process(delta: float) -> bool:
 		_shot_riders = 1
 		return false
 
-	# 3. Catch pebbles actually INSIDE the pipe — the point of the whole slice. Wait for a
-	#    rider on a straight run rather than staging one, so what is captured is the real
-	#    mechanic. Several shots, because riders are spread around the loop.
+	# 3. Catch pebbles actually INSIDE the pipe — the point of the whole slice. Phase 3c made
+	#    every leg a real body (no more presentation-only riders), so "on a straight run" is
+	#    now a real zone check rather than a fraction along a stored path — pick a transiting
+	#    body actually inside one of the pipe zones, not right at either end. Several shots,
+	#    because traffic is spread around the loop.
 	if _shot_riders < 4:
-		for r in _main._loop._riders:
-			var f: float = r["d"] / r["len"]
-			if f > 0.35 and f < 0.8:
+		for id in _main._transit:
+			var at: Vector2 = _main._physics.get_position(id)
+			var leg: int = _main._transit[id]
+			var mid_pipe: bool = FuelLoop.in_duct(at) or FuelLoop.in_riser(at) \
+				or FuelLoop.in_recirc_merge(at) or FuelLoop.in_reinject_riser(at) \
+				or FuelLoop.in_reinject_merge(at)
+			if mid_pipe:
 				_shot_riders += 1
 				_capture("vessel_pipe_rider_%d.png" % _shot_riders)
-				print("  rider #%d kind=%d at %.0f%% along its path" % [r["id"], r["kind"], f * 100.0])
+				print("  body #%d leg=%d at (%.0f, %.0f)" % [id, leg, at.x, at.y])
 				break
 
 	if _shot_wide and _shot_rods and _shot_riders >= 4 and _done_at < 0.0:
@@ -101,8 +107,8 @@ func _rod_x() -> Array:
 ## The numbers behind the picture — so a wrong-looking frame can be told apart from a
 ## wrong-looking *scene*.
 func _report_geometry() -> void:
-	print("  bed %d/%d in core, %d riding the pipes; shell %0.f px thick, bed x = %.0f..%.0f"
-		% [_main._core_count(), _main.TARGET_POPULATION, _main._loop.count(), Silo.WALL_T,
+	print("  bed %d/%d in core, %d in transit; shell %0.f px thick, bed x = %.0f..%.0f"
+		% [_main._core_count(), _main._population_setpoint, _main._transit.size(), Silo.WALL_T,
 			Silo.LEFT, Silo.RIGHT])
 	print("  pipe bore %.0f px carrying pebbles of r=%.0f (clearance %.0f px each side)"
 		% [FuelLoop.BORE_W, FuelLoop.PEBBLE_R, FuelLoop.BORE_CLEARANCE])

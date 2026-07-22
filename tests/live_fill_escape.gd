@@ -1,6 +1,6 @@
 # tests/live_fill_escape.gd
 #
-# Integration gate for the INITIAL FILL: godot --headless --script res://tests/live_fill_escape.gd
+# Integration gate for a RESTART-TO-EMPTY FILL: godot --headless --script res://tests/live_fill_escape.gd
 #
 # WHY THIS EXISTS. Silo.wall_segments() is a CLOSED hopper — main.gd's own comments are explicit
 # that the floor has no free outlet, discharge is a METERED removal, and the bed cannot
@@ -8,41 +8,59 @@
 # proof a wall was crossed, not landed through — the closed floor is a SegmentShape2D with zero
 # thickness, and Godot does not sweep a fast body against one without continuous collision on.
 #
-# WHY THE INITIAL FILL SPECIFICALLY. Every OTHER body that ever enters the bed (`_spawn_from_queue`
-# after the first pass, `_feed_drop`, `_feed_reinject`) lands on top of an already-settled pile —
-# a few px of fall. The initial fill is the one moment nothing is underneath: a pebble spawned at
-# Silo.spawn_y() (140) free-falls the full ~760 px to the closed floor at OUTLET_Y (900) and
-# reaches ~1220 px/s, well over a diameter per physics step at 32 solver iterations.
+# WHY A RESTART-TO-EMPTY FILL SPECIFICALLY (Phase 3c changed this). Boot no longer plays physics
+# forward at all — `_seed_initial_bed` places an already-settled lattice directly, so there is no
+# free-fall to test at boot any more. Every OTHER body that enters a bed with something already
+# under it (`_admit_batch` once the pile has depth, `_feed_drop`, `_feed_reinject`) lands on top
+# of an already-settled pile — a few px of fall. A restart-to-empty fill is now the ONLY moment
+# nothing is underneath: the first pebbles admitted through `FuelLoop.inlet_admit_point` free-fall
+# the full drop to the closed floor at OUTLET_Y and reach real speed, well over a diameter per
+# physics step at 32 solver iterations — the same hazard the old boot-time queue fill used to
+# produce, just moved to a different trigger.
 #
 # WHAT A BREACH LOOKS LIKE ON SCREEN, player-reported and reproduced here: the escaped pebble
 # comes to rest above the transport duct (it looks like it "fell through and stopped"), sits there
-# because `_extract_lowest` is gated off until the bed reaches TARGET_POPULATION, and once the
-# gate opens it reads as the single lowest pebble in the core (it is, by a wide margin) and gets
-# extracted — reappearing at the fixed drop mouth (Silo.CENTER_X) instead of wherever it actually
-# fell, which is the "disappears, then reappears on a different x" half of the report.
+# because `_extract_lowest` is gated off until the bed reaches the population setpoint, and once
+# the gate opens it reads as the single lowest pebble in the core (it is, by a wide margin) and
+# gets extracted — reappearing at the fixed drop mouth (Silo.CENTER_X) instead of wherever it
+# actually fell, which is the "disappears, then reappears on a different x" half of the report.
 #
-# MEASURED with `_spawn_from_queue`'s `set_continuous_cd` call absent: 16 of the first 150
-# pebbles breached the closed floor in the first ~8 s of a fill, velocity at breach almost always
-# (0, ~980-1000) px/s — a straight vertical pass through the floor, not a lateral solver-ejection
-# spike, which is what point this gate at CCD rather than at spawn clearance. With the call
-# present: 0 in 25 s.
+# MEASURED historically with the admission spawn's `set_continuous_cd` call absent: pebbles
+# breached the closed floor early in a fill, velocity at breach almost always (0, ~980-1000) px/s
+# — a straight vertical pass through the floor, not a lateral solver-ejection spike, which is what
+# points this gate at CCD rather than at spawn clearance.
 extends SceneTree
+
+const FILL_SETPOINT := 380
+const WATCH_FOR := 60.0    # measured ~11/s effective throughput, not the raw 15/s _fill_rate
 
 var _main
 var _t := 0.0
 var _failures := 0
 var _spawn_pos: Dictionary = {}    # id -> spawn x, for bodies just placed at the top
 var _breaches: Array = []          # [{id, t, pos, vel}]
+var _restarted := false
 
 
 func _initialize() -> void:
 	_main = load("res://main.tscn").instantiate()
 	root.add_child(_main)
-	print("[live fill escape] the closed hopper floor must hold during the initial (empty-core) fill")
+	print("[live fill escape] the closed hopper floor must hold during a restart-to-empty fill")
 
 
 func _process(delta: float) -> bool:
 	_t += delta
+
+	if not _restarted:
+		# Boot itself seeds directly with no physics playback (Phase 3c) — the free-fall hazard
+		# this test guards only appears once we force a REAL admission fill from empty.
+		_main._population_setpoint = 0
+		_main._restart_reactor()
+		_main._population_setpoint = FILL_SETPOINT
+		_restarted = true
+		_t = 0.0
+		print("[live fill escape] restarted to empty, target %d — watching the real fill" % FILL_SETPOINT)
+		return false
 
 	for id in _main._physics._bodies:
 		if not _spawn_pos.has(id) and not _main._out_of_core.has(id):
@@ -64,14 +82,14 @@ func _process(delta: float) -> bool:
 				print("  BREACH t=%.2fs id=%d pos=(%.1f,%.1f) vel=(%.1f,%.1f) spawn_x=%.1f" % [
 					_t, id, pos.x, pos.y, vel.x, vel.y, _spawn_pos.get(id, -1.0)])
 
-	if _t >= 25.0:
-		print("  core=%d/%d over 25 s of fill" % [_main._core_count(), _main.TARGET_POPULATION])
+	if _t >= WATCH_FOR:
+		print("  core=%d/%d over %.0f s of fill" % [_main._core_count(), _main._population_setpoint, WATCH_FOR])
 		_check(_breaches.is_empty(),
 			"no core-flagged body ever breached the closed hopper floor (%d breach(es))"
 				% _breaches.size())
-		_check(_main._core_count() == _main.TARGET_POPULATION,
-			"bed reached its calibrated population (%d/%d)"
-				% [_main._core_count(), _main.TARGET_POPULATION])
+		_check(_main._core_count() >= FILL_SETPOINT - 5,
+			"bed reached its fill setpoint (%d/%d)"
+				% [_main._core_count(), FILL_SETPOINT])
 		_report()
 		return true
 	return false
