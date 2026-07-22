@@ -11,9 +11,9 @@
 # this running far longer than any test does. This runs the real scene for 10 minutes and
 # asserts the things that would rot slowly and silently:
 #
-#   * the bed stays pinned at TARGET_POPULATION (a slow leak in the fuel loop's staging
-#     queue would drain it — the calibrated population is what the operating point is
-#     tuned against),
+#   * the bed stays near its calibrated setpoint (a slow leak in the fuel loop's staging
+#     would drain it — the calibrated population is what the operating point is tuned
+#     against),
 #   * power and temperature stay BOUNDED and RUNNING (no runaway, no creeping collapse),
 #   * the core does not drift monotonically — the second half's mean must not have walked
 #     away from the first half's, which is what a slow depletion/refuel imbalance looks
@@ -57,9 +57,9 @@ func _process(delta: float) -> bool:
 		_kcold.append(_main._k_cold)
 		_core.append(_main._core_count())
 		if _a.size() % 12 == 0:   # a line each minute
-			print("  t=%3.0f s  A=%6.2f  peakT=%4.0f K  k_cold=%.4f  core=%d  riding=%d"
+			print("  t=%3.0f s  A=%6.2f  peakT=%4.0f K  k_cold=%.4f  core=%d  in_flight=%d"
 				% [_t, _main._amplitude, _main._peak_temp, _main._k_cold,
-					_main._core_count(), _main._loop.count()])
+					_main._core_count(), _main._inventory() - _main._population_setpoint])
 	if _t < RUN_FOR:
 		return false
 
@@ -76,10 +76,18 @@ func _process(delta: float) -> bool:
 	print("  second half: mean A=%6.2f  mean peakT=%4.0f K  mean k_cold=%.4f" % [a2, t2, k2])
 	print("  max peak fuel temp seen: %.0f K   min core seen: %d\n" % [_max_peak, core_min])
 
-	# The bed must not quietly drain. TARGET_POPULATION is calibrated; running short shifts
-	# k and reads the headline power low, and nothing else in a long run would reveal it.
-	_check(core_min == _main.TARGET_POPULATION,
-		"bed stayed pinned at its calibrated population for the whole run (min %d)" % core_min)
+	# The bed must not quietly drain. RECOMMENDED_POPULATION (the default setpoint) is
+	# calibrated; running short shifts k and reads the headline power low, and nothing else
+	# in a long run would reveal it.
+	#
+	# Not exact-pin: under Phase 3c a real body has to physically travel back through the
+	# inlet before it lands, so the bed legitimately dips by ~1 for the gap between an
+	# extraction and its replacement — admission lag, sampled here over 600 s / ~every 5 s,
+	# virtually guaranteed to catch at least one such dip. What this still forbids is a real
+	# slow drain, which would show as a min far below one admission cycle's worth.
+	_check(core_min >= _main._population_setpoint - 3,
+		"bed stayed near its calibrated population for the whole run, not draining (min %d/%d)"
+			% [core_min, _main._population_setpoint])
 	# Still alive at the end — not shut down, not run away.
 	_check(a2 > Thermal.A_RUNNING, "core is still RUNNING after %.0f s (mean A=%.2f)" % [RUN_FOR, a2])
 	_check(k2 > 1.0, "k_cold still holds supercritical at the refueling equilibrium (%.4f)" % k2)

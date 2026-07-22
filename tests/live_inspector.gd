@@ -100,15 +100,23 @@ func _process(delta: float) -> bool:
 			"clicking the newest settled pebble selects it (#%d)" % newest.id)
 		_ok(_main._selected_where == "spent pool", "...and reports the pool too (%s)" % _main._selected_where)
 
-	# --- A rider ---
-	if _main._loop.count() > 0:
-		var r: Dictionary = _main._loop._riders[0]
-		var rp: Vector2 = _main._loop.rider_position(r["id"])
-		_main._pick_at(rp)
-		_ok(_main._selected != null and _main._selected.id == r["id"],
-			"clicking a pebble riding the machine selects it (#%d)" % r["id"])
+	# --- A body in transit ---
+	# Riders don't exist any more (Phase 3c: every leg is a real body) — pick a body straight
+	# out of `_transit` at its own live position, the same way the bed and pool sections above
+	# already do, and check `_where_is` names the LEG rather than lumping it in with the bed.
+	if not _main._transit.is_empty():
+		var transit_id: int = _main._transit.keys()[0]
+		var leg: int = _main._transit[transit_id]
+		var at_transit: Vector2 = _main._physics.get_position(transit_id)
+		_main._pick_at(at_transit)
+		_ok(_main._selected != null and _main._selected.id == transit_id,
+			"clicking a pebble riding the machine selects it (#%d)" % transit_id)
+		var want_where: String = "recirc riser" if leg == FuelLoop.RECIRC \
+			else ("reinject riser" if leg == FuelLoop.REINJECT else "discharge pipe")
+		_ok(_main._selected_where == want_where,
+			"...and reports the leg it is on (%s)" % _main._selected_where)
 	else:
-		print("  (no rider in flight at the assert moment — rider pick not exercised)")
+		print("  (nothing in transit at the assert moment — transit pick not exercised)")
 
 	# --- The panel actually RENDERS ---
 	#

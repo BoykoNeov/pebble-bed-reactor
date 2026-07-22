@@ -228,9 +228,9 @@ func _process(delta: float) -> bool:
 			% not_flagged)
 
 	# 6. The fuel cycle's arithmetic is untouched — the calibration-neutrality claim.
-	_ok(_main._inventory() == _main.TARGET_POPULATION + _main.LOOP_BUFFER,
-		"the circulating population is still target + buffer (%d)" % _main._inventory())
-	_ok(_main._core_count() == _main.TARGET_POPULATION,
+	_ok(_main._inventory() == _main._population_setpoint + _main.LOOP_BUFFER,
+		"the circulating population is still setpoint + buffer (%d)" % _main._inventory())
+	_ok(_main._core_count() == _main._population_setpoint,
 		"bed still pinned at its calibrated population (%d)" % _main._core_count())
 
 	# 6b. ...and that exclusion is REAL, not a rename. Same two-sided shape as check 4b:
@@ -241,8 +241,8 @@ func _process(delta: float) -> bool:
 	_ok(_main._pebbles.size() == _main._inventory() + spent.size(),
 		"the pool IS in the registry (%d = %d circulating + %d pooled) — the gate has something to exclude"
 			% [_main._pebbles.size(), _main._inventory(), spent.size()])
-	_ok(_main._pebbles.size() > _main.TARGET_POPULATION + _main.LOOP_BUFFER,
-		"...and the raw registry has outgrown target + buffer (%d) — so the gate CANNOT be reading it"
+	_ok(_main._pebbles.size() > _main._population_setpoint + _main.LOOP_BUFFER,
+		"...and the raw registry has outgrown setpoint + buffer (%d) — so the gate CANNOT be reading it"
 			% _main._pebbles.size())
 
 	# 7. The capped VIEW is honest: it holds what fits and reports the true total. Counts

@@ -6,7 +6,7 @@
 # WHY this test exists at all, for what is "only drawing": the shell was given real
 # thickness, and the ONE way that change could do damage is by growing INWARD. The inner
 # faces are the physics (Silo.wall_segments), and the bed volume they enclose is what
-# TARGET_POPULATION, A_REF and the whole M4/M5 operating point were calibrated against —
+# RECOMMENDED_POPULATION, A_REF and the whole M4/M5 operating point were calibrated against —
 # so a shell that ate even a few px of bed would shift k with no other test noticing. The
 # existing suites all drive sim/ directly and never build a silo; they would stay green.
 #

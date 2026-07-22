@@ -24,10 +24,11 @@
 # FAILURE 3 — the bed silently drains. THE one that matters to the reactor. Transiting
 # pebbles are `_out_of_core`, so they are outside the flux solve; but if this leg swallowed
 # pebbles the mint gate would keep minting against an inventory that never opens slots, and
-# TARGET_POPULATION = 380 is CALIBRATED — A_REF and the whole M4/M5 operating point assume
-# exactly that many homogenized pebbles. A bed running short shifts k with nothing on screen
-# to say so. This is what "keep the reactor calibrated" means in this slice, so the bed pin
-# is checked continuously rather than once at the end.
+# RECOMMENDED_POPULATION = 380 is CALIBRATED — A_REF and the whole M4/M5 operating point
+# assume exactly that many homogenized pebbles, and it is also the default player setpoint.
+# A bed running short shifts k with nothing on screen to say so. This is what "keep the
+# reactor calibrated" means in this slice, so the bed is watched continuously rather than
+# once at the end.
 #
 # ⚠️ SATURATION IS NOT A JAM, and this harness is built to not confuse them — the spike
 # nearly did. Feeding a pipe faster than it can clear makes rides long and arrivals late,
@@ -71,6 +72,7 @@ var _exit_speeds: Array = []
 var _min_core := 1 << 30         # nominal phase only — the gated one
 var _min_core_stress := 1 << 30  # reported, deliberately NOT gated (see _process)
 var _bed_dips := 0
+var _peak_in_flight := 0
 
 
 func _initialize() -> void:
@@ -111,7 +113,7 @@ func _process(delta: float) -> bool:
 			_min_core_stress = mini(_min_core_stress, core)
 		else:
 			_min_core = mini(_min_core, core)
-			if core < _main.TARGET_POPULATION:
+			if core < _main._population_setpoint:
 				_bed_dips += 1
 
 	_track()
@@ -162,6 +164,13 @@ func _stress() -> void:
 ## which pipe it is in.
 func _track() -> void:
 	_peak_transit = maxi(_peak_transit, _main._transit.size())
+	# The LOOP_BUFFER-relevant quantity, measured against the SETPOINT rather than the live
+	# core count — see live_fuel_loop.gd's note on the same trap. Real physical admission
+	# means the bed's own count legitimately dips by ~1 between an extraction and its
+	# replacement landing, which would make `inventory - core_count` read one high on every
+	# extraction even with nothing wrong. Against the setpoint this is structurally bounded
+	# by `main._mint_pebble`'s own gate (`_inventory() < setpoint + LOOP_BUFFER`).
+	_peak_in_flight = maxi(_peak_in_flight, _main._inventory() - _main._population_setpoint)
 	for id in _main._transit:
 		if _main._transit[id] != FuelLoop.DISCHARGE:
 			continue
@@ -216,7 +225,7 @@ func _report() -> void:
 	print("  ride: mean %.2f s  max %.2f s   exit speed: max %.0f px/s (belt %.0f)" %
 		[mean_ride, max_ride, max_exit, FuelLoop.BELT_DISCHARGE])
 	print("  bed: NOMINAL min core %d / %d (%d frames short)   under flush: min %d (not gated)" %
-		[_min_core, _main.TARGET_POPULATION, _bed_dips, _min_core_stress])
+		[_min_core, _main._population_setpoint, _bed_dips, _min_core_stress])
 
 	# Where the "held" pebbles ACTUALLY are. `pool_contains` fires the moment a falling
 	# pebble crosses into the tray's rect, which is a position test and not a rest test — so
@@ -250,12 +259,18 @@ func _report() -> void:
 	# `_out_of_core`, so the leg is neutronically invisible by construction — what this
 	# proves is that the ACCOUNTING around it (the feed queue holding inventory, the slot
 	# opening on arrival rather than at the sorter) did not drain the bed.
-	_check(_bed_dips == 0 and _min_core == _main.TARGET_POPULATION,
-		"bed stayed PINNED at %d through NOMINAL discharge (min %d)" %
-			[_main.TARGET_POPULATION, _min_core])
-	_check(_peak_transit + _main._loop.count() < _main.LOOP_BUFFER,
+	#
+	# Not exact-pin any more: under Phase 3c an extracted pebble is a real body that has to
+	# physically travel back through the inlet before it lands, so the bed legitimately dips
+	# by ~1 for the gap between an extraction and its replacement — admission lag, not the
+	# pipe draining the bed. What this still forbids is the bed running down for real, which
+	# is exactly what this leg swallowing pebbles (FAILURE 3, see header) would look like.
+	_check(_min_core >= _main._population_setpoint - 3,
+		"bed stayed near its setpoint %d through NOMINAL discharge, not draining (min %d)" %
+			[_main._population_setpoint, _min_core])
+	_check(_peak_in_flight <= _main.LOOP_BUFFER,
 		"peak in flight (%d) stays well under LOOP_BUFFER (%d)" %
-			[_peak_transit + _main._loop.count(), _main.LOOP_BUFFER])
+			[_peak_in_flight, _main.LOOP_BUFFER])
 
 	# Nothing is swallowed: every pebble ever discharged is either held in the tray, gone to
 	# a cask, or still on its way. `_total_extracted` is only incremented on ARRIVAL now

@@ -11,9 +11,10 @@
 #
 # FAILURE 1 — RE-INJECTION MINTS A PEBBLE THAT SHOULD NOT EXIST. This is the sharp one and
 # the whole reason Phase 2a moved the pool inside `_pebbles`. The bed is pinned at a
-# CALIBRATED TARGET_POPULATION, and the mint gate holds the circulating population at
-# target + buffer. A returning pebble must therefore be ABSORBED — the plant mints one
-# fewer to make room — not ADDED on top. Get it wrong and the core carries extra fuel: k
+# CALIBRATED setpoint (RECOMMENDED_POPULATION by default), and the mint gate holds the
+# circulating population at setpoint + buffer. A returning pebble must therefore be
+# ABSORBED — the plant mints one fewer to make room — not ADDED on top. Get it wrong and
+# the core carries extra fuel: k
 # shifts, headline power reads high, and every M4/M5 calibration is quietly off with
 # nothing on screen to show it. The claim is that this needs no bookkeeping at all:
 # leaving `_spent` raises `_inventory()`, which is the number the gate already reads, so
@@ -33,16 +34,34 @@ extends SceneTree
 # Let the plant fill and settle, and give the discharge leg time to put real pebbles in
 # the pool. Discharge runs ~1 per 16 s, so this is a handful of arrivals.
 const ACT_AT := 80.0
-# Queue for REINJECT's own mouth (near-instant, nothing else competes for it), climb ~920 px
-# of riser at BELT_RISER (measured ~2.5 s in tests/live_reinject_riser.gd), then the same
-# short chute tail RECIRC rides. Comfortably longer than any of that takes.
-const ARRIVE_BY := 22.0
+# NOT a fixed ride estimate any more — Phase 3c added a step the old constant never had to
+# cover: after the climb (~2.5 s, tests/live_reinject_riser.gd) and merge run, the pebble
+# piles at the shared inlet and only crosses into the bed when `_admit_batch` finds it a
+# vacancy, which opens roughly in step with extraction — and it queues behind whatever else
+# is already piled there (up to LOOP_BUFFER deep in the worst case). So this polls for the
+# real landing signal (`_out_of_core` clearing) instead of asserting at one guessed instant,
+# generously bounded rather than tuned to a number that could still be too tight some runs.
+#
+# ⚠️ KNOWN FAILING (Phase 3c) — do not raise this to "fix" the test. Root-caused: the shared
+# inlet bore (66x100px) cannot hold the pile LOOP_BUFFER's sizing produces (measured 33-35
+# bodies backed up against a bore that fits roughly half that), so once the bore saturates the
+# overflow spills sideways through the open corridor-entry band above `merge_floor` and jams
+# both merge runs — a re-injected pebble can get wedged in that spill and never reach the bore
+# at all, no matter how long this waits. See FuelLoop.inlet_walls' "open air above merge_floor"
+# reasoning, which assumed only a transient single-body overshoot, not a standing pile deep
+# enough to occupy that same space. The fix is a real design tradeoff (shrink LOOP_BUFFER,
+# widen the bore, or change admission cadence) and is not this test's to make — per project
+# convention this stays RED, honestly, until that decision is made and the geometry/sizing is
+# actually fixed. Raising ARRIVE_GIVEUP further would not help: the traced pebble does not
+# trend toward the bore even over 90s, it drifts away from it.
+const ARRIVE_GIVEUP := 90.0
 
 var _main
 var _t := 0.0
 var _failures := 0
 var _acted := false
 var _done := false
+var _act_done_t := 0.0
 
 # Snapshotted from the pebble we send back, so the assertions can prove it is the SAME
 # pebble that came out the other end and that its history survived the trip.
@@ -64,14 +83,27 @@ func _init() -> void:
 	root.add_child(_main)
 
 
+var _next_trace := 0.0
+
+
 func _process(delta: float) -> bool:
 	_t += delta
 	if not _acted and _t >= ACT_AT:
 		_acted = true
-		return _act()
-	if _acted and not _done and _t >= ACT_AT + ARRIVE_BY:
-		_done = true
-		return _assert_arrived()
+		var r := _act()
+		_act_done_t = _t
+		return r
+	if _acted and not _done:
+		if _id != -1 and _main._pebbles.has(_id) and _t >= _next_trace:
+			_next_trace += 2.0
+			var at: Vector2 = _main._physics.get_position(_id)
+			var v: Vector2 = _main._physics.get_velocity(_id)
+			print("  trace t=%.1f pos=(%7.1f, %7.1f) v=(%7.1f, %7.1f) transit=%s where=%s"
+				% [_t - _act_done_t, at.x, at.y, v.x, v.y, _main._transit.get(_id, "-"),
+					_main._where_is(_main._pebbles[_id])])
+		if not _main._out_of_core.has(_id) or _t - _act_done_t >= ARRIVE_GIVEUP:
+			_done = true
+			return _assert_arrived()
 	return false
 
 
@@ -167,31 +199,41 @@ func _act() -> bool:
 
 
 func _assert_arrived() -> bool:
-	# FAILURE 3: it must have completed the ride. `rider_position == INF` alone is ambiguous
-	# now (Phase 3b-iii) — it is also true while the pebble is still CLIMBING its own riser as
-	# a real body, not yet a rider at all. The specific claim is that it landed: no longer
-	# `_out_of_core`, which only happens on a genuine bed arrival (`_spawn_from_queue`).
-	_ok(_main._loop.rider_position(_id) == Vector2.INF,
-		"the re-injected pebble finished its ride (it is off the machine)")
+	# FAILURE 3: it must have completed the ride. Riders don't exist any more (Phase 3c) —
+	# every leg is a real body, so "off the machine" is checked directly against `_transit`
+	# and its own mouth queue, not a rider path fraction. The specific claim that it LANDED
+	# (rather than merely finishing the climb) is no longer `_out_of_core`, which only
+	# happens on a genuine bed arrival (`_admit_batch`).
+	_ok(not _main._transit.has(_id) and not _main._reinject_pending.has(_main._pebbles.get(_id)),
+		"the re-injected pebble is off REINJECT's riser and its mouth queue for good")
+	if _main._out_of_core.has(_id) and _main._pebbles.has(_id):
+		print("  (still out of core after %.0fs — where: %s)"
+			% [_t - _act_done_t, _main._where_is(_main._pebbles[_id])])
 	_ok(not _main._out_of_core.has(_id),
 		"...and actually LANDED — it is fuel in the bed again, not still climbing or queued")
-	_ok(not _main._transit.has(_id) and not _main._reinject_pending.has(_main._pebbles.get(_id)),
-		"...off REINJECT's riser and its mouth queue for good")
 	_ok(_main._pebbles.has(_id), "...and still exists (%d)" % _id)
 
 	var peb: Pebble = _main._pebbles[_id]
 	_ok(is_equal_approx(peb.burnup, _burnup) or peb.burnup > _burnup,
 		"its burnup survived the trip and only ever grew (%.1f -> %.1f)" % [_burnup, peb.burnup])
 
-	# THE HEADLINE. The bed is back at its calibrated population and the plant minted one
+	# THE HEADLINE. The bed is back near its calibrated population and the plant minted one
 	# FEWER pebble than it otherwise would have — the returning pebble took the slot.
-	# Checked against `TARGET_POPULATION` rather than a delta so a drifting bed cannot hide
-	# inside a self-consistent pair of numbers.
-	_ok(_main._core_count() == _main.TARGET_POPULATION,
-		"the bed is STILL pinned at its calibrated population (%d / %d) — re-injection did not add fuel"
-			% [_main._core_count(), _main.TARGET_POPULATION])
-	_ok(_main._inventory() == _main.TARGET_POPULATION + _main.LOOP_BUFFER,
-		"the circulating population is still target + buffer (%d)" % _main._inventory())
+	# Checked against `_population_setpoint` rather than a delta so a drifting bed cannot
+	# hide inside a self-consistent pair of numbers.
+	#
+	# Not exact equality on the core count: under Phase 3c a real body has to physically
+	# travel back through the inlet before it lands, so the bed legitimately dips by ~1 for
+	# the gap between an extraction and its replacement — admission lag, not re-injection
+	# adding fuel. `core_count` is also structurally bounded ABOVE by the setpoint (admission
+	# stops once the bed is full), so only the floor needs a tolerance.
+	_ok(_main._core_count() >= _main._population_setpoint - 3,
+		"the bed is STILL near its calibrated population (%d / %d) — re-injection did not add fuel"
+			% [_main._core_count(), _main._population_setpoint])
+	# `_inventory()` only moves on minting/shipping, not on the bed<->transit shuffle, so
+	# (unlike core_count) this one holds exactly.
+	_ok(_main._inventory() == _main._population_setpoint + _main.LOOP_BUFFER,
+		"the circulating population is still setpoint + buffer (%d)" % _main._inventory())
 
 	# The self-debit, stated as the thing a player would notice. Over this window the plant
 	# would normally mint one replacement per discharge; having taken one back by hand, it

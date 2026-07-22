@@ -21,10 +21,20 @@
 extends SceneTree
 
 const SETTLE_AT := 30.0
+# `_feed_inlet_top` runs every physics frame but only admits into a lane that is currently
+# clear — real plant traffic this test does not control. A few real frames is more than
+# enough once the backlog is cleared out of THIS pebble's way (see section 3 below).
+const MINT_WAIT_GIVEUP := 5.0
 
 var _main
 var _t := 0.0
 var _failures := 0
+var _phase := 0            # 0 = settle and run checks 1/2/3a, 1 = wait for the body, 2 = done
+var _minted := -1
+var _minted_big := 0.0
+var _default_r := 0.0
+var _saved_mint_pending: Array = []
+var _mint_wait_start := 0.0
 
 
 func _initialize() -> void:
@@ -41,20 +51,24 @@ func _ok(pass_: bool, msg: String) -> void:
 
 func _process(delta: float) -> bool:
 	_t += delta
+
+	if _phase == 1:
+		return _wait_for_minted_body()
+
 	if _t < SETTLE_AT:
 		return false
 
 	# --- 1. The default template reproduces today's core exactly ---
-	var default_r: float = _main.RADIUS_DEFAULT
-	_ok(is_equal_approx(default_r, _main.PEBBLE_RADIUS),
-		"the default design radius IS the nominal (%.2f)" % default_r)
-	_ok(is_equal_approx(_main._pebble_radius, default_r),
+	_default_r = _main.RADIUS_DEFAULT
+	_ok(is_equal_approx(_default_r, _main.PEBBLE_RADIUS),
+		"the default design radius IS the nominal (%.2f)" % _default_r)
+	_ok(is_equal_approx(_main._pebble_radius, _default_r),
 		"the sim opens at the default design radius")
 
 	var off := 0
 	for id in _main._pebbles:
 		var peb: Pebble = _main._pebbles[id]
-		if not is_equal_approx(peb.radius, default_r):
+		if not is_equal_approx(peb.radius, _default_r):
 			off += 1
 	_ok(off == 0, "every pebble in a default core is nominal-sized (%d off)" % off)
 
@@ -95,47 +109,75 @@ func _process(delta: float) -> bool:
 	# body: this is the path that was broken before — Pebble.new took the design size but
 	# spawn_pebble passed the CONSTANT, so an edited pebble arrived in the bed at 8.0 and
 	# the edit vanished with nothing to show for it.
+	#
+	# Phase 3c retired `_queue`/`_spawn_from_queue` — a minted pebble now stages bodiless
+	# in `_mint_pending` and gets a body from `_feed_inlet_top`, called every physics frame
+	# but gated on a LANE being clear (real plant traffic this test does not control). So
+	# rather than force it synchronously and risk reading "no body" from a lane that was
+	# merely busy, not broken, this clears the backlog out of THIS pebble's way and lets
+	# the real loop admit it over a few real frames — see `_wait_for_minted_body`.
 	var big: float = _main.RADIUS_MAX
 	_main._pebble_radius = big
 	var before_ids := {}
 	for id in _main._pebbles:
 		before_ids[id] = true
 	_main._mint_pebble()
-	var minted := -1
+	_minted = -1
 	for id in _main._pebbles:
 		if not before_ids.has(id):
-			minted = id
+			_minted = id
 			break
-	_ok(minted != -1, "a pebble was minted at the edited design")
-	if minted != -1:
-		var mp: Pebble = _main._pebbles[minted]
-		_ok(is_equal_approx(mp.radius, big),
-			"the minted pebble carries the EDITED radius (%.2f), not the nominal" % mp.radius)
+	_ok(_minted != -1, "a pebble was minted at the edited design")
+	_main._pebble_radius = _default_r   # restore immediately, before anything else can mint
 
-		# THE CHECK WITH TEETH. Everything above runs on a core where every pebble is
-		# already 8.0, so sim-radius and body-radius are trivially equal and the whole
-		# "two worlds agree" sweep passes whether or not the desync exists — verified: it
-		# went green with the bug deliberately restored. Only a NON-default pebble can
-		# tell the two apart. So push this oversized pebble through the real spawn path
-		# and read the body it produced: if _spawn_from_queue passes the constant, the
-		# body comes back 8.0 while its pebble says 11.0, and the bed packs one way while
-		# the flux solve sees another.
-		var saved: Array = _main._queue.duplicate()
-		_main._queue.clear()
-		_main._queue.push_back({"id": minted, "x": Silo.spawn_x(_main._rng, big + 2.0)})
-		_main._spawn_from_queue()
-		var nb = _main._physics._bodies.get(minted)
-		_ok(nb != null, "the edited pebble reached the bed as a body")
-		if nb != null:
-			_ok(is_equal_approx(nb.radius, big),
-				"the body was built at the pebble's OWN radius (%.2f, want %.2f) — the edit survives injection"
-					% [nb.radius, big])
-			_ok(is_equal_approx(nb._shape.radius, big),
-				"...and it COLLIDES at that radius (%.2f) — physics and neutronics agree"
-					% nb._shape.radius)
-		_main._queue = saved
-	_main._pebble_radius = default_r   # restore, so the checks below read a clean core
+	if _minted == -1:
+		_phase = 2
+		return _finish_checks()
 
+	var mp: Pebble = _main._pebbles[_minted]
+	_minted_big = big
+	_ok(is_equal_approx(mp.radius, big),
+		"the minted pebble carries the EDITED radius (%.2f), not the nominal" % mp.radius)
+
+	# THE CHECK WITH TEETH. Everything above runs on a core where every pebble is already
+	# 8.0, so sim-radius and body-radius are trivially equal and the whole "two worlds
+	# agree" sweep passes whether or not the desync exists — verified: it went green with
+	# the bug deliberately restored. Only a NON-default pebble can tell the two apart. So
+	# push this oversized pebble through the real admission path and read the body it
+	# produces: if `_feed_inlet_top` ever passed a constant instead of `peb.radius`, the
+	# body comes back 8.0 while its pebble says (say) 11.0, and the bed packs one way
+	# while the flux solve sees another.
+	_saved_mint_pending = _main._mint_pending.duplicate()
+	_main._mint_pending.clear()
+	_main._mint_pending.push_back(_minted)
+	_mint_wait_start = _t
+	_phase = 1
+	return false
+
+
+## Poll for the real game loop (`_feed_inlet_top`, called every physics frame) to admit the
+## edited pebble into a clear lane. Not a synchronous force — a lane being briefly busy with
+## real traffic is not a failure, so this gives it real frames rather than reading "no body"
+## off a single blocked instant.
+func _wait_for_minted_body() -> bool:
+	var nb = _main._physics._bodies.get(_minted)
+	if nb == null and _t - _mint_wait_start < MINT_WAIT_GIVEUP:
+		return false
+	_main._mint_pending.append_array(_saved_mint_pending)
+	_ok(nb != null, "the edited pebble reached the inlet pipe as a body (%.1fs)"
+		% (_t - _mint_wait_start))
+	if nb != null:
+		_ok(is_equal_approx(nb.radius, _minted_big),
+			"the body was built at the pebble's OWN radius (%.2f, want %.2f) — the edit survives injection"
+				% [nb.radius, _minted_big])
+		_ok(is_equal_approx(nb._shape.radius, _minted_big),
+			"...and it COLLIDES at that radius (%.2f) — physics and neutronics agree"
+				% nb._shape.radius)
+	_phase = 2
+	return _finish_checks()
+
+
+func _finish_checks() -> bool:
 	# --- 4. The bounds are real and derived, not decorative ---
 	#
 	# RADIUS_MAX is tied to the transport bore rather than picked, so a pebble can never
@@ -145,9 +187,9 @@ func _process(delta: float) -> bool:
 	_ok(_main.RADIUS_MAX * 2.0 <= FuelLoop.BORE_W + 0.001,
 		"a max-size pebble fits the transport bore (2*%.2f <= %.1f)"
 			% [_main.RADIUS_MAX, FuelLoop.BORE_W])
-	_ok(_main.RADIUS_MIN < default_r and default_r < _main.RADIUS_MAX,
+	_ok(_main.RADIUS_MIN < _default_r and _default_r < _main.RADIUS_MAX,
 		"the default sits INSIDE the lever's range (%.1f < %.1f < %.1f)"
-			% [_main.RADIUS_MIN, default_r, _main.RADIUS_MAX])
+			% [_main.RADIUS_MIN, _default_r, _main.RADIUS_MAX])
 
 	# A max-size pebble must still fit the VESSEL it is spawned into — the other hard
 	# limit. Silo.spawn_x takes a margin, so a pebble born at the wall would be pushed
@@ -158,4 +200,5 @@ func _process(delta: float) -> bool:
 
 	print("ALL CHECKS PASSED" if _failures == 0 else "%d CHECK(S) FAILED" % _failures)
 	quit(1 if _failures > 0 else 0)
+	return true
 	return true
