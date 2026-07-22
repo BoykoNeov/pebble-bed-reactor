@@ -20,29 +20,39 @@
 # cadence rather than time-marching it or solving every frame.
 extends Node2D
 
-const TARGET_POPULATION := 380  # keep the silo full enough to show bed flow
+# The CALIBRATED operating population — the bed's fuel inventory is what A_REF and the
+# whole M4/M5 operating point were tuned against. Phase 3c stopped pinning the LIVE bed
+# count to this: it is now a "recommended" reference the HUD shows alongside the
+# player's own `_population_setpoint`, which is what the fuel machine actually chases.
+# Kept as the boot default and the number every subcriticality/overfill readout compares
+# the live count against.
+const RECOMMENDED_POPULATION := 380
+# How far above RECOMMENDED_POPULATION the player may push the setpoint (the "overfill"
+# lever). Bounded well inside CLAUDE.md's "hundreds to a few thousand" perf envelope —
+# generous enough to make a genuinely taller, denser pile (and eventually jam the inlet,
+# see `_admit_batch`), not so large it risks the granular solver.
+const OVERFILL_MAX := 800
+
 # Extra pebbles beyond the bed, circulating in the fuel-handling machine (FuelLoop).
 #
-# WHY the buffer is load-bearing, not decoration: TARGET_POPULATION is a CALIBRATED
-# quantity — the bed's fuel inventory is what A_REF and the whole M4/M5 operating
-# point were tuned against. Once recirculation takes real time instead of being a
-# teleport, pebbles are continuously in the pipe and OUT of the core, so a naive
-# implementation would silently run the bed short (≈ ride_time / EXTRACT_INTERVAL
-# ≈ 13 pebbles, ~3%), shifting k_cold in a core whose burn-in trough already grazes
-# 1 — and the headless suites would NOT catch it, since they drive sim/ directly and
-# never see this mechanic. So the inventory is topped up by the buffer and the bed is
-# refilled from a staging queue to keep the IN-CORE count pinned at TARGET_POPULATION.
+# WHY the buffer is load-bearing, not decoration: once recirculation takes real time
+# instead of being a teleport, pebbles are continuously in the pipe and OUT of the core,
+# so a naive implementation would silently run the bed short of the player's setpoint
+# (≈ ride_time / EXTRACT_INTERVAL ≈ 13 pebbles, ~3%) — and the headless suites would NOT
+# catch it, since they drive sim/ directly and never see this mechanic. So the inventory
+# is minted ahead of the setpoint by this buffer, and the bed is refilled from whatever is
+# waiting at the inlet (`_admit_batch`) to keep the IN-CORE count tracking the setpoint.
 # That decouples ride time from the physics entirely: the ride can be as slow and
 # legible as we like at zero reactivity cost.
 #
-# SIZING: must comfortably exceed worst-case pebbles-in-flight, or the queue starves
+# SIZING: must comfortably exceed worst-case pebbles-in-flight, or the inlet starves
 # and the bed runs short — the exact failure it exists to prevent. A back-of-envelope
 # ride_time / EXTRACT_INTERVAL is NOT enough: the measured peak is ~25 in flight (the
 # ride takes longer than nominal whenever the scene runs below real time, and
 # extraction bursts), which starved a buffer of 24 and dropped the bed to 379.
 # tests/live_fuel_loop.gd measures the real peak and fails if it reaches the buffer;
-# this is sized ~2x it. Surplus is nearly free — the extra pebbles just stage at the
-# top — so prefer margin over a tight fit.
+# this is sized ~2x it. Surplus is nearly free — the extra pebbles just pile up at the
+# inlet, visibly — so prefer margin over a tight fit.
 const LOOP_BUFFER := 48
 const SPAWN_PER_TICK := 3
 const SPAWN_INTERVAL := 0.12    # seconds between injection ticks
@@ -189,23 +199,33 @@ const THERMAL_MW_SCALE := 0.035
 var _physics: PhysicsBackend
 var _pebbles: Dictionary = {}   # id -> Pebble (the FULL inventory: bed + machine)
 # The fuel-handling machine outside the vessel, and the places a pebble can be when it is
-# not fuel in the bed. A pebble is in exactly one of seven states: in the BED (a body the
-# neutronics sees); RIDING the machine (no body — the plant draws it along a path); STAGED
-# in `_queue` at the top waiting for a slot (no body, nothing draws it); PENDING at the
-# shared drop's mouth waiting for room (no body, likewise); PENDING at REINJECT's OWN mouth,
-# the same wait at a different door (no body, likewise); settled in the spent POOL (a body,
-# in a real tray); or in TRANSIT through the pipes (a body, on a belt). `_out_of_core` is
-# the id set for the six that are not the bed — main-side only, so Pebble stays a pure sim
-# struct with no notion of the game's fuel handling.
+# not fuel in the bed. A pebble is in exactly one of six states: in the BED (a body the
+# neutronics sees); in TRANSIT through the duct, a riser, or a merge run (a body, on a
+# belt); PENDING at the shared drop's mouth waiting for room (no body — this one door
+# still needs one, see `_feed_drop`); PENDING at REINJECT's OWN mouth, the same wait at a
+# different door (no body, likewise); MANUFACTURED but not yet shown, waiting in
+# `_mint_pending` for the top of the inlet pipe to clear (no body — see `_feed_inlet_top`;
+# this is not the "no body, nothing draws it" staging Phase 3c otherwise retired, because
+# nothing has ever shown this pebble existing to make disappear); WAITING at the shared
+# INLET, piled against its closed floor (a body — no list of its own; found by position,
+# see `_admit_batch`); or settled in the spent POOL (a body, in a real tray).
+# `_out_of_core` is the id set for the five that are not the bed — main-side only, so
+# Pebble stays a pure sim struct with no notion of the game's fuel handling.
 #
-# This list has grown three times, and the same line held each time: `_out_of_core` means
-# NOT FUEL, never "has no body". It used to mean both, back when the only way to leave the
-# bed was to stop existing mechanically — the pool (Phase 3a) and then the pipes (3b) broke
-# that coincidence, and every reader that had quietly come to depend on it had to be
-# re-pointed. Adding a seventh state is cheap; re-deriving which flag meant what is not.
+# This list has grown and shrunk more than once, and the same line has held every time:
+# `_out_of_core` means NOT FUEL, never "has no body". It used to mean both, back when the
+# only way to leave the bed was to stop existing mechanically — the pool (Phase 3a), the
+# pipes (3b), and the inlet (3c) all broke that coincidence, and every reader that had
+# quietly come to depend on it had to be re-pointed. Losing or gaining a state is cheap;
+# re-deriving which flag meant what is not.
 var _loop: FuelLoop
-var _queue: Array = []          # [{id, x}] arrived at the top, waiting to enter the bed
 var _out_of_core: Dictionary = {}   # id -> true for every pebble outside the bed
+# Manufactured pebbles waiting for the top of the inlet pipe to clear, oldest first — see
+# `_mint_pebble`/`_feed_inlet_top`. Bodiless like `_drop_pending`, and for the identical
+# reason: LOOP_BUFFER lets minting run up to 48 pebbles ahead of the setpoint, several per
+# tick, and the inlet pipe is short — it cannot be handed that many bodies at the same
+# point in the same instant without the solver firing them apart.
+var _mint_pending: Array = []
 # Pebbles being carried through the pipes as REAL BODIES (Phase 3b) — id -> leg. A FIFTH
 # state, and the first one that is out of the core while still holding a body. Not "down": the
 # recirculation leg goes down the drop, out along the duct and then 880 px UP the riser.
@@ -295,6 +315,27 @@ var _next_id := 0
 var _spawn_accum := 0.0
 var _extract_accum := 0.0
 var _solve_accum := 0.0
+var _fill_accum := 0.0
+
+# Population/fill control (Phase 3c) — what the fuel machine chases and how fast it is
+# allowed to chase it, both player levers now instead of the old hard-pinned
+# TARGET_POPULATION. See `RECOMMENDED_POPULATION`/`OVERFILL_MAX` for the bounds.
+var _population_setpoint := RECOMMENDED_POPULATION
+# Pebbles/sec `_admit_batch` is allowed to cross from the inlet pile into the bed. Slow end
+# is for watching a single pebble land (teaching an empty-start climb to criticality); the
+# top end SATURATES on purpose rather than reaching an arbitrary large number — the real
+# ceiling is the inlet's own physics (`FuelLoop.INLET_LANES` parallel columns, each
+# gravity-limited to ~4.5/s by how fast a body clears `INLET_MOUTH_CLEAR`), so a max far
+# above that would leave most of the slider doing nothing. MEASURED before widening the
+# pipe: a single-lane inlet capped real fill at ~4.3/s regardless of this slider, with
+# FILL_RATE_MAX=100 that left over 95% of the range dead. Three lanes raise the physical
+# ceiling to ~13/s; FILL_RATE_MAX sits just above it so the top of the slider is an honest
+# "as fast as the pipe goes", not a bigger dead zone at a bigger number. The very first
+# boot skips this path entirely — see `_seed_initial_bed`.
+var _fill_rate := 15.0
+const FILL_RATE_MIN := 1.0
+const FILL_RATE_MAX := 20.0
+var _fill_paused := false
 
 # The campaign (burnup) clock (M3). Its campaign_dt drives depletion and NOTHING
 # else — never the physics step or the flux solve (CLAUDE.md principle 1).
@@ -304,6 +345,18 @@ var _clocks := Clocks.new()
 var _grid: Grid
 var _field_display: FieldDisplay
 var _color_bar: ColorBar
+
+# Mouse-clickable controls panel (Phase 3c) — see `_build_controls_panel`.
+# Sliders: [{label, text, get, slider, fmt}]; toggles: [{button, get}]. Kept as untyped
+# dictionaries (not a resource) because they only ever round-trip within this one file,
+# between build time and `_sync_controls_panel`.
+var _control_specs: Array = []
+var _toggle_specs: Array = []
+var _pause_button: Button
+var _feedback_button: Button
+var _scram_button: Button
+var _restamp_button: Button
+var _reinject_button: Button
 var _flux_desc: FieldDescriptor
 var _flux_fast_desc: FieldDescriptor   # M5b fast-group (φ1) heatmap
 var _flux_thermal_desc: FieldDescriptor # M5b thermal-group (φ2) heatmap
@@ -596,6 +649,146 @@ func _ready() -> void:
 
 	_build_hud()
 
+	# Boot "starts filled" by default (Phase 3c): commission the plant toward the
+	# recommended population INSTANTLY, by placing already-settled bodies directly
+	# (`_seed_initial_bed`) rather than playing the real admission physics back sped up.
+	# A manual restart never does this — see `_restart_reactor`, which runs the real,
+	# watchable fill at normal speed.
+	_reset_population(RECOMMENDED_POPULATION)
+	_seed_initial_bed(RECOMMENDED_POPULATION)
+
+
+## Clear every piece of population/campaign state and start the plant toward `start`
+## pebbles. Called once at boot (`_ready`) and by the player's "Restart Reactor" control
+## (Phase 3c) — the same path both times, so a restart is not a special case of startup,
+## it IS startup.
+##
+## Deliberately narrow: only simulation state that describes THE FUEL INVENTORY resets.
+## The player's design/operating levers (enrichment, size, loading, flow, inlet temp,
+## rods, feedback, discharge policy) are NOT touched — a restart is "empty the plant and
+## refill it", not "undo my settings".
+func _reset_population(start: int) -> void:
+	# Every physics body the plant is holding, bed or otherwise — the bed, transit, the
+	# inlet pile, and the pool are all real bodies now (Phase 3c), so one sweep over
+	# `positions()` reaches all of them.
+	for id in _physics.positions().keys():
+		_physics.remove_pebble(id)
+
+	_pebbles.clear()
+	_out_of_core.clear()
+	_transit.clear()
+	_drop_pending.clear()
+	_reinject_pending.clear()
+	_mint_pending.clear()
+	_spent.clear()
+	if _selected != null:
+		_select(null, "")
+
+	_spawn_accum = 0.0
+	_extract_accum = 0.0
+	_solve_accum = 0.0
+	_fill_accum = 0.0
+	_thermal_seeded = false
+	_clocks = Clocks.new()
+
+	_total_injected = 0
+	_total_recirculated = 0
+	_total_extracted = 0
+	_total_shipped = 0
+	_total_reinjected = 0
+	_out_count = 0
+	_out_burnup_sum = 0.0
+	_out_passes_sum = 0
+	_out_fissile_sum = 0.0
+	_out_pu_sum = 0.0
+	_out_poison_sum = 0.0
+	_last_out_burnup = 0.0
+	_last_out_passes = 0
+	_last_out_fissile = 0.0
+
+	_refresh_pool()
+	_population_setpoint = clampi(start, 0, OVERFILL_MAX)
+
+
+## The player's "Restart Reactor" control (Phase 3c) — clears the plant and starts it
+## refilling toward whatever the setpoint slider currently reads, through the REAL,
+## watchable admission physics (`_admit_batch`, paced by `_fill_rate`/`_fill_paused`) —
+## never `_seed_initial_bed`. Setting the setpoint to 0 first gives an empty-start
+## commissioning fill; leaving it at the recommended population gives a fresh filled
+## start, just a slower one than boot. No separate empty/filled buttons: the setpoint
+## IS the target.
+func _restart_reactor() -> void:
+	_reset_population(_population_setpoint)
+
+
+## Instantly commission the bed with `count` already-settled pebbles, for the ONE
+## moment a real-time pour would be pure friction: the very first boot, before the
+## player has done anything to watch (Phase 3c "starts filled" default).
+##
+## WHY NOT A SPED-UP REAL FILL — this replaced an `Engine.time_scale` warm-up that
+## played the real admission physics back at 8x. MEASURED to be unsafe: a live probe
+## (tests/live_inlet_probe.gd) held 0 escapes in 70s of the real fill at time_scale=1.0,
+## then reliably tunnelled dozens of settled BED pebbles straight through the silo's
+## closed hopper floor (`Silo.OUTLET_Y`) once time_scale was restored to 8.0 — the exact
+## failure `3be4e7b` already fixed once for the old initial-fill path (a long, unbroken
+## free-fall reaching enough velocity to cross a zero-thickness SegmentShape2D in one
+## step) and CCD-on-by-default does not save it here: Godot scales the DELTA reported to
+## `_physics_process` by `time_scale`, so an 8x warm-up does not just call physics 8x
+## more often, it hands the SAME 60 Hz physics step 8x more simulated time to integrate
+## in one go — an 8x bigger stride for every body, every step, everywhere at once, not
+## just the one long first drop CCD was proven against. So this function does not run
+## physics at all: it places bodies already resting where a settled pile would be.
+##
+## Bottom-up, funnel-aware, like a real pile builds — NOT `Silo.spawn_x`'s random top
+## scatter, which is exactly the "pebbles appear from nothing, already falling" look
+## this whole phase exists to remove. A pebble placed here is real, collidable, and
+## indistinguishable from one that arrived through the inlet — same isotopic seeding
+## (`_seed_burned`), same tint, same everything except HOW it got there.
+func _seed_initial_bed(count: int) -> void:
+	var r := _pebble_radius
+	var spacing := 2.0 * r + 4.0
+	var row_height := spacing * 0.87   # hex-ish vertical pitch, not a square grid
+	var y := Silo.OUTLET_Y - r - 4.0
+	var row := 0
+	var placed := 0
+	while placed < count and y > Silo.TOP + r:
+		# The funnel narrows going DOWN, so a pebble's most constrained point is its own
+		# lower edge (y + r), not its center — measured at y alone, rows in the steep taper
+		# clipped the sloped wall and got popped free by the solver at a few hundred px/s
+		# (harmless — never an escape — but a visibly jumpy "instant fill", the opposite of
+		# what this function exists to look like).
+		var half_w: float = _bed_half_width(y + r) - r - 2.0
+		if half_w > 0.0:
+			var x := Silo.CENTER_X - half_w + (spacing * 0.5 if row % 2 == 1 else 0.0)
+			while x <= Silo.CENTER_X + half_w and placed < count:
+				var id := _next_id
+				_next_id += 1
+				var peb := Pebble.new(id, r)
+				_stamp_enrichment(peb, _enrichment)
+				peb.fuel_loading = _fuel_loading
+				_pebbles[id] = peb
+				_total_injected += 1
+				_seed_burned(peb)
+				var jitter := Vector2(_rng.randf_range(-1.0, 1.0), _rng.randf_range(-1.0, 1.0))
+				_physics.spawn_pebble(id, Vector2(x, y) + jitter, r)
+				_physics.set_pebble_tint(id, _pebble_tint(peb))
+				placed += 1
+				x += spacing
+		y -= row_height
+		row += 1
+
+
+## Half-width of the bed's cross-section at height `y` — full vessel width above the
+## funnel knee, tapering linearly to the closed floor's outlet gap below it. Mirrors
+## the same geometry `Silo.wall_segments`/`inner_profile` draw the funnel from, so a
+## seeded pebble is never placed outside the walls it will immediately be resting against.
+func _bed_half_width(y: float) -> float:
+	var full_half := (Silo.RIGHT - Silo.LEFT) * 0.5
+	if y <= Silo.FUNNEL_TOP:
+		return full_half
+	var t := clampf((y - Silo.FUNNEL_TOP) / (Silo.OUTLET_Y - Silo.FUNNEL_TOP), 0.0, 1.0)
+	return lerp(full_half, Silo.OUTLET_HALF, t)
+
 
 # HUD text colors (BBCode). Dim for labels/keys, bright for values, semantic
 # colors for the status line — the one thing that must be readable at a glance.
@@ -683,6 +876,162 @@ func _build_hud() -> void:
 	])
 	help.add_child(keys)
 
+	_build_controls_panel(root)
+
+
+## Mouse-clickable controls for every hotkey-driven lever, plus the new fill controls
+## (Phase 3c). Every widget calls the EXACT SAME setter the keyboard path calls — this is
+## thin wiring, not a second copy of any rule — so the two input paths can never disagree
+## and the key-hints bar above stays accurate.
+##
+## Placed in the one column with real free space: below the colorbar (which ends around
+## y ≈ 452), in the same right-hand margin. `MOUSE_FILTER_STOP` on the panel (Godot's
+## default for a Control with interactive children) is what lets it catch clicks while the
+## HUD root above stays `MOUSE_FILTER_IGNORE` — so buttons work without breaking
+## click-to-inspect anywhere else on screen.
+func _build_controls_panel(root: Control) -> void:
+	var panel := PanelContainer.new()
+	panel.position = Vector2(1036, 452)
+	panel.custom_minimum_size = Vector2(158, 0)
+	panel.add_theme_stylebox_override("panel", _panel_style())
+	root.add_child(panel)
+
+	var scroll := ScrollContainer.new()
+	scroll.custom_minimum_size = Vector2(150, 510)
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	panel.add_child(scroll)
+
+	var vbox := VBoxContainer.new()
+	vbox.custom_minimum_size = Vector2(140, 0)
+	vbox.add_theme_constant_override("separation", 6)
+	scroll.add_child(vbox)
+
+	_control_title(vbox, "FILL")
+	_add_slider(vbox, "population", 0.0, float(OVERFILL_MAX), 1.0,
+		func() -> float: return float(_population_setpoint),
+		func(v: float) -> void: _population_setpoint = clampi(int(round(v)), 0, OVERFILL_MAX),
+		"%d")
+	_add_slider(vbox, "fill rate/s", FILL_RATE_MIN, FILL_RATE_MAX, 1.0,
+		func() -> float: return _fill_rate,
+		func(v: float) -> void: _fill_rate = clampf(v, FILL_RATE_MIN, FILL_RATE_MAX),
+		"%.0f")
+	_pause_button = _add_toggle(vbox, "pause fill", func() -> bool: return _fill_paused,
+		func() -> void: _fill_paused = not _fill_paused)
+	_add_button(vbox, "restart reactor", _restart_reactor)
+
+	_control_title(vbox, "DESIGN")
+	_add_slider(vbox, "enrichment", ENRICH_MIN, ENRICH_MAX, ENRICH_STEP,
+		func() -> float: return _enrichment,
+		func(v: float) -> void: _set_enrichment(v), "%.3f")
+	_add_slider(vbox, "pebble size", RADIUS_MIN, RADIUS_MAX, RADIUS_STEP,
+		func() -> float: return _pebble_radius,
+		func(v: float) -> void: _set_radius(v), "%.2f")
+	_add_slider(vbox, "fuel loading", LOADING_MIN, LOADING_MAX, LOADING_STEP,
+		func() -> float: return _fuel_loading,
+		func(v: float) -> void: _set_loading(v), "%.2f")
+
+	_control_title(vbox, "OPERATING")
+	_add_slider(vbox, "coolant flow", Thermal.FLOW_MIN, Thermal.FLOW_MAX, Thermal.FLOW_STEP,
+		func() -> float: return _coolant_flow,
+		func(v: float) -> void: _set_flow(v), "%.2f")
+	_add_slider(vbox, "inlet temp", Thermal.INLET_MIN, Thermal.INLET_MAX, Thermal.INLET_STEP,
+		func() -> float: return _inlet_temp,
+		func(v: float) -> void: _set_inlet(v), "%.0f")
+	_add_slider(vbox, "control rods", ControlRods.INSERT_MIN, ControlRods.INSERT_MAX,
+		ControlRods.INSERT_STEP, func() -> float: return _rod_insertion,
+		func(v: float) -> void: _set_rods(v), "%.2f")
+	_add_slider(vbox, "discharge at", DISCHARGE_MIN, DISCHARGE_MAX, DISCHARGE_STEP,
+		func() -> float: return _discharge_burnup,
+		func(v: float) -> void: _set_discharge_burnup(v), "%.0f")
+	_add_slider(vbox, "max passes", float(PASSES_MIN), float(PASSES_MAX), 1.0,
+		func() -> float: return float(_max_passes),
+		func(v: float) -> void: _set_max_passes(int(round(v))), "%d")
+
+	_control_title(vbox, "CONTROL")
+	_feedback_button = _add_toggle(vbox, "feedback", func() -> bool: return _feedback_on,
+		func() -> void: _toggle_feedback())
+	_scram_button = _add_toggle(vbox, "scram", func() -> bool: return _scrammed,
+		func() -> void: _toggle_scram())
+	_add_button(vbox, "cycle field", _cycle_field)
+
+	_control_title(vbox, "SELECTED PEBBLE")
+	_restamp_button = _add_button(vbox, "restamp", _restamp_selected)
+	_reinject_button = _add_button(vbox, "re-inject", _reinject_selected)
+
+
+func _control_title(vbox: VBoxContainer, text: String) -> void:
+	var lbl := Label.new()
+	lbl.text = text
+	lbl.add_theme_font_size_override("font_size", 11)
+	lbl.add_theme_color_override("font_color", Color(0.42, 0.5, 0.63))
+	vbox.add_child(lbl)
+
+
+## One slider row: a label (rewritten with the live value every sync) above a compact
+## HSlider. `get`/`set` are the SAME state the keyboard path reads/writes — this function
+## only builds the widget and remembers it (`_control_specs`) so `_sync_controls_panel`
+## can push live state back onto the slider without re-triggering `value_changed`
+## (`set_value_no_signal`), the standard Godot pattern for a two-way-bound control.
+func _add_slider(vbox: VBoxContainer, label: String, min_v: float, max_v: float, step_v: float,
+		getter: Callable, setter: Callable, fmt: String) -> void:
+	var lbl := Label.new()
+	lbl.add_theme_font_size_override("font_size", 11)
+	lbl.add_theme_color_override("font_color", Color(0.75, 0.8, 0.88))
+	vbox.add_child(lbl)
+	var slider := HSlider.new()
+	slider.min_value = min_v
+	slider.max_value = max_v
+	slider.step = step_v
+	slider.value = getter.call()
+	slider.custom_minimum_size = Vector2(136, 16)
+	slider.value_changed.connect(setter)
+	vbox.add_child(slider)
+	_control_specs.append({"label": lbl, "text": label, "get": getter, "slider": slider, "fmt": fmt})
+
+
+func _add_toggle(vbox: VBoxContainer, label: String, getter: Callable, on_press: Callable) -> Button:
+	var btn := Button.new()
+	btn.toggle_mode = true
+	btn.text = label
+	btn.custom_minimum_size = Vector2(136, 0)
+	btn.add_theme_font_size_override("font_size", 11)
+	btn.pressed.connect(on_press)
+	vbox.add_child(btn)
+	_toggle_specs.append({"button": btn, "get": getter})
+	return btn
+
+
+func _add_button(vbox: VBoxContainer, label: String, on_press: Callable) -> Button:
+	var btn := Button.new()
+	btn.text = label
+	btn.custom_minimum_size = Vector2(136, 0)
+	btn.add_theme_font_size_override("font_size", 11)
+	btn.pressed.connect(on_press)
+	vbox.add_child(btn)
+	return btn
+
+
+## Push live sim state onto every slider/toggle (render clock, pure consumer — same
+## discipline as `_update_hud`): keeps the panel honest when a value changes from the
+## KEYBOARD side, or from the sim itself (e.g. a scram driving `_rod_insertion`).
+## `set_value_no_signal` is what keeps this from re-firing `value_changed` and fighting
+## the player's own drag.
+func _sync_controls_panel() -> void:
+	for spec in _control_specs:
+		var slider: HSlider = spec["slider"]
+		var v: float = spec["get"].call()
+		if not slider.has_focus():   # don't yank the slider out from under an active drag
+			slider.set_value_no_signal(v)
+		var lbl: Label = spec["label"]
+		lbl.text = spec["text"] + ": " + (spec["fmt"] as String) % v
+	for spec in _toggle_specs:
+		var btn: Button = spec["button"]
+		btn.button_pressed = spec["get"].call()
+	if _restamp_button != null:
+		var sel := _pool_selected()
+		_restamp_button.disabled = not sel
+		_reinject_button.disabled = not sel
+
 
 static func _key_hint(key: String, what: String) -> String:
 	return "[b]%s[/b] [color=#%s]%s[/color]" % [key, HUD_DIM, what]
@@ -708,6 +1057,7 @@ func _process(_delta: float) -> void:
 	_update_pebble_colors()   # render-clock consumer of sim state (never writes back)
 	_refresh_pool()
 	_update_inspector()
+	_sync_controls_panel()    # keep the mouse panel honest against keyboard/sim changes
 	_overlay.queue_redraw()   # the ring tracks a moving pebble (bed flow, or a ride)
 
 
@@ -721,26 +1071,25 @@ func _physics_process(delta: float) -> void:
 	# this is the one transport path that IS physics.
 	_feed_drop()
 	_feed_reinject()
+	_feed_inlet_top()
 	_belt_step()
-
-	# The fuel-handling machine: advance every pebble still RIDING, then act on the ones that
-	# arrived. Riders carry no body and no flux, so this is transport bookkeeping only — it
-	# touches no physics.
-	#
-	# What is left up here is the TOP of the loop: the chute and the drop into the spawn band.
-	# Phase 3b-i took DISCHARGE off the machine and 3b-ii took the recirculation leg's climb
-	# off it, so a rider is now either a recirculating pebble that has already made it up the
-	# riser, fresh fuel coming in from the hopper, or a re-injected one. Every arrival here is
-	# therefore a pebble heading INTO the bed, and stages in the queue — which is why there is
-	# no fork on kind at all.
-	for arrival in _loop.advance(delta):
-		# Recirculated, fresh, or re-injected: stage at the top for the next free bed slot.
-		_queue.push_back({"id": arrival["id"], "x": arrival["x"]})
 
 	_spawn_accum += delta
 	while _spawn_accum >= SPAWN_INTERVAL:
 		_spawn_accum -= SPAWN_INTERVAL
 		_inject_batch()
+
+	# Admission into the BED from whatever is piled at the inlet — throttled by the
+	# player's fill rate (Phase 3c), the way every other cadence in this loop is throttled
+	# by its own accumulator. Paused means exactly what it says: the pile above the
+	# closed floor keeps growing (minting above does not stop), nothing crosses into the
+	# bed until resumed.
+	if not _fill_paused:
+		_fill_accum += delta
+		var fill_interval: float = 1.0 / maxf(_fill_rate, 0.01)
+		while _fill_accum >= fill_interval:
+			_fill_accum -= fill_interval
+			_admit_batch()
 
 	_extract_accum += delta
 	while _extract_accum >= EXTRACT_INTERVAL:
@@ -899,11 +1248,11 @@ func _belt_step() -> void:
 	for id in landed:
 		var leg: int = _transit[id]
 		_transit.erase(id)
-		if leg == FuelLoop.RECIRC:
-			_board_chute(_pebbles[id], FuelLoop.RECIRC, FuelLoop.riser_head())
-			continue
-		if leg == FuelLoop.REINJECT:
-			_board_chute(_pebbles[id], FuelLoop.REINJECT, FuelLoop.reinject_riser_head())
+		if leg == FuelLoop.RECIRC or leg == FuelLoop.REINJECT:
+			# Phase 3c: nothing left to do. The pebble is already a body, already
+			# `_out_of_core`, and has just crossed into the shared inlet bore — it simply
+			# rests there now, piled against the closed floor like any other pebble
+			# waiting for `_admit_batch` to let it into the bed. No hand-off, no rider.
 			continue
 		_pool_admit(_pebbles[id])
 		# THE discharge counter, and it lives here rather than in `_pool_admit` because this
@@ -911,14 +1260,12 @@ func _belt_step() -> void:
 		_total_extracted += 1
 
 
-## Has this pebble reached the end of ITS leg? Each ends somewhere completely different — one
-## tips off a conveyor into an open tray, the others are lifted off the head of a climb — so
-## there is no shared "arrived" line to test and asking by leg is the only honest question.
+## Has this pebble reached the end of ITS leg? DISCHARGE tips off a conveyor into an open
+## tray; RECIRC and REINJECT both end the same way now (Phase 3c) — by crossing into the
+## shared inlet bore, whichever merge run they arrived on.
 func _delivered(at: Vector2, leg: int) -> bool:
-	if leg == FuelLoop.RECIRC:
-		return FuelLoop.riser_delivered(at)
-	if leg == FuelLoop.REINJECT:
-		return FuelLoop.reinject_delivered(at)
+	if leg == FuelLoop.RECIRC or leg == FuelLoop.REINJECT:
+		return FuelLoop.in_inlet_bore(at)
 	return FuelLoop.pool_contains(at)
 
 
@@ -950,10 +1297,13 @@ func _drive(id: int, at: Vector2, leg: int) -> void:
 		return
 	if leg == FuelLoop.REINJECT:
 		# Its own riser, its own straight climb — no duct leg to cross first, unlike RECIRC's.
-		# Same terminus as the main riser (a controlled removal onto the chute, not an open
-		# exit), so it gets the same fast speed rather than the discharge belt's slow one.
 		if FuelLoop.in_reinject_riser(at):
 			_belt(id, Vector2.UP, FuelLoop.BELT_RISER)
+		# Phase 3c: past the bend, the belt pushes RIGHT along REINJECT's own merge run
+		# toward the shared inlet (REINJECT_X sits left of INLET_X) instead of lifting the
+		# body off onto a rider — see `FuelLoop.in_reinject_merge`.
+		if FuelLoop.in_reinject_merge(at):
+			_belt(id, Vector2.RIGHT, FuelLoop.BELT_RISER)
 		return
 	# RECIRC: out the other way and then up. BOTH pushes are applied, and the zones overlap at
 	# the foot of the riser on purpose — a pebble in the corner is dragged right AND lifted at
@@ -963,6 +1313,11 @@ func _drive(id: int, at: Vector2, leg: int) -> void:
 		_belt(id, Vector2.RIGHT, FuelLoop.BELT_RISER)
 	if FuelLoop.in_riser(at):
 		_belt(id, Vector2.UP, FuelLoop.BELT_RISER)
+	# Phase 3c: past the bend, the belt pushes LEFT along the merge run toward the shared
+	# inlet (RISER_X sits right of INLET_X) instead of lifting the body off onto a rider —
+	# see `FuelLoop.in_recirc_merge`.
+	if FuelLoop.in_recirc_merge(at):
+		_belt(id, Vector2.LEFT, FuelLoop.BELT_RISER)
 
 
 ## The belt itself: drag a body up to `speed` along `dir`, and no further.
@@ -973,29 +1328,6 @@ func _drive(id: int, at: Vector2, leg: int) -> void:
 func _belt(id: int, dir: Vector2, speed: float) -> void:
 	if _physics.get_velocity(id).dot(dir) < speed:
 		_physics.apply_force(id, dir * FuelLoop.BELT_FORCE)
-
-
-## Lift a pebble off the head of a climb and put it on the chute as a rider — the one seam
-## left on the recirculation leg, and a deliberate one. Shared by RECIRC and REINJECT
-## (Phase 3b-iii) since both now climb a real riser and hand off at its head the same way;
-## `kind`/`from` are the only things that differ between them.
-##
-## The body must go: a rider is drawn by the plant along its path, so a pebble may be one or
-## the other and never both, or it would be drawn twice and picked twice. It happens exactly
-## where `_pipe_runs` turns the riser into the chute, so nothing jumps on screen.
-##
-## WHY A RIDER AND NOT MORE PIPE: the chute pours into the bed at each pebble's own spawn_x —
-## a hole that moves — and bed admission is GATED at TARGET_POPULATION. See
-## `FuelLoop._path_for`; the short version is that a real chute would need bodies queueing on a
-## live belt against a closed gate, which is a jam by design, and the gate is the thing that
-## pins the calibrated count.
-func _board_chute(peb: Pebble, kind: int, from: Vector2) -> void:
-	_physics.remove_pebble(peb.id)
-	# peb.radius, not the nominal: a recirculating pebble was manufactured at whatever the
-	# design was AT THE TIME, so mid-campaign the machine legitimately carries a mix of sizes.
-	# Using the constant would be silently wrong even for an UNEDITED pebble — it only needs
-	# the design to have moved since that pebble was made.
-	_loop.add(peb.id, kind, from, Silo.spawn_x(_rng, peb.radius + 2.0), _pebble_tint(peb), peb.radius)
 
 
 ## Send the oldest pooled pebble away for good — it leaves the plant entirely.
@@ -1069,13 +1401,13 @@ func _reinject_selected() -> void:
 ## accounting live_fuel_policy checks (`_spent + shipped == extracted`). The return is a
 ## new event with its own counter.
 ##
-## It climbs its OWN riser (Phase 3b-iii) rather than materializing at the hopper, so the
+## It climbs its OWN riser (Phase 3b-iii) rather than materializing at the top, so the
 ## pebble the player just edited is the one they watch climb back in — a real body for the
-## whole trip, same as the other two legs. `_out_of_core` is already true (it has been since
-## it discharged) and stays true for the ride — the pebble is not fuel again until it lands
-## in the bed, which the RECIRC/FRESH arrival path already handles: a REINJECT arrival is
-## not a DISCHARGE, so it stages in `_queue` like any other returning pebble with no new
-## arrival code at all.
+## whole trip, same as RECIRC. `_out_of_core` is already true (it has been since it
+## discharged) and stays true for the ride — the pebble is not fuel again until
+## `_admit_batch` lets it out of the inlet pile it lands in at the top of the climb
+## (Phase 3c: the shared `_belt_step`/`_drive` machinery already handles a REINJECT leg the
+## same way it handles RECIRC, so there is no new arrival code here at all).
 func _reinject(peb: Pebble) -> void:
 	var idx := _spent.find(peb)
 	if idx == -1:
@@ -1153,23 +1485,33 @@ func _core_positions() -> Dictionary:
 	return out
 
 
-## Two jobs per tick, in priority order: mint inventory until the design load exists,
-## then top the BED back up to TARGET_POPULATION from the staging queue. Keeping the
-## bed pinned at its calibrated count — regardless of how many pebbles are riding the
-## machine — is what makes the visible fuel loop free of physics consequences
-## (see LOOP_BUFFER).
+## One job per tick: mint inventory until it covers the player's population setpoint plus
+## the in-flight buffer. Admission into the bed is no longer done here — Phase 3c moved it
+## to its own throttled loop in `_physics_process` (`_admit_batch`, paced by `_fill_rate`),
+## since minting and admitting are now two genuinely different rates: minting only needs to
+## keep the inlet fed, admitting is the player-watchable one.
 func _inject_batch() -> void:
 	for i in SPAWN_PER_TICK:
 		# Gate on the CIRCULATING population, not the raw registry: the pool is inventory
 		# too, and counting it would let a filling pool throttle fresh fuel until the bed
 		# starved. `_inventory()` is exactly what `_pebbles.size()` used to mean here.
-		if _inventory() < TARGET_POPULATION + LOOP_BUFFER:
+		if _inventory() < _population_setpoint + LOOP_BUFFER:
 			_mint_pebble()
-		if _core_count() < TARGET_POPULATION and not _queue.is_empty():
-			_spawn_from_queue()
 
 
-## Manufacture one pebble at the CURRENT design settings and hand it to the loop.
+## Manufacture one pebble at the CURRENT design settings and put it in line for the inlet.
+##
+## MANUFACTURED, NOT MATERIALIZED — the distinction that keeps LOOP_BUFFER safe. Minting
+## runs up to 48 pebbles ahead of the setpoint (see LOOP_BUFFER) so the bed is never
+## starved while pebbles are in flight, and `SPAWN_PER_TICK` (3) mints several in the same
+## tick. Giving every one of those a real body at the SAME point (`inlet_top`) in the SAME
+## instant is exactly the "never materialize a body into space that may be occupied"
+## failure `FuelLoop.MOUTH_CLEAR` exists to prevent at the OTHER end of the plant — and the
+## inlet pipe is short (it has to fit above the vessel), so it physically cannot hold 48
+## pebbles even one at a time. So minting stages the pebble bodiless in `_mint_pending`,
+## same as a discharge stages in `_drop_pending`: manufactured inventory that has not yet
+## been given a body is not a pebble that disappeared, because nothing ever showed it
+## existing. `_feed_inlet_top` is the door onto the visible pipe.
 func _mint_pebble() -> void:
 	var id := _next_id
 	_next_id += 1
@@ -1182,25 +1524,63 @@ func _mint_pebble() -> void:
 	# The INITIAL load is seeded to online-refueling equilibrium (a spread of burnups),
 	# not all-fresh — including the buffer, since those pebbles cycle into the bed too
 	# and a slug of fresh fuel entering early would be a reactivity bump the equilibrium
-	# does not have. It is staged straight to the queue: making the opening load ride in
-	# from the hopper one at a time would take minutes of real time.
-	if _total_injected <= TARGET_POPULATION + LOOP_BUFFER:
+	# does not have.
+	if _total_injected <= _population_setpoint + LOOP_BUFFER:
 		_seed_burned(peb)
+	_mint_pending.push_back(id)
+
+
+## Put the next manufactured pebble(s) at the top of the visible inlet pipe, one per LANE
+## that is currently clear (Phase 3c widening — up to `FuelLoop.INLET_LANES` per tick, not
+## just one). Mirrors `_feed_drop` exactly — same door, same reason (`FuelLoop.INLET_MOUTH_CLEAR`
+## is `FuelLoop.MOUTH_CLEAR`'s bore-width margin, reused): a body spawned on top of another
+## is a collision the solver resolves violently, not a queue.
+func _feed_inlet_top() -> void:
+	for lane in FuelLoop.INLET_LANES:
+		if _mint_pending.is_empty():
+			return
+		if not _inlet_top_clear(lane):
+			continue
+		var id: int = _mint_pending.pop_front()
+		var peb: Pebble = _pebbles[id]
 		# Wall margin comes from THIS pebble's radius, not the nominal: a bigger pebble
-		# spawned at the nominal margin would be born overlapping the vessel wall and get
+		# spawned at the nominal margin would be born overlapping the pipe wall and get
 		# kicked out by the solver.
-		_queue.push_back({"id": id, "x": Silo.spawn_x(_rng, peb.radius + 2.0)})
-		return
-	# Steady state: this is a genuinely fresh replacement for a pebble that just
-	# discharged (1:1), so it rides in from the fresh-fuel hopper.
-	_loop.add(id, FuelLoop.FRESH, FuelLoop.HOPPER, Silo.spawn_x(_rng, peb.radius + 2.0),
-			PebbleBody.DEFAULT_TINT, peb.radius)
+		_physics.spawn_pebble(id, FuelLoop.inlet_top(lane), peb.radius)
+		_physics.set_pebble_tint(id, _pebble_tint(peb))
 
 
-## Move a staged pebble from the top of the machine into the bed, at exactly the x its
-## ride ended on, so the hand-off from conveyor to physics body has no visible jump.
+## Is the top of inlet LANE `lane` clear for one more pebble? Same reasoning as
+## `_admit_mouth_clear`/`_drop_mouth_clear`, checked against the point every waiting pebble
+## in THIS lane is spawned at.
 ##
-## The body is built at the PEBBLE'S OWN radius, never the nominal. This is the only
+## AXIS-ALIGNED, not a Euclidean radius — a circular check big enough to protect one lane
+## reaches into its neighbour at `FuelLoop.INLET_LANES` pitch, which would make every lane
+## block the next one and defeat the entire point of widening the pipe (see
+## `FuelLoop.INLET_MOUTH_CLEAR`/`INLET_LANE_HALF_WIDTH`). Splitting into a narrow X band and
+## a Y distance keeps lanes independently gated.
+func _inlet_top_clear(lane: int) -> bool:
+	var top := FuelLoop.inlet_top(lane)
+	var positions := _physics.positions()
+	for id in positions:
+		var at: Vector2 = positions[id]
+		if absf(at.x - top.x) < FuelLoop.INLET_LANE_HALF_WIDTH \
+				and absf(at.y - top.y) < FuelLoop.INLET_MOUTH_CLEAR:
+			return false
+	return true
+
+
+## Let the pebble resting lowest at the inlet — the one closest to actually being admitted
+## — into the bed, IF the admit point below the closed floor has room. Mirrors `_feed_drop`
+## exactly, for exactly the same door reason (see `FuelLoop.INLET_MOUTH_CLEAR`): a body
+## spawned on top of another is a collision, not a queue.
+##
+## Called on its own throttled cadence (`_fill_rate`, see `_physics_process`) rather than
+## unconditionally — that throttle IS the player's fill-speed control, and pausing it is
+## what "stop the process" means: pebbles keep minting and piling at the inlet, genuinely
+## queued as real bodies, and simply stop crossing into the bed.
+##
+## The body is rebuilt at the PEBBLE'S OWN radius, never the nominal. This is the only
 ## place in the game a body is created, so it is the single point where the two worlds
 ## could silently disagree: peb.radius is what grid.gd homogenizes (PI*r^2 → packing),
 ## while the radius passed here is what collides and what is drawn. Passing the nominal
@@ -1208,25 +1588,68 @@ func _mint_pebble() -> void:
 ## the bed would pack one way and the flux solve would see another, with nothing on
 ## screen to show it. Reading it off the pebble keeps the Lagrangian and Eulerian views
 ## of the same object in agreement by construction.
-func _spawn_from_queue() -> void:
-	var slot: Dictionary = _queue.pop_front()
-	var id: int = slot["id"]
-	var peb: Pebble = _pebbles[id]
-	_out_of_core.erase(id)
-	_physics.spawn_pebble(id, Vector2(slot["x"], Silo.spawn_y()), peb.radius)
-	# This is the one drop with no pile underneath to shorten it. Every OTHER spawn into
-	# the bed lands on top of an already-settled core (a few px of fall), but the INITIAL
-	# fill drops straight from Silo.spawn_y() (140) to the closed hopper floor (900) with
-	# nothing in the way — ~760 px of free fall reaching ~1220 px/s, well over a diameter
-	# per physics step, which is enough to tunnel clean through the floor's zero-thickness
-	# SegmentShape2D. MEASURED before CCD defaulted on at spawn (`GodotPhysicsBackend.
-	# spawn_pebble`): 16 of the first 150 pebbles breached the closed floor in the first
-	# ~8 s of a fill, came to rest above the duct with the sorter gated off (bed not yet at
-	# TARGET_POPULATION), then — once the sorter opened — read as the "lowest" pebble in
-	# the core and got extracted from wherever they were resting, reappearing at the fixed
-	# drop mouth (CENTER_X) instead of wherever they actually fell. That is the escape AND
-	# the "different vertical axis" reappearance both, from one cause
-	# (see tests/live_fill_escape.gd).
+## Admits up to one pebble per LANE that has both a waiting pebble and a clear mouth
+## (Phase 3c widening) — not just one per throttled tick. This is the actual throughput
+## multiplier: the per-lane physics (gravity-limited clearance) is unchanged from the
+## original single lane, but up to `FuelLoop.INLET_LANES` of them now run in parallel.
+func _admit_batch() -> void:
+	for lane in FuelLoop.INLET_LANES:
+		if _core_count() >= _population_setpoint:
+			return
+		var id := _lowest_at_inlet(lane)
+		if id == -1:
+			continue
+		if not _admit_mouth_clear(lane):
+			continue
+		var peb: Pebble = _pebbles[id]
+		_out_of_core.erase(id)
+		_physics.remove_pebble(id)
+		_physics.spawn_pebble(id,
+				FuelLoop.inlet_admit_point(lane, _rng.randf_range(-1.0, 1.0), peb.radius), peb.radius)
+		_physics.set_pebble_tint(id, _pebble_tint(peb))
+
+
+## Is there room just below inlet LANE `lane`'s closed floor for one more pebble? Mirrors
+## `_drop_mouth_clear` exactly (see there for the measured failure this guards against), and
+## `_inlet_top_clear`'s axis-aligned reasoning exactly (a Euclidean radius here would let
+## adjacent lanes block each other).
+func _admit_mouth_clear(lane: int) -> bool:
+	var mouth := FuelLoop.inlet_admit_point(lane)
+	var positions := _physics.positions()
+	for id in positions:
+		if _out_of_core.has(id):
+			continue   # still piled above the floor, or elsewhere in the plant
+		var at: Vector2 = positions[id]
+		if absf(at.x - mouth.x) < FuelLoop.INLET_LANE_HALF_WIDTH \
+				and absf(at.y - mouth.y) < FuelLoop.INLET_MOUTH_CLEAR:
+			return false
+	return true
+
+
+## The id of the pebble resting lowest (closest to admission) within inlet LANE `lane`, or
+## -1 if nothing is waiting there. Deliberately excludes `_transit` bodies — those are still
+## being actively driven along a merge run and have not arrived yet (`_delivered`/
+## `in_inlet_bore` is what marks arrival) — and anything not `_out_of_core`, which the inlet
+## zone should never contain but a defensive filter costs nothing here. Narrowed to THIS
+## lane's own X band so each lane admits its own pebbles rather than racing every other lane
+## for whichever is lowest across the whole wide bore.
+func _lowest_at_inlet(lane: int) -> int:
+	var lane_x := FuelLoop.inlet_lane_x(lane)
+	var positions := _physics.positions()
+	var best_id := -1
+	var best_y := -INF
+	for id in positions:
+		if not _out_of_core.has(id) or _transit.has(id):
+			continue
+		var at: Vector2 = positions[id]
+		if not FuelLoop.in_inlet_bore(at):
+			continue
+		if absf(at.x - lane_x) >= FuelLoop.INLET_LANE_HALF_WIDTH:
+			continue
+		if at.y > best_y:
+			best_y = at.y
+			best_id = id
+	return best_id
 
 
 ## Pre-burn a seed pebble to a random point in its life so the INITIAL core starts
@@ -1282,9 +1705,9 @@ func _extract_lowest() -> void:
 	# which holds reactivity roughly flat instead of a batch sawtooth.
 	# Gate on the BED being full, not on total inventory: the machine holds pebbles
 	# that are in `_pebbles` but not in the core, so the old total-based test would
-	# fire while the bed was still filling. It also means a starved staging queue
-	# stalls extraction rather than quietly draining the bed — a safe failure.
-	if _core_count() < TARGET_POPULATION:
+	# fire while the bed was still filling. It also means a starved inlet stalls
+	# extraction rather than quietly draining the bed — a safe failure.
+	if _core_count() < _population_setpoint:
 		return  # let the bed fill first
 	var lowest_id := -1
 	var lowest_y := -INF
@@ -1305,14 +1728,10 @@ func _extract_lowest() -> void:
 		_discharge(lowest_id, peb)
 	else:
 		_recirculate(lowest_id, peb)
-	# Close the vacancy in the SAME step the sorter opened it, rather than waiting for
-	# the next injection tick: otherwise the bed sits one pebble short for up to
-	# SPAWN_INTERVAL, and the flux solve (a shorter cadence still) would sample a core
-	# that is momentarily under-fuelled. Tiny, but the whole point of the staging queue
-	# is that the bed count is EXACTLY invariant — an almost-invariant would leave a
-	# real, if small, mechanism-shaped wobble in k for someone to chase later.
-	if not _queue.is_empty():
-		_spawn_from_queue()
+	# No same-step top-up any more (Phase 3c): admission is the player's own throttled
+	# `_fill_rate`, not an invariant the sorter has to protect. A vacancy can sit open
+	# for a moment between the sorter's step and the next admission tick — that lag is
+	# now a visible, honest part of how fast the player told the plant to fill.
 
 
 ## Send a not-yet-spent pebble back to the top for another pass, keeping ALL its
@@ -1323,8 +1742,9 @@ func _extract_lowest() -> void:
 ## recirculating pebble now goes down the same drop a spent one does, is dragged out along the
 ## duct by its own belt — the opposite way to the discharge belt sharing that duct, which is
 ## the sorter's decision made mechanical — and is lifted 880 px up the riser, colliding with
-## the pipe and with the pebbles ahead of it the whole way. Only at the head of the climb does
-## it become a rider again, for the chute (`_board_chute`).
+## the pipe and with the pebbles ahead of it the whole way. At the head of the climb it bends
+## onto the merge run toward the shared inlet and stays a body the rest of the way in
+## (Phase 3c: see `_drive`), piling up there until `_admit_batch` lets it into the bed.
 ##
 ## THE STATE IT KEEPS is untouched by any of that: isotopics, burnup and poison all ride
 ## along, because a pass ends at the sorter and not at the pipe. What it does NOT do is burn
@@ -1365,9 +1785,9 @@ func _recirculate(id: int, peb: Pebble) -> void:
 ##
 ## The body is DESTROYED AND RE-CREATED at the outlet rather than carried through, and the
 ## seam is real — see `FuelLoop.drop_mouth` for why the closed hopper leaves no alternative
-## (a hole in the floor would drain the bed, and TARGET_POPULATION is calibrated). What is
-## NOT re-created is anything after this point: from the drop mouth to the pile it is one
-## body, one continuous trajectory.
+## (a hole in the floor would drain the bed uncontrollably). What is NOT re-created is
+## anything after this point: from the drop mouth to the pile it is one body, one
+## continuous trajectory.
 func _discharge(id: int, peb: Pebble) -> void:
 	_record_outflow(peb)
 	_physics.remove_pebble(id)
@@ -1617,7 +2037,7 @@ func _solve_flux() -> void:
 	# empty and this reads exactly as it always did — but a raw registry count would let a
 	# stocked pool satisfy the gate with a half-empty bed, which is the under-seeded
 	# cold start this line exists to prevent.
-	if not _thermal_seeded and cold.k_eff > 1.0 and _inventory() >= TARGET_POPULATION:
+	if not _thermal_seeded and cold.k_eff > 1.0 and _inventory() >= _population_setpoint:
 		_seed_thermal_equilibrium(positions, cold.flux)
 
 	if _feedback_on:
@@ -1839,23 +2259,18 @@ func _update_pebble_colors() -> void:
 		# color in the bed, riding the machine, and settled in the pool, so you can follow
 		# one spent (or hot) pebble all the way to the end of its life.
 		#
-		# Both setters, unconditionally, because BOTH are no-op-safe (set_pebble_tint skips
-		# a pebble with no body; set_rider_tint skips one that is not on the machine) and a
-		# pebble is only ever one of the two. This used to branch on `_out_of_core` — which
-		# was right only while "out of core" implied "has no body". A settled pool pebble is
-		# now out-of-core AND bodied, so that branch would have sent its color to the plant,
-		# which does not draw it, and the whole pool would have sat there in graphite grey
-		# with the field view silently stopping at the tray. Asking each owner "is this
-		# yours?" cannot rot the way a guess about who owns it does.
+		# set_pebble_tint is no-op-safe (skips a pebble with no body), which matters for the
+		# handful of frames a pebble genuinely has none (mid-removal/respawn at a mouth).
+		# Every pebble that has a body — bed, transit, inlet pile, or pool — is reached by
+		# this one call now (Phase 3c retired the separate rider tint path: there are no
+		# riders left to color).
 		_physics.set_pebble_tint(id, c)
-		_loop.set_rider_tint(id, c)
 
 
 ## Restore graphite grey (used when switching from a PEBBLE field back to a GRID one).
 func _reset_pebble_tints() -> void:
 	for id in _pebbles:
 		_physics.set_pebble_tint(id, PebbleBody.DEFAULT_TINT)
-		_loop.set_rider_tint(id, PebbleBody.DEFAULT_TINT)
 
 
 ## The selected PEBBLE field's color for one pebble, or graphite grey when the
@@ -1901,14 +2316,9 @@ func _refresh_pool() -> void:
 ## along. What distinguishes a pool hit is not where it was found, it is what the
 ## pebble IS (`_spent.has`), which is a fact about the sim rather than about draw order.
 ##
-## Riders still need their branch: they have no body (the plant draws them along their
-## path), so the physics knows nothing about them. Phase 3b changes that.
+## No separate rider branch any more (Phase 3c retired the last of them) — every pebble
+## the plant is holding, wherever it is, is a body the physics knows about.
 func _pick_at(at: Vector2) -> void:
-	var rid := _loop.rider_at(at)
-	if rid != -1:
-		_select(_pebbles.get(rid), "fuel machine")
-		return
-
 	# Every body: the bed AND the settled pool. Nearest hit wins rather than first —
 	# pebbles overlap slightly in a packed bed (and in a pile), so "first within radius"
 	# would depend on dictionary order and feel arbitrary.
@@ -1940,8 +2350,7 @@ func _pick_at(at: Vector2) -> void:
 	_select(hit, _where_is(hit))
 
 
-## What to call the place a BODIED pebble is sitting. Riders are not covered — the plant
-## answers for those (`_pick_at` asks it first, because a rider has no body to find).
+## What to call the place a BODIED pebble is sitting — every pebble now (Phase 3c).
 ## Naming the LEG, not just the pipe: `_transit` carries three since Phase 3b-iii, and they
 ## mean different things to the player — one pebble is on its way out of the reactor for
 ## good, the other two are both going back in (by different climbs). A bare membership test
@@ -1954,6 +2363,8 @@ func _where_is(peb: Pebble) -> String:
 			FuelLoop.RECIRC: return "recirc riser"
 			FuelLoop.REINJECT: return "reinject riser"
 			_: return "discharge pipe"
+	if _out_of_core.has(peb.id):
+		return "waiting at inlet"
 	return "core bed"
 
 
@@ -1965,19 +2376,13 @@ func _select(peb: Pebble, where: String) -> void:
 
 ## Where the selected pebble is on screen, or Vector2.INF if it has no position.
 ##
-## A STAGED pebble genuinely has none: it has arrived at the top and is waiting for a
-## bed slot, holding no body and no rider, so nothing draws it. That is a real gap in
-## the fuel cycle's visibility (the "pebbles going in" have nowhere to be seen) and it
-## is why the inspector can reach a staged pebble only indirectly today.
-## The pool needs no case of its own: a settled pebble is a body, so the physics lookup
-## at the bottom already answers for it. (It used to be a `pool_slot(_spent.find(...))`
-## branch — the lattice's idea of where arrival number i belonged.)
+## One lookup answers for every state now (Phase 3c): bed, transit, waiting at the inlet,
+## and the pool are all real bodies, so this is just the physics position lookup. Only a
+## pebble genuinely between removal and respawn at a mouth — a single physics step, at
+## most — reads INF, the same as it always briefly could.
 func _selected_pos() -> Vector2:
 	if _selected == null:
 		return Vector2.INF
-	var rp := _loop.rider_position(_selected.id)
-	if rp != Vector2.INF:
-		return rp
 	var positions: Dictionary = _physics.positions()
 	return positions.get(_selected.id, Vector2.INF)
 
@@ -2360,12 +2765,17 @@ func _update_hud() -> void:
 		# would read as though the core had failed. A core that is subcritical for other
 		# reasons while rods happen to be part-in still falls through to the real cause.
 		var rod_held := _rod_worth > 0.005 and _k_cold + _rod_worth > 1.0
+		var fuel_short := _core_count() < _population_setpoint
 		if rod_held:
 			status = "SUBCRITICAL — held down by control rods (N to withdraw)"
 			status_col = "ffaa44"
 		elif xenon_pit:
 			status = "SUBCRITICAL — XENON PIT (dead time; wait for Xe decay)"
 			status_col = "c792ea"
+		elif fuel_short:
+			status = "SUBCRITICAL — not enough fuel in the bed yet (%d / %d)" \
+				% [_core_count(), _population_setpoint]
+			status_col = "7aa2f7"
 		else:
 			status = "SUBCRITICAL — shutting down"
 			status_col = "7aa2f7"
@@ -2445,6 +2855,15 @@ func _update_hud() -> void:
 	if spent_in_bed > 0:
 		policy_note = "   [color=#ff7043]%d spent in bed, awaiting the sorter[/color]" % spent_in_bed
 
+	# Overfill note (Phase 3c): once the bed is genuinely denser than the calibrated
+	# reference, say so — the honest physical consequence (a taller pile, and eventually
+	# a jammed inlet once it reaches the feed) is already what the physics does; this is
+	# only the readout that names it. Pure comparison against RECOMMENDED_POPULATION, not
+	# a new penalty.
+	var overfill_note := ""
+	if _core_count() > RECOMMENDED_POPULATION:
+		overfill_note = "   [color=#ffaa44]OVERFILLED — pile crowding the feed[/color]"
+
 	_readout.text = "[b]PEBBLE BED REACTOR[/b]  [color=#%s]toy sim — M5d[/color]\n" % HUD_DIM \
 		+ "[color=#%s]● %s[/color]\n" % [status_col, status] \
 		+ _section("CORE") \
@@ -2460,7 +2879,8 @@ func _update_hud() -> void:
 		+ _row("fuel temp", "peak %.0f K (ΔT %.0f)   mean %.0f K" % [_peak_temp, _peak_temp - Feedback.T_REF, _mean_temp]) \
 		+ _row("coolant", "%.0f → %.0f K (bed ΔT %.0f)" % [_inlet_temp, _coolant_out, _coolant_out - _inlet_temp]) \
 		+ _section("FUEL CYCLE") \
-		+ _row("in core", "%d / %d   (%d riding the loop)" % [_core_count(), TARGET_POPULATION, _loop.count()]) \
+		+ _row("in core", "%d / %d setpoint (recommended %d)   %d in the machine%s" % [
+			_core_count(), _population_setpoint, RECOMMENDED_POPULATION, _transit.size(), overfill_note]) \
 		+ _row("cycle", "recirculated %d   discharged %d   made %d%s" % [
 			_total_recirculated, _total_extracted, _total_injected,
 			# Only once it has happened: these two are player-driven, so a permanent

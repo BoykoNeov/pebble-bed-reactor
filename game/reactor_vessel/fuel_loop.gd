@@ -2,8 +2,9 @@
 #
 # The fuel-handling machine OUTSIDE the vessel: the conveyor that carries a
 # discharged pebble back up to the top for another pass, the spent-fuel pool that
-# a pebble settles into once it has finished its last pass, and the fresh-fuel
-# hopper that feeds a replacement in.
+# a pebble settles into once it has finished its last pass, and the shared INLET
+# that every pebble bound for the bed — fresh, recirculated, or re-injected —
+# falls through.
 #
 # WHY it exists: through M5 every pebble moved by TELEPORT — a recirculating
 # pebble vanished at the outlet and reappeared in the spawn band in the same
@@ -15,20 +16,35 @@
 # single pebble ride up and re-enter, and watch a spent one leave for good — and,
 # since the pool, watch where it ends up instead of watching it wink out.
 #
-# This is PRESENTATION + bookkeeping, NOT physics. A rider has no body, so it is
-# absent from `positions()` and therefore never homogenized — it is out of the
-# flux by construction, and main freezes its state while it rides (a pebble in the
-# transport pipe neither fissions nor burns). Geometry is pure data like Silo;
-# main.gd remains the sole owner of every Pebble.
+# EVERY LEG IS NOW REAL PHYSICS (superseding the "riders are presentation, not
+# physics" design this file used through Phase 3b). RECIRC/FRESH/REINJECT used
+# to finish their trip as a drawn dot gliding along a polyline with no collision
+# body — deliberately, because the ride ended at each pebble's own spawn_x (a
+# hole that moves, which a real pipe cannot be built around) and because bed
+# admission was hard-pinned to a calibrated count a real jam would have put at
+# the solver's mercy. Both reasons are gone: admission now enters through ONE
+# FIXED point (`INLET_X`, not a moving spawn_x), and the bed count is a player
+# setpoint rather than a pin, so a real jam at the inlet is an honest, wanted
+# consequence (overfilling) rather than a hazard to design around. So a pebble
+# is a real, colliding body from the instant it is minted or leaves the pool
+# until it settles in the bed — full stop, nothing in the plant is a rider any
+# more. A body waiting for room simply piles up against the inlet's closed
+# floor, exactly as spent fuel already piles up in the pool tray below.
+#
+# Geometry is pure data like Silo; main.gd remains the sole owner of every
+# Pebble and of every body (this file never spawns or removes one).
 class_name FuelLoop
 extends Node2D
 
-# Rider kinds. Plain int consts, NOT a nested enum: cross-file nested enum access
-# is unreliable in GDScript (see the project memory / M3 notes).
+# Leg/kind tags. Plain int consts, NOT a nested enum: cross-file nested enum
+# access is unreliable in GDScript (see the project memory / M3 notes).
 const RECIRC := 0     # below discharge burnup → back to the top for another pass
 const DISCHARGE := 1  # spent → out to the bin, gone for good
-const FRESH := 2      # a replacement for a discharged pebble, in from the hopper
 const REINJECT := 3   # the player pulled one back out of the spent pool
+# FRESH no longer needs a leg tag: a freshly minted pebble is never on a belt
+# (it is dropped straight into the inlet, see `inlet_top`), so it never occupies
+# `_transit` and nothing ever asks "which leg is this" about it. Kept as a
+# comment rather than a dead constant — do not resurrect it as a `_transit` tag.
 
 # Machine geometry. The vessel is x ∈ [560, 900], y ∈ [120, 900]; the neutronics
 # grid rect (drawn dimmed by FieldDisplay) reaches x ∈ [424, 1036], so the plant
@@ -36,26 +52,57 @@ const REINJECT := 3   # the player pulled one back out of the spent pool
 # vessel", which is exactly what it is. The bottom key-hints bar starts at y ≈ 1026.
 const HUB_Y := 955.0                  # the sorter: where recirc/discharge part ways
 const RISER_X := 975.0                # the riser, in the right-hand reflector margin
-const CHUTE_Y := 75.0                 # RECIRC/REINJECT's own line, above the vessel top (120)
+# The height at which a climbing RECIRC/REINJECT riser bends over into a horizontal run
+# toward the shared inlet (Phase 3c). Kept above the vessel top (120) for the same reason
+# it always was: the plant lives outside the vessel, and this is where the vertical climb
+# ends and the merge toward `INLET_X` begins. Formerly the line a presentation-only
+# "rider" glided along; now the height a real, driven body is pushed along (see
+# `in_recirc_merge` / `in_reinject_merge` and `main._drive`).
+const CHUTE_Y := 75.0
 const BIN_X := 480.0                  # spent-fuel bin, left-hand margin
 
-# FRESH gets its OWN line, ABOVE the recirc/reinject chute rather than merging onto it
-# (Phase 3b-iv). Before this, every rider bound for the bed funnelled through the exact same
-# Vector2(spawn_x, CHUTE_Y) regardless of kind — recirculating fuel is ~90% of all traffic
-# (every extraction not discharged), fresh fuel is whatever the mint gate needs to hold
-# TARGET_POPULATION — and since a rider has no body and riders never test against each other
-# (see the class doc), a fresh pebble and a recirculating one could occupy the identical point
-# on screen at the identical instant and neither would notice. That is the "new pebbles...
-# without coliding" report. Splitting the lines removes the coincidence rather than papering
-# over it: the two belts share no y except where FRESH's own drop crosses down through
-# CHUTE_Y, and THAT crossing gets its own gate (see `_gate_clear`) rather than being ignored.
+# The centreline of the single fixed PIPE every pebble bound for the bed falls through
+# (Phase 3c) — fresh, recirculated, or re-injected alike. Centred on the vessel for the same
+# reason the reference schematic draws one fuel pipe down the middle: ONE pipe reads as a
+# source, where the old per-pebble `Silo.spawn_x` scatter read as pebbles materializing out
+# of thin air across the whole top. It carries multiple LANES side by side (`INLET_LANES`)
+# rather than a single file, but they share one casing and one centreline — individual
+# pebbles still land in different spots in the bed, and that is purely the physics of
+# falling and piling onto whatever is already there, never a pre-chosen x.
+const INLET_X := Silo.CENTER_X
+# Top of the visible inlet pipe — where a freshly minted pebble is dropped in. Well above
+# CHUTE_Y so a fresh pebble free-falls a visible stretch before joining the recirc/reinject
+# traffic at the merge junction, the same way the old hopper's spout gave FRESH its own
+# short drop before the chute.
+const INLET_TOP_Y := 20.0
+# The inlet's CLOSED floor, just above the vessel's open top (120) — this vessel has no
+# lid (`Silo.wall_segments`), so without a floor here a pebble dropped into the inlet
+# would fall straight into the bed with no admission control at all. Mirrors the vessel's
+# own closed hopper floor at the OUTLET (`Silo`'s doc comment): a real plant meters fuel
+# in exactly as it meters fuel out, and a queue that cannot be seen is not a queue — see
+# `main._admit_batch`. Pebbles waiting for room pile up on this floor as REAL, colliding
+# bodies, in full view, rather than vanishing into a data structure.
+const INLET_FLOOR_Y := Silo.TOP - 4.0
+# How many pebble-wide LANES run side by side down the inlet bore (Phase 3c widening).
 #
-# 55, not lower: it has to clear the hopper's own spout (the hop polygon's bottom two points
-# sit at HOPPER.y + 8 = 52) with room to spare, and it has to stay clearly above CHUTE_Y (75)
-# so the two lines read as two belts and not one blurred band — 20 px of separation is enough
-# that FRESH_BORE_W and BORE_W's hollow bores never touch even though their outer casings
-# graze (see FRESH_BORE_W below).
-const FRESH_CHUTE_Y := 55.0
+# WHY MORE THAN ONE: a single-file bore's real throughput is capped by how fast ONE column
+# clears — gravity-limited at ~4.5 pebbles/s regardless of the player's fill-rate lever, which
+# left most of that lever's range dead (measured: `_fill_rate` up to 100/s, real fill still
+# ~4.3/s). Surfaced to the player as an explicit choice against narrowing the lever to match;
+# they chose widening the pipe instead. Each lane is independently gated exactly like the
+# original single lane was (see `main._feed_inlet_top`/`_admit_batch`), so throughput scales
+# with lane count without changing the per-lane physics that was already proven safe.
+#
+# WHY STILL "ONE PIPE" AND NOT A REGRESSION to the old open-top scatter this phase replaced:
+# three lanes sit inside ONE casing (`INLET_BORE_W`/`INLET_CASING_W`), a fixed width the whole
+# vessel is built around — visually and physically one source, just a wider one, not N
+# independent entry points scattered across the top the way `Silo.spawn_x` used to be.
+const INLET_LANES := 3
+# The bore's total width: enough for INLET_LANES columns each BORE_W apart (see
+# `inlet_lane_x`), so adjacent lanes get a full standard bore's clearance from each other —
+# the same spacing every other pipe in the plant already uses for one pebble.
+const INLET_BORE_W := float(INLET_LANES) * BORE_W
+const INLET_CASING_W := INLET_BORE_W + 2.0 * PIPE_WALL
 # REINJECT's own riser (Phase 3b-iii). A belt runs ONE way, and re-injection is the discharge
 # leg backwards, so it needs a route the discharge leg is not already using. Both routes the
 # earlier notes here considered — tunnelling under the shared duct, or merging into the main
@@ -81,7 +128,6 @@ const REINJECT_MOUTH_Y := 995.0       # roughly the pool's mid-height — depart
 # needs ~50 of it. Reads correctly anyway: the discharge conveyor runs out to the left
 # and dumps into the pool directly below it, which is what a transfer pool looks like.
 const BIN_Y := 958.0
-const HOPPER := Vector2(480.0, 44.0)  # fresh-fuel hopper, top-left
 
 # --- Spent-fuel pool ---
 #
@@ -186,13 +232,7 @@ const POOL_CAP := 8
 const POOL_WALL := Color(0.10, 0.06, 0.06, 0.92)
 const POOL_EDGE := Color(0.55, 0.35, 0.35, 0.8)
 
-# Ride speed (px/s) for the pebbles still carried as RIDERS (recirc, fresh, reinject).
-# Purely a legibility knob with ZERO physics cost: main pins the IN-CORE population
-# regardless of how many pebbles are riding (see LOOP_BUFFER), so a slow, watchable ride
-# does not dilute the bed or shift reactivity.
-const SPEED := 380.0
-
-# --- The belts (Phase 3b) ---
+# --- The belts (Phase 3b, extended to the inlet at 3c) ---
 #
 # NEITHER leg out of the sorter is a ride any more. An extracted pebble is a REAL BODY from
 # the moment it enters the drop: it falls to the duct, and then a belt drags it either LEFT to
@@ -209,8 +249,9 @@ const SPEED := 380.0
 # What makes both legs free, whatever the bodies do: a transiting pebble is flagged
 # `_out_of_core` by main, so it is outside the flux solve for its whole journey. The pipes
 # cross valid grid cells and cost nothing. The one thing physics must NOT be handed is
-# admission to the BED — that stays gated by `main._queue`, because TARGET_POPULATION = 380 is
-# calibrated and a count set by solver timing is a count that wanders.
+# admission to the BED — that stays gated by `main._admit_batch` against the player's
+# population setpoint and fill rate (Phase 3c superseded the old hard TARGET_POPULATION
+# pin), because a count set by solver timing alone is a count that wanders.
 #
 # THE BELT IS A SPEED, NOT A FORCE, and that distinction is measured rather than stylistic.
 # A constant force accelerates over the whole 250 px run and the pebble leaves the end at
@@ -231,18 +272,18 @@ const BELT_DISCHARGE := 95.0
 # FOUR TIMES the discharge belt, and the two numbers are not a matter of taste — each leg's
 # speed is set by the thing at the far end of it, which is why one constant could never have
 # covered both. The discharge belt tips into an open tray, so it must be slow. This one ends
-# in a CONTROLLED REMOVAL at a fixed point (main lifts the body off the top of the riser and
-# hands it to a chute rider), so there is no open exit to overshoot and nothing to be thrown
-# out of — the escape hazard that pins BELT_DISCHARGE at 95 simply does not exist here.
+# by bending over into the horizontal merge run toward the shared inlet (`CHUTE_Y`), not an
+# open exit a pebble could overshoot, so the escape hazard that pins BELT_DISCHARGE at 95
+# simply does not exist here.
 #
 # It is not free speed for its own sake. This leg carries EVERY extraction (1 per
 # EXTRACT_INTERVAL = 0.3 s), where the discharge leg carries roughly 1 in 10 of them, so it
 # is the only pipe in the plant that can genuinely congest. At 95 px/s the 880 px riser takes
 # ~9 s and would hold ~28 pebbles nose-to-tail; at 380 it takes ~2.3 s and holds ~8. That
 # matters beyond looking better, because a pebble in the pipe is a pebble not in the bed:
-# TARGET_POPULATION = 380 is calibrated, LOOP_BUFFER is what absorbs the ones in flight, and
-# a slow riser would eat it and starve the staging queue — the bed would run short and shift
-# k with nothing on screen to say so.
+# LOOP_BUFFER is what absorbs the ones in flight against the player's population setpoint,
+# and a slow riser would eat it and starve the inlet — the bed would run short and shift k
+# with nothing on screen to say so.
 #
 # MEASURED, not reasoned: a velocity-capped belt at 380 carries the riser fed at the real
 # extraction rate with 132 of 132 arriving, nothing stuck, a 3.0 s mean ride and a PEAK OF 11
@@ -265,15 +306,15 @@ const BELT_FORCE := 2500.0
 
 const PEBBLE_R := 8.0
 
-# Pipe cross-section. The runs used to be a single fat line with a bright stripe down the
-# middle, which read as a LINE the pebbles slid along — the rider (r=8) covered the stripe
-# and filled the band, so there was nothing to see them travel *inside*.
-#
-# A pipe is a bore with walls around it, so it is drawn as one: a casing band, a darker
-# hollow bore inset into it, and the bore's two edges picked out. The rider then goes down
-# the middle of the bore with clearance on both sides, and reads as being CONTAINED.
-# BORE_W is sized off the pebble it must carry (2·PEBBLE_R + clearance both sides), so a
-# pebble can never appear wider than the pipe conveying it.
+# Pipe cross-section. Every leg is a real body now, so the pipe has to look like something
+# a pebble travels INSIDE rather than a line it slides along: a casing band, a darker
+# hollow bore inset into it, and the bore's two edges picked out. A pebble goes down the
+# middle of the bore with clearance on both sides, and reads as being CONTAINED. BORE_W is
+# sized off the pebble it must carry (2·PEBBLE_R + clearance both sides), so a pebble can
+# never appear wider than the pipe conveying it — including the inlet, which reuses this
+# same bore rather than a separate thinner one (Phase 3c retired the old FRESH-only line
+# and its FRESH_BORE_W once FRESH stopped needing a lane of its own to avoid colliding
+# with RECIRC/REINJECT — real collision handles that now, at the merge itself).
 const BORE_CLEARANCE := 3.0
 const BORE_W := 2.0 * (PEBBLE_R + BORE_CLEARANCE)
 # Wall thickness of the pipe itself, per side. 3 px was tried first and rendered as a
@@ -283,40 +324,12 @@ const BORE_W := 2.0 * (PEBBLE_R + BORE_CLEARANCE)
 const PIPE_WALL := 6.0
 const CASING_W := BORE_W + 2.0 * PIPE_WALL
 
-# FRESH's own line is drawn thinner than the main recirc/reinject duct, not sized off the
-# same BORE_W — and that is load-bearing for the layout, not decoration. There are only
-# ~20 px between the hopper's spout and CHUTE_Y (see FRESH_CHUTE_Y), nowhere near enough
-# for two full CASING_W (34 px) pipes stacked without their bores touching. A thinner feed
-# also reads correctly on its own terms: this line carries whatever trickle keeps
-# TARGET_POPULATION topped up, the recirc/reinject line below it carries ~90% of all
-# traffic, and a real plant would not build them to the same bore either.
-const FRESH_BORE_W := BORE_W * 0.55
-const FRESH_CASING_W := FRESH_BORE_W + 2.0 * PIPE_WALL
-
 # Plant livery — dim structural greys, so the machine frames the core without
 # competing with the field heatmap it sits on top of.
 const PIPE_CASING := Color(0.24, 0.27, 0.34, 1.0)  # the pipe wall
 const PIPE_BORE := Color(0.05, 0.06, 0.08, 1.0)    # the hollow interior
 const PIPE_EDGE := Color(0.42, 0.47, 0.57, 0.85)
 const GRAPHITE := Color(0.62, 0.64, 0.68)
-
-# How close a RECIRC/REINJECT rider may be to FRESH's own spawn_x, on the CHUTE_Y line,
-# before FRESH holds its drop rather than releasing through it (Phase 3b-iv). Sized off two
-# riders at max radius (main.RADIUS_MAX = BORE_W / 2, a player lever) touching, plus a full
-# bore of room on top — not a bare touching-distance margin, because this is a PREDICTIVE
-# gate checked one step ahead of a crossing that is still closing, not a contact test on
-# something already there.
-const FRESH_CLEAR_X := BORE_W * 2.0
-# How far above/below CHUTE_Y a RECIRC/REINJECT rider counts as "at the crossing" for that
-# same gate. A rider approaching the line is exactly as much a hazard as one sitting on it —
-# holding the gate only at the instant some other rider's y is EXACTLY CHUTE_Y would let two
-# riders converge on the same point a physics step apart and call it clear the whole time.
-const FRESH_GATE_Y := BORE_W * 2.0
-
-# Riders in flight. Each: id, kind, pts (polyline), d (distance travelled),
-# len (total), x (the spawn-band x it is bound for), tint, and — FRESH only — gate_len (see
-# `_gate_clear`).
-var _riders: Array = []
 
 # What the pool's CAPTION says. Counts only: the settled pebbles are real bodies that
 # draw themselves, so the tray holds no view state about them at all — it is a vessel,
@@ -417,6 +430,52 @@ static func plant_walls() -> Array:
 		# the pool floor to the chute.
 		[Vector2(rx_l, POOL_FLOOR), Vector2(rx_l, riser_top)],
 		[Vector2(rx_r, POOL_FLOOR), Vector2(rx_r, riser_top)],
+	] + inlet_walls()
+
+
+## The shared inlet (Phase 3c): the merge runs off the tops of both risers, and the
+## vertical bore they and a freshly minted pebble all fall into. Split out of
+## `plant_walls` only for readability — it is still the one function main hands every
+## static segment to.
+##
+## THE FLOOR IS CLOSED, on purpose, mirroring `Silo`'s own closed hopper floor at the
+## OUTLET: this vessel has no lid at all (`Silo.wall_segments`), so without a floor here
+## a pebble minted at `inlet_top` would free-fall straight into the bed with no admission
+## control whatsoever — the exact same argument that keeps the OUTLET a metered removal
+## rather than a hole. `main._admit_batch` is the metering; this is what it meters.
+##
+## THE MERGE ROOFS STOP SHORT OF THE INLET BORE, on purpose — a roof that crossed the
+## inlet bore's own width would cap the one place a freshly minted pebble is meant to
+## fall THROUGH from `inlet_top` above. Both merge runs hand off to the vertical bore at
+## its outer edge, leaving the bore itself open top to bottom.
+##
+## THE BORE IS WIDER THAN THE MERGE RUNS FEEDING IT (`INLET_BORE_W` vs `BORE_W`), on
+## purpose (Phase 3c widening, `INLET_LANES`) — it is the one place three feeds actually
+## converge (fresh mint straight down the middle, recirc and reinject arriving from either
+## side), so it is the natural place for the plant to be widest, the same way a funnel
+## opens up at a junction rather than staying pipe-width throughout.
+static func inlet_walls() -> Array:
+	var half := BORE_W * 0.5
+	var inlet_half := INLET_BORE_W * 0.5
+	var inlet_l := INLET_X - inlet_half
+	var inlet_r := INLET_X + inlet_half
+	var riser_r := RISER_X + half
+	var rx_l := REINJECT_X - half
+	var merge_roof := CHUTE_Y - half
+	var merge_floor := CHUTE_Y + half
+	return [
+		# --- Recirc's merge run: RISER_X's bore, bent left toward the inlet's WIDE right face.
+		[Vector2(inlet_r, merge_roof), Vector2(riser_r, merge_roof)],
+		[Vector2(inlet_r, merge_floor), Vector2(riser_r, merge_floor)],
+		# --- Reinject's merge run: REINJECT_X's bore, bent right toward the inlet's WIDE left face.
+		[Vector2(rx_l, merge_roof), Vector2(inlet_l, merge_roof)],
+		[Vector2(rx_l, merge_floor), Vector2(inlet_l, merge_floor)],
+		# --- The inlet bore itself: full height from the visible pipe top down to the
+		# closed floor, so a freshly minted pebble falls down a contained pipe the whole
+		# way rather than drifting before it ever meets a wall. INLET_LANES columns wide.
+		[Vector2(inlet_l, INLET_TOP_Y), Vector2(inlet_l, INLET_FLOOR_Y)],
+		[Vector2(inlet_r, INLET_TOP_Y), Vector2(inlet_r, INLET_FLOOR_Y)],
+		[Vector2(inlet_l, INLET_FLOOR_Y), Vector2(inlet_r, INLET_FLOOR_Y)],
 	]
 
 
@@ -433,12 +492,9 @@ static func plant_walls() -> Array:
 ##
 ## THERE IS AN HONEST SEAM HERE and it is worth naming rather than hiding. The silo is a
 ## CLOSED hopper — extraction is metered, the floor has no hole, and it must not get one:
-## a real outlet would let the bed drain and TARGET_POPULATION is calibrated. So the pebble
-## cannot physically fall out of the core; it is removed at the outlet and appears in the
-## pipe it was discharged into, which is what metered discharge means. The old rider glided
-## the same gap, but glided it THROUGH the hopper's steel floor and through its neighbours.
-## Neither is more real than the other; this one at least ends with the pebble contained in
-## pipework for the rest of its journey.
+## an open outlet would let the bed drain uncontrollably. So the pebble cannot physically
+## fall out of the core; it is removed at the outlet and appears in the pipe it was
+## discharged into, which is what metered discharge means.
 static func drop_mouth(across := 0.0, radius := PEBBLE_R) -> Vector2:
 	# Kept a clear radius below the hopper floor so the new body cannot be born overlapping
 	# it — a body spawned inside geometry is fired out of it by the solver.
@@ -514,24 +570,34 @@ static func in_riser(at: Vector2) -> bool:
 			and at.y > CHUTE_Y and at.y < HUB_Y + BORE_W * 0.5
 
 
-## Has a climbing pebble reached the head of the riser, where main lifts it onto the chute?
+## Has a climbing pebble reached the head of the riser, where the belt should stop lifting
+## and start pushing it sideways along the merge run toward the inlet (`main._drive`)?
 ##
-## This is the riser belt's TERMINUS, and having one is what lets that belt run at 380 while
-## the discharge belt must crawl at 95: this leg does not end in an open exit a pebble could
-## overshoot, it ends in a removal at a fixed point. Nothing is thrown anywhere, so nothing
-## has to be slow enough not to be thrown.
+## This is the riser belt's bend, not its end — under the old rider design it WAS the
+## terminus (a removal at a fixed point, which is what let this belt run at 380 while the
+## discharge belt crawls at 95: no open exit to overshoot). That speed argument still holds
+## unchanged; only what happens at the top does. A real body now continues past this point,
+## driven horizontally, until `in_inlet_bore` says it has actually arrived.
 ##
 ## Both axes, like `pool_contains` and for the same reason: a bare `y <= CHUTE_Y` would be
 ## satisfied by a pebble that had punched through the riser wall and sailed up the outside of
-## it, and would report the escape as a delivery. Requiring x as well means only a pebble
-## actually in the bore can arrive.
-static func riser_delivered(at: Vector2) -> bool:
+## it, and would report the escape as having reached the bend. Requiring x as well means only
+## a pebble actually in the bore counts.
+static func riser_at_bend(at: Vector2) -> bool:
 	return at.y <= CHUTE_Y and absf(at.x - RISER_X) < BORE_W
 
 
-## Where a pebble lifted off the riser starts its ride — the head of the climb, which is also
-## where `_pipe_runs` turns the riser into the chute. The hand-off is drawn at the point it
-## happens, so the body vanishes and the rider appears in the same place.
+## Is this body on the RECIRC merge run — the horizontal leg from the top of the riser's
+## bend to the shared inlet? Wider than the bore, matching `in_riser`'s reasoning: the
+## sideways push should catch the pebble the instant it clears the bend, not once it has
+## drifted to the run's own centreline first.
+static func in_recirc_merge(at: Vector2) -> bool:
+	return at.x > INLET_X and at.x < RISER_X + BORE_W \
+			and absf(at.y - CHUTE_Y) < BORE_W
+
+
+## Where the riser hands a climbing pebble off to the merge run — the head of the climb,
+## which is also where `_pipe_runs` bends the riser over toward the inlet.
 static func riser_head() -> Vector2:
 	return Vector2(RISER_X, CHUTE_Y)
 
@@ -552,17 +618,35 @@ static func in_reinject_riser(at: Vector2) -> bool:
 	return absf(at.x - REINJECT_X) < BORE_W and at.y > CHUTE_Y and at.y < POOL_FLOOR
 
 
-## Has a climbing re-injected pebble reached the head of ITS riser? Both axes, for the same
-## reason `riser_delivered` checks both: a pebble that punched through the bore wall must not
-## be read as a safe arrival just because it cleared the y line.
-static func reinject_delivered(at: Vector2) -> bool:
+## Has a climbing re-injected pebble reached the head of ITS riser — the bend onto its own
+## merge run toward the inlet? Both axes, for the same reason `riser_at_bend` checks both: a
+## pebble that punched through the bore wall must not be read as safely at the bend just
+## because it cleared the y line.
+static func reinject_at_bend(at: Vector2) -> bool:
 	return at.y <= CHUTE_Y and absf(at.x - REINJECT_X) < BORE_W
 
 
-## Where a pebble lifted off the reinject riser starts its ride — merges onto the SAME chute
-## `_pipe_runs` already draws for recirc/fresh fuel, just further along it.
+## Is this body on REINJECT's own merge run, the horizontal leg from its riser's bend to the
+## shared inlet? Mirrors `in_recirc_merge`, mirrored in x (REINJECT_X sits LEFT of the
+## inlet, RISER_X sits RIGHT of it).
+static func in_reinject_merge(at: Vector2) -> bool:
+	return at.x < INLET_X and at.x > REINJECT_X - BORE_W \
+			and absf(at.y - CHUTE_Y) < BORE_W
+
+
+## Where REINJECT's riser hands a climbing pebble off to its own merge run.
 static func reinject_riser_head() -> Vector2:
 	return Vector2(REINJECT_X, CHUTE_Y)
+
+
+## Has a pebble arriving from either merge run reached the shared inlet bore — the point
+## RECIRC and REINJECT both actually count as "delivered" at (`main._delivered`)? Both axes,
+## same reasoning as `pool_contains`: the walls are what put the pebble over the bore, so
+## arrival must be checked against real geometry, not a bare y-line a wall gap could let a
+## stray body sail past. Checked against the WIDE bore (`INLET_BORE_W`), not one lane, since
+## a merge-run pebble can arrive anywhere across it.
+static func in_inlet_bore(at: Vector2) -> bool:
+	return absf(at.x - INLET_X) < INLET_BORE_W * 0.5 and at.y >= CHUTE_Y - BORE_W and at.y <= INLET_FLOOR_Y
 
 
 ## Has a falling pebble reached the tray? Inside it in BOTH axes, deliberately.
@@ -651,215 +735,90 @@ static func pool_capacity() -> int:
 	return POOL_CAP
 
 
-## Push a pebble onto the machine. `from` is where it physically left the bed (or
-## the hopper mouth for FRESH); `spawn_x` is the x it will re-enter the bed at, so
-## the ride ENDS exactly where the body will appear — no jump at the hand-off.
+## The x-centre of inlet LANE `lane` (0-indexed, 0 .. INLET_LANES-1), spaced one BORE_W
+## apart and centred on INLET_X — INLET_LANES=3 gives lanes at INLET_X - BORE_W, INLET_X,
+## and INLET_X + BORE_W, so every lane sits a full standard bore's width from its neighbour,
+## the same clearance every other single-pebble pipe in the plant already gets.
+static func inlet_lane_x(lane: int) -> float:
+	return INLET_X + (float(lane) - float(INLET_LANES - 1) * 0.5) * BORE_W
+
+
+## Where a newly minted (or steady-state fresh) pebble becomes a body — the top of inlet
+## LANE `lane`. It free-falls from here, under real gravity, down through the bore and onto
+## whatever is already piled against the closed floor (`INLET_FLOOR_Y`). This is the ONE
+## PIPE every pebble bound for the bed enters through (`INLET_LANES` columns inside it) —
+## see the class doc for why unifying it here is what fixes both "pebbles appear from
+## nothing" (no more `Silo.spawn_x` scatter) and "pebbles disappear for a second" (no more
+## bodiless staging).
+static func inlet_top(lane := 0) -> Vector2:
+	return Vector2(inlet_lane_x(lane), INLET_TOP_Y)
+
+
+## Where an ADMITTED pebble reappears — just below the inlet's closed floor, inside the
+## vessel proper, at the given LANE. Mirrors `drop_mouth` exactly, for exactly the same
+## reason: the floor is closed (see `inlet_walls`), so admission is a removal from the pile
+## above it and a reappearance just below, never a hole. `across`/`radius` behave like every
+## other mouth in the plant (see `drop_mouth`) — bore play so the feed does not stack into a
+## column within its own lane.
+static func inlet_admit_point(lane := 0, across := 0.0, radius := PEBBLE_R) -> Vector2:
+	return Vector2(inlet_lane_x(lane) + across * BORE_CLEARANCE, Silo.TOP + radius + 2.0)
+
+
+## How much VERTICAL room one lane of the inlet needs — above its top or below its floor —
+## before another pebble may enter or be admitted through THAT lane. Mirrors `MOUTH_CLEAR`
+## exactly, for exactly the same reason (see there): a body spawned on top of another is not
+## a queue, it is a collision the solver resolves violently.
 ##
-## `radius` is the RIDER'S OWN size, not the nominal: once size is a design lever the
-## machine carries a mix, and drawing every rider at PEBBLE_R would show a uniform
-## stream while the bed fills with pebbles of another size — the transport pipe would
-## be the one place the player's edit is invisible. It also sets the pick radius, so
-## clicking a big pebble on the conveyor hits where it actually LOOKS.
-## Defaults to PEBBLE_R so a caller that has no opinion gets today's behaviour exactly.
-func add(id: int, kind: int, from: Vector2, spawn_x: float, tint: Color,
-		radius: float = PEBBLE_R) -> void:
-	var pts := _path_for(kind, from, spawn_x)
-	var rider := {
-		"id": id, "kind": kind, "pts": pts, "d": 0.0,
-		"len": _length_of(pts), "x": spawn_x, "tint": tint, "r": radius,
-	}
-	if kind == FRESH:
-		# Arc-length to the vertex at (spawn_x, FRESH_CHUTE_Y) — pts[0..2] — everything up
-		# to and including it is FRESH's own belt; everything past it is the drop that
-		# crosses the recirc/reinject line. `advance` holds a rider at this length rather
-		# than letting it cross until `_gate_clear` says the crossing is empty.
-		rider["gate_len"] = _length_of(pts.slice(0, 3))
-	_riders.append(rider)
-
-
-## Advance every rider on the RENDER/physics clock and return those that reached
-## the end: [{id, kind, x}, ...]. Main decides what an arrival means (a RECIRC or
-## FRESH arrival joins the staging queue; a DISCHARGE arrival leaves the inventory).
-##
-## A FRESH rider carries `gate_len` (Phase 3b-iv): the arc-length just before its own drop
-## crosses the recirc/reinject line at CHUTE_Y. It is only let past that point once
-## `_gate_clear` says the crossing is empty right now — otherwise it is held EXACTLY at the
-## gate, not stopped short of it or bounced back, so it reads as a belt waiting for a clear
-## signal rather than a rider that got stuck. Checked fresh every frame it sits there, so it
-## releases the instant the crossing opens rather than on some fixed retry timer.
-func advance(delta: float) -> Array:
-	var arrived: Array = []
-	var still: Array = []
-	for r in _riders:
-		var gate: float = r.get("gate_len", -1.0)
-		var next_d: float = r["d"] + SPEED * delta
-		if gate >= 0.0 and r["d"] <= gate and next_d > gate and not _gate_clear(r):
-			next_d = gate
-		r["d"] = next_d
-		if r["d"] >= r["len"]:
-			arrived.append({"id": r["id"], "kind": r["kind"], "x": r["x"]})
-		else:
-			still.append(r)
-	_riders = still
-	return arrived
-
-
-## Is it safe for FRESH rider `r` to drop through the recirc/reinject line right now?
-##
-## Checked against every OTHER rider's CURRENT position, not against their spawn_x alone —
-## a recirc/reinject rider still approaching the crossing is exactly as much a hazard as one
-## already on top of it, which is why this is a predictive gate and not a contact test.
-func _gate_clear(r: Dictionary) -> bool:
-	var spawn_x: float = r["x"]
-	for other in _riders:
-		if other["id"] == r["id"]:
-			continue
-		if other["kind"] != RECIRC and other["kind"] != REINJECT:
-			continue
-		var pos: Vector2 = _point_at(other["pts"], other["d"])
-		if absf(pos.y - CHUTE_Y) < FRESH_GATE_Y and absf(pos.x - spawn_x) < FRESH_CLEAR_X:
-			return false
-	return true
-
-
-## Recolor one rider for the per-pebble field heatmap — the Lagrangian view should
-## not stop at the vessel wall: a hot or heavily-burned pebble stays legible while
-## it rides. No-op if the id is not on the machine.
-func set_rider_tint(id: int, tint: Color) -> void:
-	for r in _riders:
-		if r["id"] == id:
-			r["tint"] = tint
-			return
-
-
-func count() -> int:
-	return _riders.size()
-
-
-## The id of the rider under `at`, or -1 if none.
-##
-## Deliberately routed through the SAME _point_at the renderer uses: a rider's
-## position is not stored anywhere, it is derived from its arc-length each frame, so
-## a hit-test with its own idea of where riders are would drift from what is drawn
-## and the player would click a pebble and select its neighbour.
-func rider_at(at: Vector2) -> int:
-	for r in _riders:
-		if _point_at(r["pts"], r["d"]).distance_to(at) <= float(r["r"]):
-			return r["id"]
-	return -1
-
-
-## Where a rider currently is, or Vector2.INF if it is not on the machine.
-func rider_position(id: int) -> Vector2:
-	for r in _riders:
-		if r["id"] == id:
-			return _point_at(r["pts"], r["d"])
-	return Vector2.INF
-
-
-# Riders move every frame, so the machine repaints on the RENDER clock. Like the
-# rest of visualization it is a pure consumer — it may lag the sim harmlessly.
-func _process(_delta: float) -> void:
-	queue_redraw()
-
-
-## Polyline for a ride. Kept to a handful of segments on purpose — this is a
-## conveyor, not a spline system.
-##
-## A leaving pebble now routes via the OUTLET MOUTH before the sorter, rather than cutting
-## a straight diagonal from wherever it happened to be lying to the hub. Two reasons: it
-## is what metered extraction physically means (the pebble is drawn to the outlet, then
-## down the discharge pipe), and now that the vessel has a real floor and the runs are
-## real pipes, the old diagonal had pebbles drifting through 14 px of steel and entering
-## the pipe from its side. The detour is ~50 px ≈ 0.13 s of a ~2.3 s ride — absorbed by
-## LOOP_BUFFER, which is sized ~2x the measured peak-in-flight (tests/live_fuel_loop.gd
-## measures the real peak and fails if it ever reaches the buffer).
-static func _path_for(kind: int, from: Vector2, spawn_x: float) -> PackedVector2Array:
-	var hub := Vector2(Silo.CENTER_X, HUB_Y)
-	match kind:
-		# There is no DISCHARGE case, and its absence is deliberate rather than an
-		# oversight. Phase 3b-i put spent fuel on a BELT: it is a real body rolling down a
-		# real pipe, so the route it takes is the solver's answer and no longer a polyline
-		# anybody can state. Keeping the old branch "for reference" would leave a function
-		# claiming to know where discharged pebbles go while they demonstrably went
-		# wherever the physics put them — the same two-sources-of-truth drift that made
-		# `pool_slot` a liability once the pile became real (commit 7b0be70).
-		FRESH:
-			# Down out of the hopper onto FRESH's OWN belt (Phase 3b-iv), then the drop that
-			# crosses the recirc/reinject line and continues into the silo. `add()` marks the
-			# vertex just before that crossing as this rider's gate — see `_gate_clear`.
-			return PackedVector2Array([HOPPER, Vector2(HOPPER.x, FRESH_CHUTE_Y),
-					Vector2(spawn_x, FRESH_CHUTE_Y), Vector2(spawn_x, Silo.spawn_y())])
-		REINJECT:
-			# Only the TAIL, now (Phase 3b-iii) — same shape as RECIRC's below, because the
-			# climb itself is real bodies on its OWN riser (`reinject_riser_head`), not a glide
-			# through the discharge leg backwards any more. `from` is the head of that climb.
-			return PackedVector2Array([from, Vector2(spawn_x, CHUTE_Y),
-					Vector2(spawn_x, Silo.spawn_y())])
-		_:
-			# RECIRC — and only the TAIL of it, which is why this is now three points and not
-			# seven. Phase 3b-ii made the climb real: a recirculating pebble is a BODY from the
-			# drop mouth, out along the duct and all the way up the riser, and it becomes a
-			# rider only when main lifts it off the head of the climb (`main._board_chute`). So
-			# `from` here is the top of the riser, not the bed, and all that is left to ride is
-			# the chute and the drop into the spawn band.
-			#
-			# WHY THE CHUTE STAYS A RIDE while everything below it is bodies — two reasons, and
-			# the second is the one that settles it:
-			#   * The chute's exit is each pebble's OWN spawn_x. That is a hole that MOVES from
-			#     pebble to pebble, and a hole that moves cannot be walled.
-			#   * Admission to the bed is GATED — the bed is held at exactly TARGET_POPULATION,
-			#     and `main._queue`/`_spawn_from_queue` is what pins it. A real chute would mean
-			#     bodies physically queued on a running belt whenever the bed is full: a jam
-			#     built on purpose, and one that would put the calibrated count at the mercy of
-			#     the solver. The ride costs nothing to hold and keeps the gate exactly where it
-			#     already is.
-			return PackedVector2Array([from, Vector2(spawn_x, CHUTE_Y),
-					Vector2(spawn_x, Silo.spawn_y())])
+## Checked AXIS-ALIGNED, not as a Euclidean radius (see `main._lane_clear`): a circular
+## clearance this size around one lane's point would reach across `INLET_LANE_HALF_WIDTH`
+## into its neighbour and false-block it — exactly the "every lane blocks the next one"
+## failure that would defeat the whole point of widening the pipe. Splitting into a Y
+## distance (this) and a narrow X band (`INLET_LANE_HALF_WIDTH`) keeps lanes independent.
+const INLET_MOUTH_CLEAR := BORE_W + 2.0
+# Half-width of the X band a lane's own clearance check looks at. Narrower than half the
+# lane pitch (BORE_W * 0.5) so a body sitting in the ADJACENT lane — up to BORE_CLEARANCE of
+# bore play from ITS OWN centre — is never mistaken for one in this lane.
+const INLET_LANE_HALF_WIDTH := BORE_W * 0.35
 
 
 ## The fixed pipework, as POLYLINES (not loose segments) so every interior vertex is a
 ## real elbow the draw can fit a bend to.
 ##
-## These are the same coordinates _path_for rides along, so a rider is always centred in
-## its bore by construction — the pipe cannot drift away from the path it carries.
+## These are the same coordinates the walls (`plant_walls`/`inlet_walls`) are built from,
+## so a body is always centred in its bore by construction — the pipe cannot drift away
+## from the physics it draws.
+##
+## The inlet bore itself is NOT here — it is `INLET_BORE_W` wide, wider than every other
+## run in the plant (`BORE_W`), so it has to be drawn in its own pass at its own width (see
+## `_inlet_bore_run`/`_draw_plant`) rather than sharing one uniform-width pass with these.
 static func _pipe_runs() -> Array:
 	var hub := Vector2(Silo.CENTER_X, HUB_Y)
 	return [
 		# Outlet → sorter. Starts flush with the hopper's inner floor face and pierces the
 		# vessel wall, so the discharge pipe is visibly socketed into the bottom of the core.
 		PackedVector2Array([Vector2(Silo.CENTER_X, Silo.OUTLET_Y), hub]),
-		# Sorter → riser → chute → reinject's own riser: the RECIRC/REINJECT belt. Two legs
-		# merge onto this feed — recirculated fuel from the right, re-injected fuel from the
-		# far left where its own riser meets the chute (Phase 3b-iii). FRESH no longer joins
-		# here (Phase 3b-iv: it has its own line, above — see `_fresh_pipe_runs`), so this run
-		# is back to exactly the two legs its name says.
+		# Sorter → riser → bend → the shared inlet: the RECIRC leg (Phase 3c retired its old
+		# rider tail, which used to end at REINJECT_X on this same run — the two legs now
+		# merge at the inlet instead of on top of each other).
 		PackedVector2Array([hub, Vector2(RISER_X, HUB_Y), Vector2(RISER_X, CHUTE_Y),
-				Vector2(REINJECT_X, CHUTE_Y)]),
+				Vector2(INLET_X, CHUTE_Y)]),
 		# Sorter → spent pool (the discharge leg), ending at the mouth it pours from.
-		# No fudge factor between the pipe's end and the ride's end any more: they are the
+		# No fudge factor between the pipe's end and the belt's end any more: they are the
 		# same point, so the pebble becomes a body exactly where it was last drawn.
 		PackedVector2Array([hub, Vector2(BIN_X, HUB_Y), Vector2(BIN_X, BIN_Y)]),
-		# Reinject's own riser (Phase 3b-iii): beside the pool, up to where it joins the
-		# recirc/reinject line above. This is the one run in the plant with no matching entry
-		# above it that it shares a mouth with — it has its own, `reinject_mouth`.
-		PackedVector2Array([Vector2(REINJECT_X, POOL_FLOOR), Vector2(REINJECT_X, CHUTE_Y)]),
+		# Reinject's own riser (Phase 3b-iii) → its own bend → the shared inlet (Phase 3c).
+		PackedVector2Array([Vector2(REINJECT_X, POOL_FLOOR), Vector2(REINJECT_X, CHUTE_Y),
+				Vector2(INLET_X, CHUTE_Y)]),
 	]
 
 
-## FRESH's own line (Phase 3b-iv) — drawn and driven separately from `_pipe_runs` above, a
-## thinner feed sitting ABOVE the recirc/reinject chute rather than sharing it. See
-## FRESH_CHUTE_Y / FRESH_BORE_W for why the two lines needed separating at all.
-static func _fresh_pipe_runs() -> Array:
-	return [
-		# Hopper → FRESH's own belt.
-		PackedVector2Array([Vector2(HOPPER.x, HOPPER.y), Vector2(HOPPER.x, FRESH_CHUTE_Y)]),
-		# FRESH's own horizontal run. Only needs to reach right of the hopper — every
-		# spawn_x it is ever handed lands inside the vessel, which is entirely to the
-		# hopper's right — so, unlike the recirc/reinject line, it does not need to reach
-		# REINJECT_X on the left.
-		PackedVector2Array([Vector2(HOPPER.x, FRESH_CHUTE_Y), Vector2(RISER_X, FRESH_CHUTE_Y)]),
-	]
+## The shared inlet bore itself (Phase 3c, widened for `INLET_LANES`): the ONE visible pipe
+## every pebble bound for the bed falls through. Fresh fuel drops straight down it from
+## `inlet_top`; the two runs `_pipe_runs` draws join it partway down, at the bend height.
+## Its own function (not folded into `_pipe_runs`) because it draws at `INLET_BORE_W`, not
+## the uniform `BORE_W` every other run shares.
+static func _inlet_bore_run() -> PackedVector2Array:
+	return PackedVector2Array([Vector2(INLET_X, INLET_TOP_Y), Vector2(INLET_X, INLET_FLOOR_Y)])
 
 
 ## One pass of pipe: a line of `w` along every run, plus a disc of `w/2` at every vertex.
@@ -895,66 +854,44 @@ func _pipe_outline(runs: Array, half_w: float) -> void:
 			draw_polyline(ring + PackedVector2Array([ring[0]]), PIPE_EDGE, 1.0)
 
 
-static func _length_of(pts: PackedVector2Array) -> float:
-	var total := 0.0
-	for i in range(1, pts.size()):
-		total += pts[i].distance_to(pts[i - 1])
-	return maxf(total, 0.001)
-
-
-## Position at arc-length d along the polyline.
-static func _point_at(pts: PackedVector2Array, d: float) -> Vector2:
-	var left := d
-	for i in range(1, pts.size()):
-		var seg := pts[i].distance_to(pts[i - 1])
-		if left <= seg:
-			return pts[i - 1].lerp(pts[i], left / maxf(seg, 0.001))
-		left -= seg
-	return pts[pts.size() - 1]
-
-
 func _draw() -> void:
 	_draw_plant()
-	# Riders on top of their pipework.
-	for r in _riders:
-		var p: Vector2 = _point_at(r["pts"], r["d"])
-		var rr: float = r["r"]
-		draw_circle(p, rr, r["tint"])
-		draw_arc(p, rr, 0.0, TAU, 12, Color(0, 0, 0, 0.35), 1.0)
+	# No rider pass any more (Phase 3c) — every pebble in the plant is a real physics body
+	# now, and bodies draw themselves (`PebbleBody._draw`), the same way the pool's pile
+	# always has. This node only draws the fixed pipework and captions around them.
 
 
-## The static plant: pipework, the sorter, the bin, the hopper. Drawn every frame with
-## the riders (one Node2D, one pass) — trivial next to the bed.
+## The static plant: pipework, the sorter, the bin, the inlet. Drawn on demand
+## (`queue_redraw`, e.g. from `set_pool`) rather than every frame — nothing here animates
+## any more since the riders are gone.
 func _draw_plant() -> void:
 	var hub := Vector2(Silo.CENTER_X, HUB_Y)
 	var runs := _pipe_runs()
-	var fresh_runs := _fresh_pipe_runs()
+
+	var inlet_run := [_inlet_bore_run()]
 
 	# The pipe is built from outside in: the casing wall, then the hollow bore inset into
 	# it, then (below) the bore's outline. Drawing whole PASSES — every run's casing before
 	# any run's bore — rather than finishing each run in turn is what makes the junctions
-	# work: three pipes meet at the sorter, and a later run's casing would otherwise paint
-	# over an earlier run's bore and plug it.
+	# work: multiple pipes meet at the sorter and at the inlet, and a later run's casing
+	# would otherwise paint over an earlier run's bore and plug it. The wide inlet run gets
+	# its own pass at `INLET_CASING_W`/`INLET_BORE_W`, but stays in the SAME casing-then-bore
+	# ordering as everything else, for the same junction reason.
 	_pipe_pass(runs, CASING_W, PIPE_CASING)
+	_pipe_pass(inlet_run, INLET_CASING_W, PIPE_CASING)
 	_pipe_pass(runs, BORE_W, PIPE_BORE)
-	# FRESH's own line, thinner (FRESH_BORE_W < BORE_W — see the constant), drawn as its own
-	# pass rather than folded into `runs`: the two lines sit close enough (Phase 3b-iv put
-	# only ~20 px between them, see FRESH_CHUTE_Y) that mixing them into one pass-per-width
-	# loop would paint one line's casing over the other's bore wherever they graze.
-	_pipe_pass(fresh_runs, FRESH_CASING_W, PIPE_CASING)
-	_pipe_pass(fresh_runs, FRESH_BORE_W, PIPE_BORE)
-
+	_pipe_pass(inlet_run, INLET_BORE_W, PIPE_BORE)
 	_pipe_outline(runs, BORE_W * 0.5)
-	_pipe_outline(fresh_runs, FRESH_BORE_W * 0.5)
+	_pipe_outline(inlet_run, INLET_BORE_W * 0.5)
 
-	# Where hopper's own drop MEETS FRESH's belt (Phase 3b-iv): a T-fitting, the same
-	# treatment the old hopper/chute merge used before FRESH got its own line — this really
-	# is where fuel from the hopper joins the belt that carries it into the vessel, so
-	# drawing it both states the mechanism and covers the seam.
-	var merge := Vector2(HOPPER.x, FRESH_CHUTE_Y)
-	draw_circle(merge, FRESH_CASING_W * 0.5, PIPE_CASING)
-	draw_circle(merge, FRESH_BORE_W * 0.5, PIPE_BORE)
-	draw_arc(merge, FRESH_CASING_W * 0.5, 0.0, TAU, 24, PIPE_EDGE, 1.0)
+	# The inlet's closed floor (`INLET_FLOOR_Y`, `inlet_walls`), drawn as a cap across the
+	# bore so the plant shows what the physics already has: a real, closed door, not an
+	# open pipe — this is what a waiting pebble is resting ON, and what disappears for the
+	# instant `main._admit_batch` opens it.
+	var inlet_half := INLET_BORE_W * 0.5
+	draw_line(Vector2(INLET_X - inlet_half, INLET_FLOOR_Y), Vector2(INLET_X + inlet_half, INLET_FLOOR_Y),
+			PIPE_EDGE, 2.0)
+	_label("NEW FUEL", Vector2(INLET_X - 26.0, INLET_TOP_Y - 6.0))
 
 	# The sorter — this is the recirculate-vs-discharge DECISION made visible
 	# (main._extract_lowest): a pebble under discharge burnup turns right and goes
@@ -989,15 +926,6 @@ func _draw_plant() -> void:
 	if _pool_shipped > 0:
 		caption += "  (%d held, %d to cask)" % [_pool_held, _pool_shipped]
 	_label(caption, Vector2(POOL_LEFT + 2.0, POOL_FLOOR - POOL_H - 6.0))
-
-	# Fresh-fuel hopper — drawn as a funnel feeding FRESH's own belt.
-	var hop := PackedVector2Array([
-		Vector2(HOPPER.x - 30.0, HOPPER.y - 26.0), Vector2(HOPPER.x + 30.0, HOPPER.y - 26.0),
-		Vector2(HOPPER.x + 9.0, HOPPER.y + 8.0), Vector2(HOPPER.x - 9.0, HOPPER.y + 8.0),
-	])
-	draw_colored_polygon(hop, Color(0.07, 0.11, 0.09, 0.92))
-	draw_polyline(hop + PackedVector2Array([hop[0]]), Color(0.4, 0.6, 0.48, 0.8), 1.5)
-	_label("FRESH", Vector2(HOPPER.x - 20.0, HOPPER.y - 32.0))
 
 
 func _label(text: String, at: Vector2) -> void:
