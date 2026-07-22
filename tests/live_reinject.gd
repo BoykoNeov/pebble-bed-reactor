@@ -42,18 +42,14 @@ const ACT_AT := 80.0
 # real landing signal (`_out_of_core` clearing) instead of asserting at one guessed instant,
 # generously bounded rather than tuned to a number that could still be too tight some runs.
 #
-# ⚠️ KNOWN FAILING (Phase 3c) — do not raise this to "fix" the test. Root-caused: the shared
-# inlet bore (66x100px) cannot hold the pile LOOP_BUFFER's sizing produces (measured 33-35
-# bodies backed up against a bore that fits roughly half that), so once the bore saturates the
-# overflow spills sideways through the open corridor-entry band above `merge_floor` and jams
-# both merge runs — a re-injected pebble can get wedged in that spill and never reach the bore
-# at all, no matter how long this waits. See FuelLoop.inlet_walls' "open air above merge_floor"
-# reasoning, which assumed only a transient single-body overshoot, not a standing pile deep
-# enough to occupy that same space. The fix is a real design tradeoff (shrink LOOP_BUFFER,
-# widen the bore, or change admission cadence) and is not this test's to make — per project
-# convention this stays RED, honestly, until that decision is made and the geometry/sizing is
-# actually fixed. Raising ARRIVE_GIVEUP further would not help: the traced pebble does not
-# trend toward the bore even over 90s, it drifts away from it.
+# ⚠️ FORMERLY KNOWN FAILING — see [[reinject-inlet-bore-overflow]] in project memory. The
+# shared inlet bore (was 66px wide) could not hold the pile LOOP_BUFFER's sizing produces
+# under real operation (measured 33-35 bodies backed up against a bore sized for ~half that),
+# so once it saturated the overflow spilled sideways through the open corridor-entry band
+# above `merge_floor` and jammed both merge runs — a re-injected pebble got wedged in that
+# spill and never reached the bore at all, no matter how long this waited. FIXED by widening
+# `FuelLoop.INLET_BORE_W` (66 -> 240), decoupled from `INLET_LANES` so lane throughput is
+# unchanged; verified against this exact test.
 const ARRIVE_GIVEUP := 90.0
 
 var _main

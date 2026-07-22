@@ -98,10 +98,29 @@ const INLET_FLOOR_Y := Silo.TOP - 4.0
 # vessel is built around — visually and physically one source, just a wider one, not N
 # independent entry points scattered across the top the way `Silo.spawn_x` used to be.
 const INLET_LANES := 3
-# The bore's total width: enough for INLET_LANES columns each BORE_W apart (see
-# `inlet_lane_x`), so adjacent lanes get a full standard bore's clearance from each other —
-# the same spacing every other pipe in the plant already uses for one pebble.
-const INLET_BORE_W := float(INLET_LANES) * BORE_W
+# The bore's CONTAINMENT width — deliberately NOT `INLET_LANES * BORE_W` any more (that was
+# 66px). See [[reinject-inlet-bore-overflow]] in project memory for the full story: under
+# real sustained operation the pile waiting at the inlet (bounded by `main.LOOP_BUFFER=48`)
+# measured 33-35 bodies deep, more than double what a 66px-wide bore can hold, and once it
+# saturated the excess had nowhere to go but sideways — spilling out through the open-air
+# gap above `merge_floor` (see `inlet_walls`) and physically jamming both merge runs, most
+# visibly stranding a re-injected pebble ~160px short of the bore.
+#
+# WIDENED, not deepened or re-walled: the fully-contained floor band (`merge_floor` to
+# `INLET_FLOOR_Y`, only 30px tall) can't be made much taller without eating into the bed
+# itself, and extending the SIDE walls up past `merge_floor` was tried in reasoning and
+# rejected — a body arriving off either merge run is *itself* still elevated above
+# `merge_floor` in the ordinary case (measured y≈56 on delivery, not the y≈75 corridor
+# centreline), so a full-height wall at the bore's own edge would trap ordinary arrivals,
+# not just the overflow — the exact failure the "open air above merge_floor" comment below
+# already documents from the FIRST time this was tried. Widening sideways instead multiplies
+# the contained floor area directly and, as a free side effect, shrinks the merge-roof
+# "shelf" on both sides (`inlet_walls`' recirc/reinject roof segments run from the riser's
+# near edge to `inlet_l`/`inlet_r` — moving those out means less shelf for a spill to reach).
+# 240px clears the vessel's own side walls (Silo.LEFT/RIGHT = 560/900) with ~50px margin on
+# each side, and clears both risers (REINJECT_X=380, RISER_X=975) with well over 100px to
+# spare — nowhere near either corridor's own geometry.
+const INLET_BORE_W := 240.0
 const INLET_CASING_W := INLET_BORE_W + 2.0 * PIPE_WALL
 # REINJECT's own riser (Phase 3b-iii). A belt runs ONE way, and re-injection is the discharge
 # leg backwards, so it needs a route the discharge leg is not already using. Both routes the
