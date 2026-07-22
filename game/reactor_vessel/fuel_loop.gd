@@ -317,29 +317,6 @@ const PEBBLE_R := 8.0
 # with RECIRC/REINJECT — real collision handles that now, at the merge itself).
 const BORE_CLEARANCE := 3.0
 const BORE_W := 2.0 * (PEBBLE_R + BORE_CLEARANCE)
-# The two vertical CLIMBS (RECIRC's main riser and REINJECT's own) get double BORE_W, not
-# the standard bore every other leg uses.
-#
-# NOT WHAT FIXED THE JAM — say that plainly, because an earlier version of this comment
-# claimed otherwise. The actual bug (tests/live_fuel_policy.gd: 45 recirculations, then the
-# whole fuel cycle froze for good — one pebble stuck blocks `_extract_lowest`'s
-# core-count->=-setpoint gate forever) turned out to be TWO missing wall gaps in
-# `inlet_walls` (see there), not a granular arch. PROVEN by elimination, not assumed: this
-# widening, and separately a 10x BELT_FORCE increase, were BOTH tried first and BOTH left
-# the exact same pebble frozen at the exact same tick — real physics changes that changed
-# nothing are the signature of a logic gap, not an undersized channel. Once the wall gaps
-# were fixed, a controlled revert of ONLY this constant (RISER_BORE_W := BORE_W) ran the
-# same 100s sustained-load probe with IDENTICAL results (recirc climbing to 324, transit
-# stable at 12-15, both runs) — so this widening is not load-bearing for the fix at all.
-#
-# Kept anyway as headroom, not as the fix: it was the user's own explicitly chosen direction
-# ("widen the riser bore") before the real cause was known, and it does raise the riser's
-# pebble-diameter-to-bore ratio away from the classic narrow-chute jamming zone (~1.4x is
-# the danger band; this sits at ~2.75x nominal / ~2x at RADIUS_MAX) — genuine margin against
-# a DIFFERENT failure mode from the one that actually happened, even though it happens not
-# to have been needed this time. Flagged to the user as droppable if they'd rather keep the
-# geometry simple now that its premise (this is what fixes the freeze) is known false.
-const RISER_BORE_W := 2.0 * BORE_W
 # Wall thickness of the pipe itself, per side. 3 px was tried first and rendered as a
 # hairline — the pipe read as an outlined slot rather than something with walls. 6 px is
 # what makes the casing legible at this zoom; it also roughly matches the vessel's own
@@ -403,20 +380,14 @@ var _pool_shipped := 0   # of those, the ones the full pool sent to a cask
 ## — the alternative is a wall that recirculating fuel cannot get past either.
 static func plant_walls() -> Array:
 	var half := BORE_W * 0.5
-	# The two climbs are wider than every other leg (see RISER_BORE_W) — this is the ONLY
-	# thing that changes for the anti-jam fix. `riser_l`/`riser_r` also close off the duct's
-	# own roof/floor spans below, so widening them alone opens a funnel from the standard-
-	# width duct into the wider climb, exactly where a real transfer would flare — no new
-	# wall segments needed, just wider values for the two endpoints every span already shared.
-	var riser_half := RISER_BORE_W * 0.5
 	var drop_l := Silo.CENTER_X - half       # the drop's left face
 	var drop_r := Silo.CENTER_X + half       # the drop's right face
 	var roof := HUB_Y - half                 # the duct's upper face
 	var floor_y := HUB_Y + half              # the duct's lower face — what pebbles roll on
 	var mouth_l := BIN_X - half              # the pool mouth's far side
 	var mouth_r := BIN_X + half              # where the floor stops and the pebble tips off
-	var riser_l := RISER_X - riser_half      # the riser's left face
-	var riser_r := RISER_X + riser_half      # the riser's right face
+	var riser_l := RISER_X - half            # the riser's left face
+	var riser_r := RISER_X + half            # the riser's right face
 	# The climb's walls stop exactly AT the chute line, not past it. This used to carry a
 	# bore's half-width further UP (smaller y) than CHUTE_Y, on the old rider design's
 	# reasoning: main REMOVED the body at CHUTE_Y, so the walls had to still be there for
@@ -437,8 +408,8 @@ static func plant_walls() -> Array:
 	# gaps) — this fix closes one real dead pocket on the climb, not the delivery freeze
 	# itself, which needed both.
 	var riser_top := CHUTE_Y
-	var rx_l := REINJECT_X - riser_half      # reinject riser's left face
-	var rx_r := REINJECT_X + riser_half      # reinject riser's right face
+	var rx_l := REINJECT_X - half            # reinject riser's left face
+	var rx_r := REINJECT_X + half            # reinject riser's right face
 	return [
 		# --- The drop: outlet → duct. BOTH faces stop at the roof, and symmetrically:
 		# below that line is the duct, and either face carried further would wall the duct
@@ -500,7 +471,6 @@ static func plant_walls() -> Array:
 ## opens up at a junction rather than staying pipe-width throughout.
 static func inlet_walls() -> Array:
 	var half := BORE_W * 0.5
-	var riser_half := RISER_BORE_W * 0.5
 	var inlet_half := INLET_BORE_W * 0.5
 	var inlet_l := INLET_X - inlet_half
 	var inlet_r := INLET_X + inlet_half
@@ -520,8 +490,8 @@ static func inlet_walls() -> Array:
 	# comment already states this principle for the INLET side of these walls ("stop short of
 	# the inlet bore... leaving the bore itself open top to bottom") — this was simply never
 	# applied to the RISER side too.
-	var riser_l := RISER_X - riser_half
-	var rx_r := REINJECT_X + riser_half
+	var riser_l := RISER_X - half
+	var rx_r := REINJECT_X + half
 	var merge_roof := CHUTE_Y - half
 	var merge_floor := CHUTE_Y + half
 	return [
@@ -881,46 +851,24 @@ const INLET_LANE_HALF_WIDTH := BORE_W * 0.5
 ## The inlet bore itself is NOT here — it is `INLET_BORE_W` wide, wider than every other
 ## run in the plant (`BORE_W`), so it has to be drawn in its own pass at its own width (see
 ## `_inlet_bore_run`/`_draw_plant`) rather than sharing one uniform-width pass with these.
-##
-## THE TWO VERTICAL CLIMBS ARE ALSO NOT HERE, for the same reason (anti-jam widening,
-## `RISER_BORE_W` — see its own comment) — see `_riser_climb_runs`. What stays here is each
-## climb's duct/merge-run NEIGHBOURS at their ORIGINAL width: the horizontal hop from the
-## sorter to the foot of the recirc riser, and each riser's merge run out to the shared
-## inlet. Splitting a run that used to be one polyline costs nothing at the joints — the
-## elbow discs `_pipe_pass` draws at every vertex already cover the seam.
 static func _pipe_runs() -> Array:
 	var hub := Vector2(Silo.CENTER_X, HUB_Y)
 	return [
 		# Outlet → sorter. Starts flush with the hopper's inner floor face and pierces the
 		# vessel wall, so the discharge pipe is visibly socketed into the bottom of the core.
 		PackedVector2Array([Vector2(Silo.CENTER_X, Silo.OUTLET_Y), hub]),
-		# Sorter → foot of the RECIRC riser (duct portion only — the climb itself is drawn
-		# wider, separately, by `_riser_climb_runs`).
-		PackedVector2Array([hub, Vector2(RISER_X, HUB_Y)]),
-		# RECIRC's bend → the shared inlet (merge run only; the climb below is wider).
-		PackedVector2Array([Vector2(RISER_X, CHUTE_Y), Vector2(INLET_X, CHUTE_Y)]),
+		# Sorter → riser → bend → the shared inlet: the RECIRC leg (Phase 3c retired its old
+		# rider tail, which used to end at REINJECT_X on this same run — the two legs now
+		# merge at the inlet instead of on top of each other).
+		PackedVector2Array([hub, Vector2(RISER_X, HUB_Y), Vector2(RISER_X, CHUTE_Y),
+				Vector2(INLET_X, CHUTE_Y)]),
 		# Sorter → spent pool (the discharge leg), ending at the mouth it pours from.
 		# No fudge factor between the pipe's end and the belt's end any more: they are the
 		# same point, so the pebble becomes a body exactly where it was last drawn.
 		PackedVector2Array([hub, Vector2(BIN_X, HUB_Y), Vector2(BIN_X, BIN_Y)]),
-		# REINJECT's own bend (Phase 3b-iii) → the shared inlet (merge run only; its climb,
-		# beside the pool, is wider — see `_riser_climb_runs`).
-		PackedVector2Array([Vector2(REINJECT_X, CHUTE_Y), Vector2(INLET_X, CHUTE_Y)]),
-	]
-
-
-## The two vertical CLIMBS — RECIRC's main riser and REINJECT's own — drawn in their own
-## pass at `RISER_BORE_W`, wider than every other run in the plant. Same reason
-## `_inlet_bore_run` is split out, and the same anti-jam widening documented at
-## `RISER_BORE_W`'s own declaration: a queue of bodies climbing against gravity in the
-## standard bore locked into a permanent static arch (measured, tests/live_fuel_policy.gd),
-## and doubling the width is what fixed it. The physics walls (`plant_walls`) already widen
-## to match; this is what makes the drawn pipe the wall the pebble actually rolls against,
-## same discipline as everywhere else in this file.
-static func _riser_climb_runs() -> Array:
-	return [
-		PackedVector2Array([Vector2(RISER_X, HUB_Y), Vector2(RISER_X, CHUTE_Y)]),
-		PackedVector2Array([Vector2(REINJECT_X, POOL_FLOOR), Vector2(REINJECT_X, CHUTE_Y)]),
+		# Reinject's own riser (Phase 3b-iii) → its own bend → the shared inlet (Phase 3c).
+		PackedVector2Array([Vector2(REINJECT_X, POOL_FLOOR), Vector2(REINJECT_X, CHUTE_Y),
+				Vector2(INLET_X, CHUTE_Y)]),
 	]
 
 
@@ -981,26 +929,20 @@ func _draw_plant() -> void:
 	var runs := _pipe_runs()
 
 	var inlet_run := [_inlet_bore_run()]
-	var riser_runs := _riser_climb_runs()
-	var riser_casing_w := RISER_BORE_W + 2.0 * PIPE_WALL
 
 	# The pipe is built from outside in: the casing wall, then the hollow bore inset into
 	# it, then (below) the bore's outline. Drawing whole PASSES — every run's casing before
 	# any run's bore — rather than finishing each run in turn is what makes the junctions
 	# work: multiple pipes meet at the sorter and at the inlet, and a later run's casing
 	# would otherwise paint over an earlier run's bore and plug it. The wide inlet run gets
-	# its own pass at `INLET_CASING_W`/`INLET_BORE_W`, and the two climbs their own at
-	# `riser_casing_w`/`RISER_BORE_W`, but all stay in the SAME casing-then-bore ordering as
-	# everything else, for the same junction reason.
+	# its own pass at `INLET_CASING_W`/`INLET_BORE_W`, but stays in the SAME casing-then-bore
+	# ordering as everything else, for the same junction reason.
 	_pipe_pass(runs, CASING_W, PIPE_CASING)
 	_pipe_pass(inlet_run, INLET_CASING_W, PIPE_CASING)
-	_pipe_pass(riser_runs, riser_casing_w, PIPE_CASING)
 	_pipe_pass(runs, BORE_W, PIPE_BORE)
 	_pipe_pass(inlet_run, INLET_BORE_W, PIPE_BORE)
-	_pipe_pass(riser_runs, RISER_BORE_W, PIPE_BORE)
 	_pipe_outline(runs, BORE_W * 0.5)
 	_pipe_outline(inlet_run, INLET_BORE_W * 0.5)
-	_pipe_outline(riser_runs, RISER_BORE_W * 0.5)
 
 	# The inlet's closed floor (`INLET_FLOOR_Y`, `inlet_walls`), drawn as a cap across the
 	# bore so the plant shows what the physics already has: a real, closed door, not an
