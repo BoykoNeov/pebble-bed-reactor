@@ -1253,6 +1253,9 @@ func _belt_step() -> void:
 			# `_out_of_core`, and has just crossed into the shared inlet bore — it simply
 			# rests there now, piled against the closed floor like any other pebble
 			# waiting for `_admit_batch` to let it into the bed. No hand-off, no rider.
+			# It is free to sleep again — the belt guard (`set_can_sleep`) only needed to
+			# hold while something was actively driving it.
+			_physics.set_can_sleep(id, true)
 			continue
 		_pool_admit(_pebbles[id])
 		# THE discharge counter, and it lives here rather than in `_pool_admit` because this
@@ -1860,6 +1863,10 @@ func _feed_drop() -> void:
 	# grey: under a per-pebble field the pebble the player is following must not blink.
 	_physics.set_pebble_tint(peb.id, _pebble_tint(peb))
 	_transit[peb.id] = next["leg"]
+	# A belt-driven body must never sleep mid-journey — a sleeping RigidBody2D ignores
+	# apply_force entirely, and nothing else wakes it once the rest of the queue behind it
+	# is asleep too (see PhysicsBackend.set_can_sleep). Restored once it lands (`_belt_step`).
+	_physics.set_can_sleep(peb.id, false)
 
 
 ## Is there room at the mouth for one more pebble?
@@ -1899,6 +1906,7 @@ func _feed_reinject() -> void:
 	# default it on.
 	_physics.set_pebble_tint(peb.id, _pebble_tint(peb))
 	_transit[peb.id] = FuelLoop.REINJECT
+	_physics.set_can_sleep(peb.id, false)   # see _feed_drop's identical guard
 
 
 func _reinject_mouth_clear() -> bool:

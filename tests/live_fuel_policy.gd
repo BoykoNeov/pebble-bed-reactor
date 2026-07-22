@@ -274,12 +274,15 @@ func _phase_wave() -> void:
 	_ok(_main._total_shipped > 0,
 		"...and this wave really did overflow it, so the cask path is exercised (%d shipped)"
 			% _main._total_shipped)
-	# The bed stays pinned at its calibrated population THROUGH the wave — fresh fuel
-	# replaces the discharged 1:1. A wave that drained the bed would walk k off calibration
-	# for reasons that have nothing to do with the policy (the LOOP_BUFFER hazard).
-	_ok(_main._core_count() == _main.TARGET_POPULATION,
-		"the bed stays pinned at its calibrated population through the wave (%d / %d)"
-			% [_main._core_count(), _main.TARGET_POPULATION])
+	# The bed stays near its setpoint THROUGH the wave — fresh fuel replaces the discharged
+	# close to 1:1. Phase 3c's inlet fills against continuous extraction rather than hard-
+	# pinning the count, so a few pebbles of oscillation below setpoint is the honest
+	# behavior, not drift; but a wave that actually DRAINED the bed would walk k off
+	# calibration for reasons that have nothing to do with the policy (the LOOP_BUFFER
+	# hazard), so this still fails hard on real loss, just not on the pin's exact equality.
+	_ok(_main._core_count() >= _main._population_setpoint - 5,
+		"the bed stays near its setpoint through the wave, not draining (%d / %d)"
+			% [_main._core_count(), _main._population_setpoint])
 
 	# Restoring the policy must restore the cycle: the backlog is a property of the RULE,
 	# not damage done to the fuel. Nothing was burned by moving the knob — put it back and

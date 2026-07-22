@@ -47,6 +47,17 @@ var _drop_pending_last_size := -1
 var _drop_pending_last_change_t := 0.0
 var _drop_pending_stuck := false
 
+# Snapshot at the HALFWAY point of the loop-watch window, so the final report can assert the
+# loop made real progress in the back half — not just that recirc+extract is nonzero overall.
+# A cumulative "moved SOME pebbles" check is satisfiable by a burst that happens once, early,
+# then jams solid for good (measured: exactly this shape shipped green once — a wall-gap bug
+# let ~45 pebbles cycle before freezing the whole fuel cycle permanently, and the cumulative
+# check never noticed because the burst alone cleared it). A back-half delta cannot be fooled
+# that way: it is zero unless the loop is still genuinely running near the end of the watch.
+var _halfway_recirc := -1
+var _halfway_extracted := -1
+var _halfway_taken := false
+
 var _checks := 0
 var _failures := 0
 
@@ -107,6 +118,10 @@ func _process(delta: float) -> bool:
 				return true
 		"looping":
 			_watch_drop_pending()
+			if not _halfway_taken and _t - _full_at_t > LOOP_WATCH_FOR * 0.5:
+				_halfway_taken = true
+				_halfway_recirc = _main._total_recirculated
+				_halfway_extracted = _main._total_extracted
 			if _t - _full_at_t > LOOP_WATCH_FOR:
 				_phase = "done"
 				_report()
@@ -179,9 +194,17 @@ func _report() -> void:
 	_check(_escaped.is_empty(), "no body was ever flung out of the plant's bounds (%d escaped)" % _escaped.size())
 	if _full_at_t >= 0.0:
 		_check(not _drop_pending_stuck, "the shared drop never got stuck for the loop-watch window")
-		_check(_main._total_recirculated + _main._total_extracted > 0,
-			"the loop actually moved pebbles once the bed was full (recirc+extract = %d)"
-				% [_main._total_recirculated + _main._total_extracted])
+		# BACK-HALF DELTA, not a cumulative total: a total > 0 is satisfied by a burst that
+		# runs once early and then jams for good — measured, this exact shape shipped green
+		# once (a wall-gap bug let ~45 pebbles cycle through before permanently freezing the
+		# whole fuel cycle, and "recirc+extract > 0" never noticed). Comparing the SECOND half
+		# of the watch against the snapshot taken at the halfway point catches a freeze
+		# anywhere in the back half, not just a total absence of ever moving anything.
+		var recirc_progress: int = _main._total_recirculated - _halfway_recirc
+		var extracted_progress: int = _main._total_extracted - _halfway_extracted
+		_check(_halfway_taken and recirc_progress + extracted_progress > 0,
+			"the loop keeps moving pebbles through the SECOND half of the watch, not just an early burst (+%d recirc, +%d extracted since the halfway mark)"
+				% [recirc_progress, extracted_progress])
 		_check(_main._core_count() >= FILL_SETPOINT - 5,
 			"the bed HELD near setpoint through the loop-watch window, not draining (%d/%d)"
 				% [_main._core_count(), FILL_SETPOINT])

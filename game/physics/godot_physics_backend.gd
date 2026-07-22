@@ -90,6 +90,14 @@ func set_continuous_cd(id: int, on: bool) -> void:
 				else RigidBody2D.CCD_MODE_DISABLED
 
 
+func set_can_sleep(id: int, on: bool) -> void:
+	var body: PebbleBody = _bodies.get(id)
+	if body != null:
+		body.can_sleep = on
+		if not on:
+			body.sleeping = false
+
+
 func set_pebble_tint(id: int, color: Color) -> void:
 	var body: PebbleBody = _bodies.get(id)
 	if body != null:

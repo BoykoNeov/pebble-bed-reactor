@@ -108,6 +108,27 @@ func set_continuous_cd(_id: int, _on: bool) -> void:
 	pass
 
 
+## Allow (or forbid) the engine's own sleep system to park this body.
+##
+## A sleeping RigidBody2D ignores `apply_force` entirely until something collides it awake —
+## Godot's normal, correct behavior for a settled bed (380 pebbles resting quietly should not
+## burn cycles), but the wrong behavior for a body a BELT is actively driving: a transit
+## pebble that dips under the linear sleep threshold for a moment (queued behind others,
+## momentarily stalled at a corner) could go to sleep mid-journey, at which point the belt's
+## force becomes a no-op and nothing wakes it on its own.
+##
+## NOT WHAT CAUSED the one real freeze this project hit (`tests/live_fuel_policy.gd`, a
+## permanently frozen recirc column that halted the whole fuel cycle) — that was a genuine
+## missing-wall-gap bug (see `FuelLoop.inlet_walls`), confirmed by instrumenting the actual
+## stuck body: `sleeping` read `false` throughout, this guard forcing `can_sleep=false` on it
+## changed nothing, and the freeze persisted until the real walls were fixed. Kept anyway as
+## deliberate, cheap defensive hardening against a real hazard this investigation surfaced,
+## not as evidence it was ever triggered — a transit body sleeping mid-belt is still a
+## plausible failure mode even though it wasn't THIS one.
+func set_can_sleep(_id: int, _on: bool) -> void:
+	pass
+
+
 ## Recolor one body for the per-pebble (Lagrangian) field heatmap (M3+). Pure
 ## visualization — a consumer of sim state, routed through the backend only
 ## because it owns the render bodies. No-op if the backend has no drawable body.
