@@ -93,6 +93,7 @@ func _process(delta: float) -> bool:
 		_peak_at_flow_restore = _main._peak_temp
 		_main._set_flow(Thermal.FLOW_NOMINAL)
 		_check(_main._decay_power > 0.0, "decay heat PERSISTS after fission stops")
+		_checked_scram = true
 	# t=125 s: with cooling back, decay heat alone cannot hold the temperature — the core
 	# cools. (Fission is still off: the scram is latched.)
 	if _t >= 125.0 and _checked_scram and not _checked_cooldown:
@@ -100,7 +101,6 @@ func _process(delta: float) -> bool:
 		_check(_main._peak_temp < _peak_at_flow_restore - 20.0, "core cools once cooling is restored (decay heat alone cannot hold it)")
 		_check(_main._amplitude < Thermal.A_RUNNING, "fission stays off (scram latched)")
 		_checked_cooldown = true
-		_checked_scram = true
 		if _failures == 0:
 			print("LIVE M4/M5 CHECKS PASSED")
 		else:
