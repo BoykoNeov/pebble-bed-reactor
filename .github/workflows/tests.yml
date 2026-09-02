@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pure:
+    name: pure sim gates (headless Godot)
+    runs-on: ubuntu-latest
+    env:
+      GODOT_VERSION: 4.7-stable
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch headless Godot
+        run: |
+          curl -sSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          unzip -q godot.zip
+          chmod +x "Godot_v${GODOT_VERSION}_linux.x86_64"
+          echo "GODOT=$PWD/Godot_v${GODOT_VERSION}_linux.x86_64" >> "$GITHUB_ENV"
+      - name: Run the pure suite
+        run: tests/run_tests.sh
+  live:
+    name: live scene harnesses (headless Godot)
+    runs-on: ubuntu-latest
+    needs: pure
+    env:
+      GODOT_VERSION: 4.7-stable
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch headless Godot
+        run: |
+          curl -sSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          unzip -q godot.zip
+          chmod +x "Godot_v${GODOT_VERSION}_linux.x86_64"
+          echo "GODOT=$PWD/Godot_v${GODOT_VERSION}_linux.x86_64" >> "$GITHUB_ENV"
+      - name: Run the live set
+        run: tests/run_tests.sh --live

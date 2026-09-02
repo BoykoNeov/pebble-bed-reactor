@@ -29,6 +29,8 @@ var _scram_done := false
 var _checked_scram := false
 var _amp_pre_scram := 0.0
 var _peak_pre_scram := 0.0
+var _peak_at_flow_restore := 0.0
+var _checked_cooldown := false
 
 
 func _initialize() -> void:
@@ -82,8 +84,22 @@ func _process(delta: float) -> bool:
 			% [_amp_pre_scram, amp, _peak_pre_scram, _main._peak_temp, _main._decay_power, _main._decay_frac * 100.0])
 		_check(amp < Thermal.A_RUNNING and amp < 0.05 * _amp_pre_scram, "scram collapses fission power")
 		_check(_main._peak_temp < 2200.0, "fuel temperature BOUNDED after scram + loss-of-flow (walk-away safe)")
-		_check(_main._peak_temp < _peak_pre_scram, "core cools after scram")
+		# NOT "the core cools" here: with the flow cut, the decay heat has nowhere to go but
+		# the small ambient leak, so the fuel is EXPECTED to warm before it settles — that is
+		# the loss-of-flow story, and this gate used to contradict it (it failed on the
+		# untouched scene: 734 → 987 K, driven by the decay-heat inventory seeded for A_REF
+		# while the core actually runs far below it — docs/PLAN.md §3.4). Restore cooling
+		# and gate the cooldown below.
+		_peak_at_flow_restore = _main._peak_temp
+		_main._set_flow(Thermal.FLOW_NOMINAL)
 		_check(_main._decay_power > 0.0, "decay heat PERSISTS after fission stops")
+	# t=125 s: with cooling back, decay heat alone cannot hold the temperature — the core
+	# cools. (Fission is still off: the scram is latched.)
+	if _t >= 125.0 and _checked_scram and not _checked_cooldown:
+		print("  flow restored 20 s: peakT %.0f -> %.0f K   A %.4f" % [_peak_at_flow_restore, _main._peak_temp, _main._amplitude])
+		_check(_main._peak_temp < _peak_at_flow_restore - 20.0, "core cools once cooling is restored (decay heat alone cannot hold it)")
+		_check(_main._amplitude < Thermal.A_RUNNING, "fission stays off (scram latched)")
+		_checked_cooldown = true
 		_checked_scram = true
 		if _failures == 0:
 			print("LIVE M4/M5 CHECKS PASSED")

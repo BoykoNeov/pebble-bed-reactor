@@ -65,6 +65,20 @@ var nu_sigma_f2: PackedFloat32Array # thermal fission production
 # non-fuel cells.
 var xenon: PackedFloat32Array
 var moderation: PackedFloat32Array  # per-cell moderation ratio M (fuel cells; 0 elsewhere)
+# Area-weighted fissile fraction of the heavy metal in each fuel cell — the `e` the
+# fission cross-sections above were built from (E_REF outside fuel). Kept so the
+# sample-back can hand each pebble its OWN share of the cell's fission rate
+# (Pebble.fission_weight = its fissile fraction / this) instead of the cell mean.
+var enrichment: PackedFloat32Array
+# Per-cell CONVECTIVE CONDUCTANCE WEIGHT: the sum over the cell's pebbles of their
+# surface relative to a nominal pebble (Σ r_i / R_REF; in this 2D slice a pebble's
+# heat-transfer surface is its perimeter, ∝ r). Multiplied by the per-nominal-pebble
+# Newton-cooling h it gives the cell's total pebble→coolant conductance — the SAME
+# total the per-pebble thermal step sheds, so the Eulerian coolant march picks up
+# exactly the heat the Lagrangian pebbles lose, for ANY pebble size or size mix.
+# (It replaced a constant "23 pebbles per cell" that was only right at r = 8.) At the
+# nominal radius this is simply the pebble count.
+var conductance: PackedFloat32Array
 # Derived total fission production νΣf1+νΣf2. Kept because downstream consumers
 # (thermal coolant field, viz) use "nu_sigma_f > 0" purely as a FUEL-CELL FLAG,
 # and it is a convenient displayable total. Not read by the two-group solver.
@@ -117,6 +131,9 @@ func _alloc() -> void:
 	nu_sigma_f = PackedFloat32Array(); nu_sigma_f.resize(n)
 	xenon = PackedFloat32Array(); xenon.resize(n)
 	moderation = PackedFloat32Array(); moderation.resize(n)
+	enrichment = PackedFloat32Array(); enrichment.resize(n)
+	enrichment.fill(CrossSections.E_REF)
+	conductance = PackedFloat32Array(); conductance.resize(n)
 	temperature = PackedFloat32Array(); temperature.resize(n)
 	temperature.fill(T_INLET)
 	coolant_temp = PackedFloat32Array(); coolant_temp.resize(n)
@@ -160,6 +177,7 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 	var x_acc := PackedFloat32Array(); x_acc.resize(n) # area-weighted Xe-135 (M5c)
 	var t_acc := PackedFloat32Array(); t_acc.resize(n) # area-weighted temperature (M4)
 	var l_acc := PackedFloat32Array(); l_acc.resize(n) # area-weighted fuel loading (M5b)
+	var g_acc := PackedFloat32Array(); g_acc.resize(n) # summed surface weight (conductance)
 
 	for id in positions:
 		var c := cell_of(positions[id])
@@ -170,6 +188,7 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 			continue
 		var a := PI * peb.radius * peb.radius
 		area[c] += a
+		g_acc[c] += peb.radius / Pebble.R_REF
 		# Enrichment proxy from the isotopic vector: fissile fraction of heavy
 		# metal. At M1 pebbles carry no isotopics yet, so fall back to E_REF.
 		var e := _enrichment_of(peb)
@@ -186,6 +205,7 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 			var c := j * nx + i
 			var pack: float = min(area[c] / cell_area, PACK_MAX)
 			packing[c] = pack
+			conductance[c] = g_acc[c]
 			if pack > 0.03:
 				material[c] = CrossSections.FUEL
 				var inv := 1.0 / area[c]
@@ -196,6 +216,7 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 				var loading: float = l_acc[c] * inv
 				var m := CrossSections.moderation(loading)
 				moderation[c] = m
+				enrichment[c] = e
 				xenon[c] = xe
 				d1[c] = CrossSections.diffusion_fast(pack)
 				d2[c] = CrossSections.diffusion_thermal(pack)
@@ -211,6 +232,7 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 			elif _inside_vessel(i, j):
 				material[c] = CrossSections.VOID
 				moderation[c] = 0.0
+				enrichment[c] = CrossSections.E_REF
 				xenon[c] = 0.0
 				d1[c] = CrossSections.VOID_D1
 				d2[c] = CrossSections.VOID_D2
@@ -224,6 +246,7 @@ func homogenize(pebbles: Dictionary, positions: Dictionary) -> void:
 			else:
 				material[c] = CrossSections.REFLECTOR
 				moderation[c] = 0.0
+				enrichment[c] = CrossSections.E_REF
 				xenon[c] = 0.0
 				d1[c] = CrossSections.REFL_D1
 				d2[c] = CrossSections.REFL_D2
@@ -270,6 +293,14 @@ func _inside_vessel(i: int, j: int) -> bool:
 ## Fissile fraction of a pebble's heavy metal, defaulting to E_REF before any
 ## isotopics are tracked (M1). Kept here so M3 only fills the pebble vector.
 func _enrichment_of(peb: Pebble) -> float:
+	return fissile_fraction(peb)
+
+
+## The SAME fissile fraction, public and static: the enrichment proxy homogenize
+## builds a cell's nu_sigma_f from, exposed so the sample-back (ReactorCore) can weight
+## a pebble's share of the cell's fission rate by the identical quantity — one
+## definition, so the two worlds cannot disagree about what "fissile" means.
+static func fissile_fraction(peb: Pebble) -> float:
 	var hm := peb.u235 + peb.u238 + peb.pu239
 	if hm <= 0.0:
 		return CrossSections.E_REF

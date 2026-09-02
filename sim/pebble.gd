@@ -33,7 +33,13 @@ var id: int = -1
 ## a lie the code never backed; adding it would be new physics (and, per the M5d
 ## pattern, would want a factor of exactly 1.0 at the nominal radius so every existing
 ## calibration survives).
-var radius: float = 8.0
+var radius: float = R_REF
+
+## The NOMINAL pebble radius — the size every calibrated constant was tuned at, and the
+## reference the size-dependent thermal scalings (Thermal.size_of) are 1.0 at. Lives on
+## the pebble, the lowest module, so grid.gd and thermal.gd can both read it without a
+## dependency between them.
+const R_REF := 8.0
 
 ## Fuel loading: heavy-metal mass per pebble relative to nominal (1.0). One of
 ## CLAUDE.md's three player design knobs (size, fuel loading, enrichment), wired
@@ -74,6 +80,17 @@ var temperature: float = 293.15
 ## for now — M3 turns it into a burnup rate. Populated by main.gd's coupling step.
 var local_flux: float = 0.0
 
+## This pebble's fission rate relative to the MEAN pebble of the cell it sits in —
+## its own fissile fraction over the cell's homogenized one (ReactorCore sets it at
+## sample-back). WHY it exists: `local_flux` is the CELL's fission-rate density, so
+## without this a spent pebble and a fresh one in the same cell would make the same
+## heat. Weighting by fissile content is what the Eulerian solve already assumed when
+## it built the cell's nu_sigma_f from the area-weighted enrichment — this just hands
+## each pebble back its own share. The area-weighted mean of the weights over a cell
+## is exactly 1, so the cell's total heat (and the calibrated operating point) is
+## unchanged; only its distribution among the pebbles is. 1.0 = an average pebble.
+var fission_weight: float = 1.0
+
 ## Local coolant (helium) temperature the pebble is bathed in, sampled from the
 ## grid coolant-transport field (M4b). Rises going DOWN the bed as the coolant
 ## picks up heat — so a deep pebble is cooled by hotter helium than a shallow one.
@@ -89,6 +106,6 @@ var local_coolant: float = 293.15
 var decay_e: PackedFloat32Array = PackedFloat32Array()
 
 
-func _init(p_id: int = -1, p_radius: float = 8.0) -> void:
+func _init(p_id: int = -1, p_radius: float = R_REF) -> void:
 	id = p_id
 	radius = p_radius

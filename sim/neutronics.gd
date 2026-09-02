@@ -58,7 +58,26 @@ class Stencil:
 ## Solve the two-group diffusion eigenproblem on `grid`. Coupling coefficients
 ## depend only on the (fixed) cross-sections, so the two stencils are built once;
 ## power iteration then alternates fast/thermal fixed-source solves with a k update.
-static func solve(grid: Grid, max_outer := 300, inner_sweeps := 8, tol := 1.0e-5) -> Solution:
+##
+## CONVERGENCE is judged on BOTH the eigenvalue and the fission-source SHAPE. A k-only
+## test is the classic false-convergence trap of power iteration: k is a Rayleigh-like
+## quotient and settles to second order while the shape is still first-order off, so
+## |Δk| < tol can trigger while the flux is visibly wrong. Measured on the calibrated
+## lattice with the rods half in: the k-only test stopped at 12 outer iterations with
+## the peak-normalized fission-rate density still 2.8e-3 off its converged value —
+## and every worth the HUD shows (rods, xenon) is a DIFFERENCE of two such solves, so
+## shape error goes straight into the readout. `tol_src` bounds the max change of the
+## peak-normalized fission-rate density between outer iterations.
+##
+## `guess` WARM-STARTS the iteration from a previous solution (its phi1/phi2 and k).
+## The live loop re-solves a nearly-unchanged core every 0.2 s (and 3-4 variants of
+## it per cadence: cold / xenon-free / rod-free / warm), so starting from a flat flux
+## each time wastes ~40 outer iterations per solve; from the last answer it converges
+## in a handful. The result is IDENTICAL up to the tolerance — the eigenproblem has one
+## fundamental mode — so a warm start changes cost, never physics. A guess whose size
+## does not match the grid is ignored.
+static func solve(grid: Grid, max_outer := 300, inner_sweeps := 8, tol := 1.0e-5,
+		guess: Solution = null, tol_src := 1.0e-4) -> Solution:
 	var n := grid.nx * grid.ny
 	var nx := grid.nx
 	var ny := grid.ny
@@ -84,8 +103,18 @@ static func solve(grid: Grid, max_outer := 300, inner_sweeps := 8, tol := 1.0e-5
 	var phi1 := PackedFloat32Array(); phi1.resize(n); phi1.fill(1.0)
 	var phi2 := PackedFloat32Array(); phi2.resize(n); phi2.fill(1.0)
 	var fsrc := PackedFloat32Array(); fsrc.resize(n)   # fission-rate density (per cell)
+	var fprev := PackedFloat32Array(); fprev.resize(n) # ... from the previous outer iteration
 	var src := PackedFloat32Array(); src.resize(n)     # per-group fixed source
 	var k := 1.0
+	var have_prev := false
+	# A guess from a fuel-less solve (zero flux) would make the very first fission
+	# integral zero and end the iteration before it starts — so it is only used when
+	# it actually carries a fission source.
+	if guess != null and guess.flux_fast.size() == n and guess.flux_thermal.size() == n \
+			and guess.k_eff > 0.0 and guess.fission_rate > 0.0:
+		phi1 = guess.flux_fast.duplicate()
+		phi2 = guess.flux_thermal.duplicate()
+		k = guess.k_eff
 
 	var sol := Solution.new()
 	sol.converged = false
@@ -93,8 +122,12 @@ static func solve(grid: Grid, max_outer := 300, inner_sweeps := 8, tol := 1.0e-5
 		# Fission source F = nuSigf1*phi1 + nuSigf2*phi2 (born fast). fiss_old is its
 		# spatial integral — the numerator of the k update.
 		var fiss_old := 0.0
+		var dsrc := 0.0
 		for c in range(n):
 			var fc := f1[c] * phi1[c] + f2[c] * phi2[c]
+			if have_prev:
+				dsrc = maxf(dsrc, absf(fc - fprev[c]))
+			fprev[c] = fc
 			fsrc[c] = fc
 			fiss_old += fc
 		if fiss_old <= 0.0:
@@ -130,9 +163,13 @@ static func solve(grid: Grid, max_outer := 300, inner_sweeps := 8, tol := 1.0e-5
 		var dk: float = absf(k_new - k)
 		k = k_new
 		sol.iterations = outer + 1
-		if dk < tol:
+		# Both the eigenvalue AND the shape must have settled (see the header). The shape
+		# test compares the peak-normalized fission source entering this iteration with the
+		# one entering the last, so it needs one prior iteration before it can pass.
+		if dk < tol and have_prev and dsrc < tol_src:
 			sol.converged = true
 			break
+		have_prev = true
 
 	# Peak-normalized fission-rate density (peak = 1) — the derived `flux` the rest
 	# of the sim samples; and its total (relative power). phi1/phi2 already carry the

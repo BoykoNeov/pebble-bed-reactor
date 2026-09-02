@@ -106,13 +106,33 @@ sim/                     # engine-agnostic, deterministic, testable
   feedback.gd            # Doppler / temperature coefficients → cross-sections
   thermal.gd             # (M4) heat source, pebble temp, coolant transport, exchanger
   clocks.gd              # the three-clock manager
+  control_rods.gd        # (M5d) reflector absorbers; scram = full insertion
+  reactor.gd             # ReactorCore: THE coupling loop as one engine-agnostic object
+                         #   (solve / thermal_step / deplete) — main.gd drives it with the
+                         #   physics engine's positions, tests drive it with a lattice
 game/                    # Godot nodes
   reactor_vessel/        # silo geometry, pebble spawn (top) + extract (bottom)
   pebble_body/           # RigidBody2D wrapper, syncs to a sim.pebble
   visualization/         # switchable field heatmaps (grid + per-pebble), colorbar, readouts
   controls/              # player-tunable pebble design + operating params
-main.gd                  # orchestrates the coupling loop
+main.gd                  # Godot skin: feeds ReactorCore, fuel machine, HUD, input
+tests/                   # headless SceneTree scripts; run_tests.sh runs them
+docs/PLAN.md             # open scientific hurdles + roadmap (read before new physics)
 ```
+
+## Testing
+
+`tests/run_tests.sh` runs the pure suite (`tests/test_*.gd`, no scene, minutes);
+`--live` adds the curated scene harnesses; `--all` every headless one. CI runs
+both. Every script is a `SceneTree` that quits with its failure count. The first
+run after a checkout imports the project — a new `class_name` is invisible to
+`--script` runs until then. `GODOT=/path/to/godot tests/run_tests.sh`.
+
+Rules that keep the suite meaningful: every new physics constant is pinned by a
+gate that would fail if it were wrong in sign or scale; anything that changes a
+calibrated number gets re-gated, not re-tuned silently; and the LIVE loop is
+`sim/reactor.gd`, so a coupled-loop behavior belongs in `tests/test_reactor.gd`
+(which drives that object), not in a private re-implementation.
 
 ## Physics reference — approximate, HTR-PM-flavored
 
@@ -123,7 +143,8 @@ For plausible defaults only. Do not treat as accurate.
 - Enrichment ~8.5% (LEU). Keep player-adjustable enrichment **< 20%**.
 - Random monodisperse sphere packing fraction ≈ 0.61. Note: changing all
   pebbles' size *uniformly* does NOT change packing fraction; *mixing* sizes
-  does. Uniform size change instead affects surface-to-volume and self-shielding.
+  does. Uniform size change instead affects surface-to-volume (modelled: see
+  `sim/thermal.gd`'s size section) and self-shielding (not yet — `docs/PLAN.md`).
 - Discharge burnup ~90–100 MWd/kgHM.
 - Multi-pass fuel cycling (~6–15 passes) before a pebble is discharged.
 - Graphite moderator; helium coolant.
@@ -196,6 +217,22 @@ For plausible defaults only. Do not treat as accurate.
 > (`_test_full_insertion_shuts_down_a_critical_core` — now also the trip's calibration),
 > and end-to-end by `tests/live_scram.gd` (the trip drives the bank, the gate holds, reset
 > restores the trim) plus `tests/live_rods.gd` (the deep-shutdown mechanism it rides on).
+
+> **THE COUPLING LOOP IS ONE OBJECT (`sim/reactor.gd`).** The homogenize → solve →
+> feedbacks → sample-back step, the fast-clock thermal/kinetics integration, and the
+> campaign-clock depletion used to be methods on the scene node, so the pure suite
+> gated a *re-implementation* of the live loop (`test_thermal.gd`) that had drifted from
+> it. `ReactorCore` is the loop; `main.gd` forwards its fields under the old names;
+> `tests/test_reactor.gd` drives the same object headless. Two physics corrections
+> landed with it, both calibration-neutral at the nominal pebble: **(1) size is real in
+> the energy balance** — heat ∝ r², conductance ∝ r, capacity ∝ r² (2D-consistent), so a
+> bigger pebble runs hotter and slower (surface-to-volume), and the coolant march picks
+> up exactly what the pebbles shed for any size mix via `Grid.conductance` (it used a
+> hardcoded 23 pebbles/cell, wrong for any r ≠ 8); **(2) heat is fission-weighted** —
+> `Pebble.fission_weight` = own fissile fraction / cell's, mean exactly 1 per cell, so a
+> fresh pebble runs hotter than the spent one beside it. The solver also gained a
+> fission-source convergence criterion (a k-only test stopped with the rodded flux 3e-3
+> off) and a warm start (~2.5 ms vs ~30 ms per cadence re-solve). See `docs/PLAN.md`.
 
 > **ABSORBER WORTHS ARE NOT ADDITIVE — rods and xenon shadow each other.** Discovered (not
 > designed) when the scram unification first *broke* the M5c pit gate, and worth knowing

@@ -206,13 +206,38 @@ const FLOW_STEP := 0.1
 # alongside the h(flow) drop. Pinned by tests/test_thermal.gd.
 const W_NOMINAL := 30.0
 
-# Pebbles per fully-packed grid cell — the geometric factor turning a cell's
-# per-pebble convective conductance h into the cell's TOTAL conductance
-# (G_cell = h · packing · CELL_PEBBLES). For the default 68 px cell and 8 px pebble
-# this is cell_area/(π r²) ≈ 23, so the coolant picks up exactly the heat the
-# pebbles in the cell shed (energy-consistent with the per-pebble Newton cooling in
-# the thermal step). A toy geometric constant, not a free parameter.
-const CELL_PEBBLES := 23.0
+# --- Pebble SIZE (the third design knob) in the energy balance --------------
+#
+# This is a 2D slice, and its geometry is used CONSISTENTLY: a pebble's fuel (heat
+# source and heat capacity) scales with its AREA (r²), its heat-transfer surface with
+# its PERIMETER (r). Everything below is relative to the nominal radius Pebble.R_REF, so
+# a nominal pebble is scaled by exactly 1.0 and every calibration made at r = 8 is
+# untouched (the M5d pattern). What the scalings BUY, for a pebble of size s = r/R_REF:
+#
+#   * heat source     P ∝ s²   — a bigger pebble holds more fuel and makes more heat in
+#                                the same flux; per cell N·P is size-INVARIANT because
+#                                N ∝ 1/s² at fixed packing, matching the Eulerian
+#                                fission-rate density, which knows only packing.
+#   * conductance   h·A ∝ s    — Newton cooling through the perimeter.
+#   * capacity        C ∝ s²
+#
+# So the operating temperature rise ΔT = P/(hA) ∝ s and the time constant τ = C/(hA) ∝ s:
+# BIGGER PEBBLES RUN HOTTER (at the same power density) AND RESPOND SLOWER. That is the
+# surface-to-volume effect CLAUDE.md names for uniform size change, and it closes the
+# loop for the size lever — a bigger pebble is hotter → more Doppler → less power —
+# through the existing feedback, with no new coefficient. (Before this the thermal step
+# treated every pebble as nominal, so size reached the physics only through leakage.)
+#
+# The cell's coolant pickup uses Grid.conductance — the same Σ s_i the pebbles shed
+# through — so the Eulerian coolant march and the Lagrangian pebble losses are the
+# SAME number for any size mix. (This replaced a hardcoded 23 pebbles-per-cell that
+# was only right at r = 8: at r = 5 the coolant saw 40% of the heat the pebbles shed,
+# at r = 13 it saw 260%.)
+
+
+## Size of a pebble relative to nominal, s = r / R_REF (1.0 for a nominal pebble).
+static func size_of(peb: Pebble) -> float:
+	return peb.radius / Pebble.R_REF
 
 # Player inlet-temperature lever (M4b) — the load-following knob (advisor). Raising
 # the returning coolant temperature shrinks the convective gap (T_pebble − T_cool),
@@ -260,7 +285,7 @@ static func solve_coolant_field(grid: Grid, flow: float, t_inlet: float) -> floa
 			# the coolant through unchanged (nu_sigma_f flags a fuel cell as in the
 			# rest of the coupling).
 			if grid.nu_sigma_f[c] > 0.0:
-				var g_cell := h * grid.packing[c] * CELL_PEBBLES
+				var g_cell := h * grid.conductance[c]
 				var t_peb := grid.temperature[c]
 				var t_out := (w * t_cool + g_cell * t_peb) / (w + g_cell)
 				extracted += w * (t_out - t_cool)   # enthalpy this cell added to the coolant
@@ -285,21 +310,38 @@ static func step_power(amplitude: float, k_eff: float, dt: float) -> float:
 
 ## Semi-implicit (backward-Euler) update of a pebble's lumped temperature for one
 ## physics step. `p_fission` is the heat-generation rate, `h_conv` the convective
-## conductance from h_of_flow(). Stable for any dt and any conductance.
+## conductance from h_of_flow() for a NOMINAL pebble, `size` the pebble's relative
+## size (size_of; capacity ∝ size², both conductances ∝ size — see the size section).
+## Stable for any dt and any conductance.
 ##
 ##   C·(T' − T)/dt = P − G_conv·(T' − T_cool) − G_amb·(T' − T_amb)
 ##   ⇒ T' = (C·T + dt·(P + G_conv·T_cool + G_amb·T_amb)) / (C + dt·(G_conv + G_amb))
-static func step_pebble_temp(temp: float, p_fission: float, t_coolant: float, h_conv: float, dt: float) -> float:
-	var gain := HEAT_CAPACITY + dt * (h_conv + G_AMBIENT)
-	var src := HEAT_CAPACITY * temp + dt * (p_fission + h_conv * t_coolant + G_AMBIENT * T_AMBIENT)
+static func step_pebble_temp(temp: float, p_fission: float, t_coolant: float, h_conv: float, dt: float, size := 1.0) -> float:
+	var cap := HEAT_CAPACITY * size * size
+	var g_conv := h_conv * size
+	var g_amb := G_AMBIENT * size
+	var gain := cap + dt * (g_conv + g_amb)
+	var src := cap * temp + dt * (p_fission + g_conv * t_coolant + g_amb * T_AMBIENT)
 	return src / gain
 
 
 ## Per-pebble TOTAL fission heat-generation rate S from the current power amplitude
 ## and the pebble's local (peak-normalized) flux. The M4 heat source; at M5 it is
 ## split into a prompt part (prompt_power) and the decay-heat reservoirs.
-static func pebble_power(amplitude: float, local_flux: float) -> float:
-	return HEAT_PER_FLUX * amplitude * local_flux
+##
+## `size` scales the fuel content (∝ size², see the size section) and `fission_weight`
+## is the pebble's own share of its cell's fission rate (Pebble.fission_weight — a
+## fresh pebble > 1, a spent one < 1, an average one exactly 1). Both default to the
+## nominal, average pebble so every pre-existing caller is unchanged.
+static func pebble_power(amplitude: float, local_flux: float, size := 1.0, fission_weight := 1.0) -> float:
+	return HEAT_PER_FLUX * amplitude * local_flux * size * size * fission_weight
+
+
+## Heat a pebble is currently shedding into its coolant, G_conv·(T − T_cool) — the
+## per-pebble term the headline extracted power sums, with the same size scaling the
+## step uses so what is summed here is exactly what step_pebble_temp removed.
+static func conv_power(temp: float, t_coolant: float, h_conv: float, size := 1.0) -> float:
+	return h_conv * size * (temp - t_coolant)
 
 
 ## Number of decay-heat groups (reservoirs per pebble).
@@ -361,8 +403,10 @@ static func decay_power(e: PackedFloat32Array) -> float:
 ## the balance point step_pebble_temp() relaxes toward. Exposed for tests and for
 ## the fast-forward-collapse path (quasi-steady thermal when the campaign clock
 ## is fast — CLAUDE.md clock model; deferred until a time-skip control exists).
-static func steady_temp(p_fission: float, t_coolant: float, h_conv: float) -> float:
-	return (p_fission + h_conv * t_coolant + G_AMBIENT * T_AMBIENT) / (h_conv + G_AMBIENT)
+static func steady_temp(p_fission: float, t_coolant: float, h_conv: float, size := 1.0) -> float:
+	var g_conv := h_conv * size
+	var g_amb := G_AMBIENT * size
+	return (p_fission + g_conv * t_coolant + g_amb * T_AMBIENT) / (g_conv + g_amb)
 
 
 ## Add the Doppler resonance-absorption feedback to a grid's FAST-group absorption

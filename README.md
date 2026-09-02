@@ -28,7 +28,9 @@ physics reference.
 
 ## Status
 
-Early development. Built in milestone order:
+M0–M5d are built and gated by a headless test suite; the open scientific
+hurdles and the roadmap are in [`docs/PLAN.md`](docs/PLAN.md). Built in
+milestone order:
 
 - **M0** — Granular flow (silo, falling pebbles, inject/extract)
 - **M1** — Neutronics MVP (diffusion solve, k-eff, flux heatmap)
@@ -41,6 +43,18 @@ Early development. Built in milestone order:
 - **M5d** — Control rods in the side reflector (emergent worth and S-curve).
   Scram is unified with them: tripping drives the bank fully in, so the trip's
   worth comes from the diffusion solve rather than a hand-tuned constant.
+
+## Running the tests
+
+Headless Godot 4.7 runs every suite; no editor needed:
+
+```
+tests/run_tests.sh            # pure sim gates (no scene)
+tests/run_tests.sh --live     # + curated live-scene harnesses (minutes)
+GODOT=/path/to/godot tests/run_tests.sh
+```
+
+CI (`.github/workflows/tests.yml`) runs both on every push.
 
 ## Tech stack
 
