@@ -30,6 +30,11 @@ environment/defaults/default_clear_color=Color(0.05, 0.06, 0.09, 1)
 
 [physics]
 
+; Interpolate rendered transforms between physics ticks. Physics runs at 60 Hz; on a
+; display refreshing faster than that (or on any frame that misses a tick) the bodies
+; would otherwise move in visible 60 Hz steps. The sim is untouched: scripts still read
+; the physics transform, only what the renderer shows is smoothed.
+common/physics_interpolation=true
 ; Raised from the default: granular stacking is jittery/spongy otherwise; more
 ; iterations buy quieter quasi-static settling (CLAUDE.md pitfall). The editor
 ; may strip this comment on save — the rationale also lives in CLAUDE.md.

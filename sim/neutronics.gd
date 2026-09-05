@@ -76,12 +76,18 @@ class Stencil:
 ## in a handful. The result is IDENTICAL up to the tolerance — the eigenproblem has one
 ## fundamental mode — so a warm start changes cost, never physics. A guess whose size
 ## does not match the grid is ignored.
+##
+## `stencils` optionally supplies the two pre-built stencils (`build_stencils(grid)`).
+## The stencils depend on the diffusion coefficients only — on PACKING, which homogenize
+## sets — never on temperature, xenon or rods, so every solve posed against one
+## homogenization (cold, xenon-free, rod-free, warm: up to four per cadence) shares the
+## same pair. Building them once per cadence instead of once per solve is a pure cost
+## saving with bit-identical results; omitted, they are built here as before.
 static func solve(grid: Grid, max_outer := 300, inner_sweeps := 8, tol := 1.0e-5,
-		guess: Solution = null, tol_src := 1.0e-4) -> Solution:
+		guess: Solution = null, tol_src := 1.0e-4, stencils: Array = []) -> Solution:
 	var n := grid.nx * grid.ny
 	var nx := grid.nx
 	var ny := grid.ny
-	var h2 := grid.h * grid.h
 
 	var sa1 := grid.sigma_a1
 	var sa2 := grid.sigma_a2
@@ -92,8 +98,10 @@ static func solve(grid: Grid, max_outer := 300, inner_sweeps := 8, tol := 1.0e-5
 	# Two stencils (fast/thermal) share geometry but differ in D, hence in face
 	# couplings and vacuum-BC leakage. Removal adds to the fast diagonal (a loss
 	# from group 1); thermal absorption is the thermal diagonal's reaction term.
-	var st1 := _build_stencil(grid.d1, nx, ny, h2)
-	var st2 := _build_stencil(grid.d2, nx, ny, h2)
+	if stencils.size() != 2:
+		stencils = build_stencils(grid)
+	var st1: Stencil = stencils[0]
+	var st2: Stencil = stencils[1]
 	var diag1 := PackedFloat32Array(); diag1.resize(n)
 	var diag2 := PackedFloat32Array(); diag2.resize(n)
 	for c in range(n):
@@ -217,11 +225,26 @@ static func _gs_sweeps(phi: PackedFloat32Array, src: PackedFloat32Array, st: Ste
 				phi[c] = maxf(acc / diag[c], 0.0)
 
 
+## The fast and thermal stencils for `grid`, as [fast, thermal]. See `solve` for why a
+## caller posing several solves against one homogenization should build these once.
+static func build_stencils(grid: Grid) -> Array:
+	var h2 := grid.h * grid.h
+	return [_build_stencil(grid.d1, grid.nx, grid.ny, h2), _build_stencil(grid.d2, grid.nx, grid.ny, h2)]
+
+
 ## Build one group's 5-point stencil from its diffusion field `dd`. `diag` holds
 ## only the leakage part (face couplings + vacuum-BC boundary leakage); the caller
 ## adds the reaction term (absorption, plus removal for the fast group).
+##
+## Each face is either a harmonic-mean coupling to an interior neighbour (which adds the
+## same amount to the diagonal) or, at the grid edge, a vacuum-boundary leakage term to a
+## zero-flux point ~2D beyond the face (current out = D*phi / (h/2 + d_ext), d_ext ~ 2D,
+## per cell area) that adds to the diagonal only. Written inline rather than through a
+## per-face helper returning a Dictionary: this ran 4 allocations per cell per stencil,
+## twice per solve, several solves per cadence — measurable in GDScript for no gain.
 static func _build_stencil(dd: PackedFloat32Array, nx: int, ny: int, h2: float) -> Stencil:
 	var n := nx * ny
+	var h := sqrt(h2)
 	var st := Stencil.new()
 	st.cE = PackedFloat32Array(); st.cE.resize(n)
 	st.cW = PackedFloat32Array(); st.cW.resize(n)
@@ -232,29 +255,32 @@ static func _build_stencil(dd: PackedFloat32Array, nx: int, ny: int, h2: float) 
 		for i in nx:
 			var c := j * nx + i
 			var dc := dd[c]
-			var ce := _coupling(dc, dd, i + 1 < nx, c + 1, h2)
-			var cw := _coupling(dc, dd, i - 1 >= 0, c - 1, h2)
-			var cn := _coupling(dc, dd, j - 1 >= 0, c - nx, h2)
-			var cs := _coupling(dc, dd, j + 1 < ny, c + nx, h2)
-			st.cE[c] = ce.coup
-			st.cW[c] = cw.coup
-			st.cN[c] = cn.coup
-			st.cS[c] = cs.coup
-			st.diag[c] = ce.diag + cw.diag + cn.diag + cs.diag
+			var leak := dc / ((0.5 * h + 2.0 * dc) * h)
+			var diag := 0.0
+			var coup: float
+			if i + 1 < nx:
+				coup = 2.0 * dc * dd[c + 1] / (dc + dd[c + 1]) / h2
+				st.cE[c] = coup
+				diag += coup
+			else:
+				diag += leak
+			if i - 1 >= 0:
+				coup = 2.0 * dc * dd[c - 1] / (dc + dd[c - 1]) / h2
+				st.cW[c] = coup
+				diag += coup
+			else:
+				diag += leak
+			if j - 1 >= 0:
+				coup = 2.0 * dc * dd[c - nx] / (dc + dd[c - nx]) / h2
+				st.cN[c] = coup
+				diag += coup
+			else:
+				diag += leak
+			if j + 1 < ny:
+				coup = 2.0 * dc * dd[c + nx] / (dc + dd[c + nx]) / h2
+				st.cS[c] = coup
+				diag += coup
+			else:
+				diag += leak
+			st.diag[c] = diag
 	return st
-
-
-## One face's contribution: harmonic-mean coupling to an interior neighbor, or a
-## vacuum-boundary leakage term to a zero-flux point ~2D beyond the face.
-## Returns {coup, diag}: `coup` multiplies the neighbor flux (0 at a boundary);
-## `diag` is what this face adds to the cell's diagonal.
-static func _coupling(dc: float, dd: PackedFloat32Array, interior: bool, nbr: int, h2: float) -> Dictionary:
-	var h := sqrt(h2)
-	if interior:
-		var dn := dd[nbr]
-		var d_face := 2.0 * dc * dn / (dc + dn)  # harmonic mean
-		var coup := d_face / h2
-		return {"coup": coup, "diag": coup}
-	# Vacuum BC: current out = D * phi / (h/2 + d_ext), d_ext ~ 2D, per cell area.
-	var leak := dc / ((0.5 * h + 2.0 * dc) * h)
-	return {"coup": 0.0, "diag": leak}

@@ -789,7 +789,15 @@ static func pool_drop(across := 0.0) -> Vector2:
 ## themselves are bodies now and draw themselves, so the tray no longer renders them
 ## and no longer needs their colors. What is left is the caption, which is the part
 ## that keeps a capped tray honest.
+##
+## Repaints ONLY when a count actually changed. main calls this every render frame, and
+## an unconditional queue_redraw here had the whole static plant — every pipe run,
+## mitred outline and label — re-issued 60 times a second for a caption that changes a
+## few times a minute. `_draw_plant`'s "drawn on demand" claim was only true once this
+## was made to check.
 func set_pool(held: int, total: int, shipped: int) -> void:
+	if held == _pool_held and total == _pool_total and shipped == _pool_shipped:
+		return
 	_pool_held = held
 	_pool_total = total
 	_pool_shipped = shipped

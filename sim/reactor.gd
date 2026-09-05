@@ -97,6 +97,7 @@ func reset_campaign() -> void:
 	_sol_noxe = null
 	_sol_norod = null
 	_sol_warm = null
+	_pending_diag.clear()
 
 
 # --- Levers ------------------------------------------------------------------
@@ -137,6 +138,40 @@ func set_inlet(t: float) -> void:
 
 # --- The clockless solve -----------------------------------------------------
 
+# Diagnostic solves: the readouts that are NOT the driving solve. Each is a full
+# eigenproblem, and a cadence used to pose all of them in the same physics frame as
+# the warm solve — three or four ~3 ms solves back to back, a ~15 ms hitch five times a
+# second (measured, tests/live_render_perf.gd). See `defer_diagnostics`.
+const DIAG_COLD := 0     # k with no feedback — k_cold (also the seed's reference)
+const DIAG_NOXE := 1     # k with the Xe-135 absorption stripped — xenon worth
+const DIAG_NOROD := 2    # k with the rods stripped — rod worth
+
+# Spread the diagnostic solves over the frames AFTER the cadence instead of doing them
+# all in the cadence frame. OFF by default so every headless gate that calls solve()
+# and reads k_cold / xenon_worth / rod_worth on the next line sees them fresh, exactly
+# as before. main.gd turns it ON: the driving warm solve still lands in the cadence
+# frame (the physics never waits), and the three readouts follow one per physics frame
+# via `run_deferred_diagnostic` — fresh within ~50 ms, against the SAME homogenized
+# grid, so a worth is still the difference of two solves of one core. Per-frame peak
+# cost drops from ~4 solves to 1. `solve(..., immediate=true)` bypasses the deferral
+# for the moments that must register at once (scram, feedback toggle).
+var defer_diagnostics := false
+var _pending_diag: Array = []
+# The cadence's temperature-free bases (what homogenize + rods wrote) and its rod-free
+# thermal absorption, kept so a deferred diagnostic can pose its problem against the
+# cadence's core after the warm solve has overwritten the grid with the fed-back
+# cross-sections — and restore those afterwards, so the grid a reader sees between
+# frames is always the warm one the physics is running on.
+var _base_sa1 := PackedFloat32Array()
+var _base_sr := PackedFloat32Array()
+var _base_sa2 := PackedFloat32Array()
+var _sa2_norod := PackedFloat32Array()
+var _cold_k_for_worths := 0.0   # the cold k the pending worths difference against
+# The two diffusion stencils for the cadence's homogenization — built once here and
+# shared by every solve posed against it (Neutronics.build_stencils).
+var _stencils: Array = []
+
+
 ## The coupling step: homogenize the in-core pebbles (`positions` holds ONLY pebbles in
 ## the bed; ids index `pebbles`) — including each pebble's real, lagged temperature —
 ## onto the grid, solve the quasi-static flux against that temperature, measure the
@@ -148,7 +183,10 @@ func set_inlet(t: float) -> void:
 ## it on the bed being FULL — a partly-filled bed reads k_cold just above 1, giving a
 ## tiny equilibrium ΔT: under-seeding, and the climb to the packed operating point IS the
 ## overshoot the seed exists to avoid).
-func solve(pebbles: Dictionary, positions: Dictionary, allow_seed: bool) -> void:
+##
+## `immediate`: run the diagnostic solves in this call even when `defer_diagnostics` is
+## on — for a change that must show up in every readout NOW (a scram trip).
+func solve(pebbles: Dictionary, positions: Dictionary, allow_seed: bool, immediate := false) -> void:
 	if positions.is_empty():
 		return
 	grid.homogenize(pebbles, positions)
@@ -158,47 +196,48 @@ func solve(pebbles: Dictionary, positions: Dictionary, allow_seed: bool) -> void
 	# enrichment or burnup: applying it to the base means every downstream solve — cold,
 	# xenon-worth, warm, AND the feedback-OFF branch — sees the rods for free. It cannot
 	# stack across frames because homogenize unconditionally REWRITES sigma_a2 first.
-	var sa2_norod := grid.sigma_a2.duplicate() if rod_insertion > 0.0 else PackedFloat32Array()
+	_sa2_norod = grid.sigma_a2.duplicate() if rod_insertion > 0.0 else PackedFloat32Array()
 	ControlRods.apply_rods(grid, rod_insertion)
 
 	# Snapshot the temperature-FREE bases homogenize just wrote (Neutronics only reads
 	# the grid). Doppler perturbs sigma_a1; the moderator-temperature coefficient perturbs
 	# sigma_r / sigma_a2.
-	var base_sa1 := grid.sigma_a1.duplicate()
-	var base_sr := grid.sigma_r.duplicate()
-	var base_sa2 := grid.sigma_a2.duplicate()
+	_base_sa1 = grid.sigma_a1.duplicate()
+	_base_sr = grid.sigma_r.duplicate()
+	_base_sa2 = grid.sigma_a2.duplicate()
+	_stencils = Neutronics.build_stencils(grid)
 
-	# Cold (temperature-free) reference solve — the honest UNCONTROLLED reactivity, the
-	# k the core WOULD run at with no feedback (design M, no Doppler, no MTC).
-	var cold := Neutronics.solve(grid, 300, 8, 1.0e-5, _sol_cold)
-	_sol_cold = cold
-	k_cold = cold.k_eff
+	# The diagnostics run here, in the cadence frame, unless deferred. Before the seed
+	# they always run here: the seed needs the cold flux and a fresh cold k this call.
+	# With feedback OFF the cold solve IS the driving solve, so it too stays here.
+	var deferred := defer_diagnostics and not immediate and thermal_seeded
+	_pending_diag.clear()
 
-	# Xenon reactivity worth (M5c): re-solve with the Xe-135 absorption stripped out of
-	# the thermal group. XENON_A2*xenon is exactly what homogenize folded into sigma_a2.
-	var sa2_xe := grid.sigma_a2.duplicate()
-	for c in range(grid.cell_count()):
-		grid.sigma_a2[c] = sa2_xe[c] - CrossSections.XENON_A2 * grid.xenon[c]
-	var cold_noxe := Neutronics.solve(grid, 300, 8, 1.0e-5, _sol_noxe)
-	_sol_noxe = cold_noxe
-	grid.sigma_a2 = sa2_xe
-	xenon_worth = cold_noxe.k_eff - cold.k_eff
-
-	# Control-rod worth (M5d), measured the same honest way: re-solve against the rod-FREE
-	# snapshot and difference. Measured COLD (like xenon) so it is the rod's OWN
-	# reactivity, not tangled with the feedback's response to it. Costs a solve ONLY while
-	# the rods are in; fully withdrawn, worth is exactly zero by definition.
-	if rod_insertion > 0.0:
-		var sa2_rod := grid.sigma_a2
-		grid.sigma_a2 = sa2_norod
-		var cold_norod := Neutronics.solve(grid, 300, 8, 1.0e-5, _sol_norod)
-		_sol_norod = cold_norod
-		grid.sigma_a2 = sa2_rod
-		rod_worth = cold_norod.k_eff - cold.k_eff
+	var cold: Neutronics.Solution = null
+	if not deferred or not feedback_on:
+		# Cold (temperature-free) reference solve — the honest UNCONTROLLED reactivity,
+		# the k the core WOULD run at with no feedback (design M, no Doppler, no MTC).
+		cold = Neutronics.solve(grid, 300, 8, 1.0e-5, _sol_cold, 1.0e-4, _stencils)
+		_sol_cold = cold
+		k_cold = cold.k_eff
+		_cold_k_for_worths = k_cold
 	else:
-		rod_worth = 0.0
+		_pending_diag.append(DIAG_COLD)
 
-	if not thermal_seeded and allow_seed and cold.k_eff > 1.0:
+	if not deferred:
+		_diag_noxe()
+		if rod_insertion > 0.0:
+			_diag_norod()
+		else:
+			rod_worth = 0.0
+	else:
+		_pending_diag.append(DIAG_NOXE)
+		if rod_insertion > 0.0:
+			_pending_diag.append(DIAG_NOROD)
+		else:
+			rod_worth = 0.0
+
+	if not thermal_seeded and allow_seed and cold != null and cold.k_eff > 1.0:
 		seed_equilibrium(pebbles, positions, cold.flux)
 
 	var sol: Neutronics.Solution
@@ -208,20 +247,20 @@ func solve(pebbles: Dictionary, positions: Dictionary, allow_seed: bool) -> void
 		# state. Both feedbacks read the SAME driver — grid.temperature, the pebble/graphite
 		# temperature (Thermal.apply_field_moderator). Restore all three bases first so
 		# neither feedback stacks across frames.
-		grid.sigma_a1 = base_sa1.duplicate()
-		grid.sigma_r = base_sr.duplicate()
-		grid.sigma_a2 = base_sa2.duplicate()
+		grid.sigma_a1 = _base_sa1.duplicate()
+		grid.sigma_r = _base_sr.duplicate()
+		grid.sigma_a2 = _base_sa2.duplicate()
 		Thermal.apply_field_doppler(grid)
 		Thermal.apply_field_moderator(grid)
-		sol = Neutronics.solve(grid, 300, 8, 1.0e-5, _sol_warm)
+		sol = Neutronics.solve(grid, 300, 8, 1.0e-5, _sol_warm, 1.0e-4, _stencils)
 		_sol_warm = sol
 	else:
 		# Feedback OFF: the uncontrolled state — no Doppler, no MTC, so k is the raw cold
 		# k and nothing self-limits power. Restore the bases so the heatmaps show the design
 		# cross-sections, not a stale warm field.
-		grid.sigma_a1 = base_sa1.duplicate()
-		grid.sigma_r = base_sr.duplicate()
-		grid.sigma_a2 = base_sa2.duplicate()
+		grid.sigma_a1 = _base_sa1.duplicate()
+		grid.sigma_r = _base_sr.duplicate()
+		grid.sigma_a2 = _base_sa2.duplicate()
 		sol = cold
 	k_eff = sol.k_eff
 	flux = sol.flux
@@ -254,6 +293,64 @@ func solve(pebbles: Dictionary, positions: Dictionary, allow_seed: bool) -> void
 			xe_sum += peb.xe135
 			xe_n += 1
 	mean_xenon = xe_sum / xe_n if xe_n > 0 else 0.0
+
+
+## Run ONE queued diagnostic solve (see `defer_diagnostics`), or nothing if none is
+## pending. Called by main every physics frame. Poses the problem against the cadence's
+## temperature-free bases, then puts the grid back exactly as it found it (the warm,
+## fed-back cross-sections the physics is running on).
+func run_deferred_diagnostic() -> void:
+	if _pending_diag.is_empty():
+		return
+	var which: int = _pending_diag.pop_front()
+	var live_sa1 := grid.sigma_a1
+	var live_sr := grid.sigma_r
+	var live_sa2 := grid.sigma_a2
+	grid.sigma_a1 = _base_sa1
+	grid.sigma_r = _base_sr
+	grid.sigma_a2 = _base_sa2
+	match which:
+		DIAG_COLD:
+			var cold := Neutronics.solve(grid, 300, 8, 1.0e-5, _sol_cold, 1.0e-4, _stencils)
+			_sol_cold = cold
+			k_cold = cold.k_eff
+			_cold_k_for_worths = k_cold
+		DIAG_NOXE:
+			_diag_noxe()
+		DIAG_NOROD:
+			_diag_norod()
+	grid.sigma_a1 = live_sa1
+	grid.sigma_r = live_sr
+	grid.sigma_a2 = live_sa2
+
+
+## Xenon reactivity worth (M5c): re-solve with the Xe-135 absorption stripped out of
+## the thermal group. XENON_A2*xenon is exactly what homogenize folded into sigma_a2.
+## Expects the grid to hold the temperature-free bases; leaves it holding them.
+func _diag_noxe() -> void:
+	var sa2_xe := grid.sigma_a2
+	var stripped := sa2_xe.duplicate()
+	for c in range(grid.cell_count()):
+		stripped[c] = sa2_xe[c] - CrossSections.XENON_A2 * grid.xenon[c]
+	grid.sigma_a2 = stripped
+	var cold_noxe := Neutronics.solve(grid, 300, 8, 1.0e-5, _sol_noxe, 1.0e-4, _stencils)
+	_sol_noxe = cold_noxe
+	grid.sigma_a2 = sa2_xe
+	xenon_worth = cold_noxe.k_eff - _cold_k_for_worths
+
+
+## Control-rod worth (M5d), measured the same honest way: re-solve against the rod-FREE
+## snapshot and difference. Measured COLD (like xenon) so it is the rod's OWN
+## reactivity, not tangled with the feedback's response to it. Costs a solve ONLY while
+## the rods are in; fully withdrawn, worth is exactly zero by definition (the caller
+## sets it). Expects the grid to hold the temperature-free bases; leaves it holding them.
+func _diag_norod() -> void:
+	var sa2_rod := grid.sigma_a2
+	grid.sigma_a2 = _sa2_norod
+	var cold_norod := Neutronics.solve(grid, 300, 8, 1.0e-5, _sol_norod, 1.0e-4, _stencils)
+	_sol_norod = cold_norod
+	grid.sigma_a2 = sa2_rod
+	rod_worth = cold_norod.k_eff - _cold_k_for_worths
 
 
 ## A pebble's share of its cell's fission rate: its fissile fraction over the cell's

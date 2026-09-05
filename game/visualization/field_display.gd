@@ -40,7 +40,12 @@ func set_grid_field(grid: Grid, field: PackedFloat32Array, desc: FieldDescriptor
 	for j in grid.ny:
 		for i in grid.nx:
 			img.set_pixel(i, j, desc.color(field[j * grid.nx + i]))
-	_tex = ImageTexture.create_from_image(img)
+	# Update the existing GPU texture in place when the grid shape is unchanged (always,
+	# after the first call) rather than allocating a fresh one per solve cadence.
+	if _tex != null and _tex.get_width() == grid.nx and _tex.get_height() == grid.ny:
+		_tex.update(img)
+	else:
+		_tex = ImageTexture.create_from_image(img)
 	_rect = Rect2(grid.ox, grid.oy, grid.nx * grid.h, grid.ny * grid.h)
 	_has_field = true
 	queue_redraw()

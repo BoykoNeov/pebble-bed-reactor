@@ -321,6 +321,16 @@ var _spawn_accum := 0.0
 var _extract_accum := 0.0
 var _solve_accum := 0.0
 var _fill_accum := 0.0
+# Render-clock cadences for the text panels and the per-pebble tint walk (see _process).
+const HUD_INTERVAL := 0.1
+const TINT_INTERVAL := 0.05
+var _hud_accum := HUD_INTERVAL    # start due, so the first frame is not blank
+var _tint_accum := TINT_INTERVAL
+# Perf readout: smoothed / decaying-peak script cost of a physics step (ms), see
+# _physics_process. Display only.
+var _perf_physics_ms := 0.0
+var _perf_physics_peak_ms := 0.0
+var _perf_sections: Dictionary = {}   # section name -> smoothed ms per tick (see _perf_lap)
 
 # Population/fill control (Phase 3c) — what the fuel machine chases and how fast it is
 # allowed to chase it, both player levers now instead of the old hard-pinned
@@ -594,6 +604,13 @@ func _ready() -> void:
 	# The reactor core: the coarse neutronics mesh over the silo + reflector band and
 	# the whole coupling loop (sim/reactor.gd). Built before the HUD, which reads it.
 	_core = ReactorCore.new(Grid.for_silo())
+	# The LIVE loop spreads the three diagnostic solves (k_cold, xenon worth, rod worth)
+	# over the frames after each cadence instead of stacking all four eigenproblems in
+	# one physics frame — a measured ~15 ms hitch five times a second, the one visible
+	# stutter in the falling bed. The physics-driving warm solve is unchanged and still
+	# lands in the cadence frame; only readouts move, by at most ~50 ms. Off by default
+	# in ReactorCore so the headless gates read every number fresh from a single solve().
+	_core.defer_diagnostics = true
 
 	# Field heatmap goes in first so it renders BEHIND the pebbles (background
 	# field, pebbles on top — the two-worlds-at-once view).
@@ -847,7 +864,7 @@ func _bed_half_width(y: float) -> float:
 const HUD_DIM := "8a97ab"
 const HUD_HEAD := "5c81c4"
 # Top of the inspector panel — clear of the readout above it, which runs to y ≈ 440.
-const INSPECTOR_Y := 460.0
+const INSPECTOR_Y := 478.0  # one HUD row taller since the perf row landed
 
 func _build_hud() -> void:
 	var layer := CanvasLayer.new()
@@ -1104,16 +1121,31 @@ static func _panel_style(opaque := false) -> StyleBoxFlat:
 	return sb
 
 
-func _process(_delta: float) -> void:
-	_update_hud()
-	_update_pebble_colors()   # render-clock consumer of sim state (never writes back)
+func _process(delta: float) -> void:
+	# The text panels are rebuilt on their own slow cadence, not every render frame:
+	# each rebuild re-parses a screen of BBCode, and the numbers it shows move over
+	# seconds. 10 Hz is above what the eye tracks on a readout and cuts the cost 6-14x
+	# (measured, tests/live_render_perf.gd). The controls panel and the selection ring
+	# stay per-frame — a slider under the mouse must not lag.
+	_hud_accum += delta
+	if _hud_accum >= HUD_INTERVAL:
+		_hud_accum = fmod(_hud_accum, HUD_INTERVAL)
+		_update_hud()
+		_update_inspector()
+	# Per-pebble field tints likewise: the fields they show (temperature, burnup, xenon)
+	# evolve over seconds, and a tint walk touches every body. A body that changes hands
+	# is tinted at that moment regardless (see `_pebble_tint`'s callers).
+	_tint_accum += delta
+	if _tint_accum >= TINT_INTERVAL:
+		_tint_accum = fmod(_tint_accum, TINT_INTERVAL)
+		_update_pebble_colors()   # render-clock consumer of sim state (never writes back)
 	_refresh_pool()
-	_update_inspector()
 	_sync_controls_panel()    # keep the mouse panel honest against keyboard/sim changes
 	_overlay.queue_redraw()   # the ring tracks a moving pebble (bed flow, or a ride)
 
 
 func _physics_process(delta: float) -> void:
+	var t0 := Time.get_ticks_usec()
 	# Native self-steps; kept explicit so an external engine slots in cleanly.
 	_physics.step(delta)
 
@@ -1125,6 +1157,7 @@ func _physics_process(delta: float) -> void:
 	_feed_reinject()
 	_feed_inlet_top()
 	_belt_step()
+	var t1 := _perf_lap("belts", t0)
 
 	_spawn_accum += delta
 	while _spawn_accum >= SPAWN_INTERVAL:
@@ -1147,11 +1180,18 @@ func _physics_process(delta: float) -> void:
 	while _extract_accum >= EXTRACT_INTERVAL:
 		_extract_accum -= EXTRACT_INTERVAL
 		_extract_lowest()
+	t1 = _perf_lap("fuel machine", t1)
 
 	_solve_accum += delta
 	while _solve_accum >= SOLVE_INTERVAL:
 		_solve_accum -= SOLVE_INTERVAL
 		_solve_flux()
+	t1 = _perf_lap("solve", t1)
+	# One deferred diagnostic solve per frame (k_cold / xenon worth / rod worth), so the
+	# cadence frame above carries only the physics-driving solve. A no-op when nothing is
+	# queued — i.e. on most frames.
+	_core.run_deferred_diagnostic()
+	t1 = _perf_lap("diagnostics", t1)
 
 	# Thermal & power dynamics (M4) — the ONE subsystem that time-integrates on the
 	# fast physics clock (CLAUDE.md clock model): the flux is quasi-static above and
@@ -1159,12 +1199,31 @@ func _physics_process(delta: float) -> void:
 	# so it steps every frame against the latest k. This is what makes the loop lag,
 	# overshoot, and settle instead of regulating instantly.
 	_core.thermal_step(_pebbles, _out_of_core, delta)
+	t1 = _perf_lap("thermal", t1)
 
 	# Deplete on the CAMPAIGN clock (CLAUDE.md principle 1): the core derives campaign_dt
 	# from the physics step (Clocks) and it reaches ONLY Depletion.step. Burnup scales
 	# with A/A_REF, so an idling core barely burns. Uses each pebble's local_flux from
 	# the last solve; pebbles out of the core (in the machine) do not burn.
 	_core.deplete(_pebbles, _out_of_core, delta)
+	_perf_lap("deplete", t1)
+
+	# Script cost of this physics step (the engine's own collision step is not in it),
+	# smoothed for the HUD's perf readout. A cheap, always-on measure so a regression in
+	# the per-frame walks shows on screen rather than in a profiler nobody opens.
+	var ms := (Time.get_ticks_usec() - t0) / 1000.0
+	_perf_physics_ms = lerpf(_perf_physics_ms, ms, 0.05)
+	_perf_physics_peak_ms = maxf(_perf_physics_peak_ms * 0.995, ms)
+
+
+## Book the time since `since` (usec) against one named section of the physics step, as
+## a smoothed per-tick average in `_perf_sections`, and return "now" for the next lap.
+## Display/diagnostic only (tests/live_render_perf.gd prints the table).
+func _perf_lap(section: String, since: int) -> int:
+	var now := Time.get_ticks_usec()
+	var ms := (now - since) / 1000.0
+	_perf_sections[section] = lerpf(_perf_sections.get(section, ms), ms, 0.05)
+	return now
 
 
 ## Pebbles currently in the BED (i.e. homogenized, fissioning).
@@ -1995,11 +2054,15 @@ func _record_outflow(peb: Pebble) -> void:
 ## has made its full load (`_inventory()`, not `_pebbles.size()`: a stocked pool must
 ## not satisfy the gate with a half-empty bed — that is the under-seeded cold start the
 ## seed exists to prevent).
-func _solve_flux() -> void:
+##
+## `immediate`: also run the diagnostic solves in this frame instead of deferring them
+## (ReactorCore.defer_diagnostics) — for a scram or feedback toggle, whose every readout
+## must change on the same frame the player acted.
+func _solve_flux(immediate := false) -> void:
 	var positions := _core_positions()
 	if positions.is_empty():
 		return
-	_core.solve(_pebbles, positions, _inventory() >= _population_setpoint)
+	_core.solve(_pebbles, positions, _inventory() >= _population_setpoint, immediate)
 	# Update the heatmap for whichever field is selected (consumer; never writes back).
 	_refresh_field_display()
 
@@ -2154,6 +2217,7 @@ func _select(peb: Pebble, where: String) -> void:
 	_selected = peb
 	_selected_where = where
 	_overlay.queue_redraw()
+	_update_inspector()   # a click answers now, not at the panels' next slow tick
 
 
 ## Where the selected pebble is on screen, or Vector2.INF if it has no position.
@@ -2194,7 +2258,7 @@ func _stamp_enrichment(peb: Pebble, e: float) -> void:
 
 func _toggle_feedback() -> void:
 	_core.feedback_on = not _core.feedback_on
-	_solve_flux()   # re-solve immediately so the contrast is instant
+	_solve_flux(true)   # re-solve immediately so the contrast is instant
 
 
 ## Trip / reset the scram. Scram SLAMS THE CONTROL RODS FULLY IN — that is the whole
@@ -2219,7 +2283,7 @@ func _toggle_feedback() -> void:
 func _toggle_scram() -> void:
 	_core.toggle_scram()
 	queue_redraw()   # the rods are drawn from _rod_insertion; the shell only repaints on request
-	_solve_flux()
+	_solve_flux(true)
 
 
 func _cycle_field() -> void:
@@ -2671,7 +2735,8 @@ func _update_hud() -> void:
 		+ _row("loading", "%.2f → M %.2f  %s" % [_fuel_loading, m_design, mod_regime]) \
 		+ _row("feedback", "%s   scram %s   campaign %.0f" % [("[color=#6ecf7a]ON[/color]" if _feedback_on else "[color=#ff5555]OFF[/color]"), ("[color=#ffaa44]TRIPPED[/color]" if _scrammed else "off"), _clocks.campaign_elapsed]) \
 		+ _section("FIELD") \
-		+ _row(field_name, "solve iters %d   fps %d" % [_solve_iters, Engine.get_frames_per_second()])
+		+ _row(field_name, "solve iters %d   fps %d" % [_solve_iters, Engine.get_frames_per_second()]) \
+		+ _row("perf", "physics step %.1f ms (peak %.1f)" % [_perf_physics_ms, _perf_physics_peak_ms])
 
 
 ## The inspector panel: everything this toy tracks about ONE pebble.
